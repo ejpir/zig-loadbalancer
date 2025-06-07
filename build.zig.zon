@@ -1,0 +1,33 @@
+.{
+    .name = .load_balancer,
+    .fingerprint = 0x76c4befbe0cec3f4,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{
+        .tardy = .{
+            .url = "git+https://github.com/tardy-org/tardy?ref=v0.3.0#cd454060f3b6006368d53c05ab96cd16c73c34de",
+            .hash = "tardy-0.3.0-69wrgi7PAwDFhO7m0aXae6N15s2b28VIOrnRrSHHake6",
+        },
+        .secsock = .{
+            .path = "../../vendor/secsock",
+        },
+        .clap = .{
+            .url = "git+https://github.com/Hejsil/zig-clap#master",
+            .hash = "122019e1c28b97391e57d983bb6c8666fb4dd90b8ec9f01f8c18a329f3bf8315ee30",
+        },
+        .yaml = .{
+            .url = "git+https://github.com/kubkon/zig-yaml#2d42183a7b49742e74f4b1eca8a245e73cb34113",
+            .hash = "zig_yaml-0.1.0-C1161uaCAgBeGM34gK6grYHDxDEq92BCDbSleBDEqd-s",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "main.zig",
+        "backend1.zig",
+        "backend2.zig",
+        "config",
+    },
+}

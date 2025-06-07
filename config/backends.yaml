@@ -1,0 +1,24 @@
+# Load Balancer Backend Configuration
+# ------------------------------
+# This file defines the backend servers that the load balancer will distribute traffic to.
+# Each backend can have the following properties:
+#   - host: (required) The hostname or IP address of the backend server
+#   - port: (required) The port number the backend server is listening on
+#   - weight: (optional) The weight for weighted round-robin balancing, default is 1
+
+backends:
+  # Main backend server with default weight (1)
+  - host: "127.0.0.1"
+    port: 9001
+
+  # Secondary backend server with default weight (1)
+  - host: "127.0.0.1"
+    port: 9002
+
+  # - host: "https://127.0.0.1"
+  #   port: 3000
+
+  # You can add more backends by following the same pattern
+  # - host: "https://127.0.0.1"
+  #   port: 3000
+  #   weight: 1
