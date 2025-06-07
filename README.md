@@ -120,6 +120,8 @@ backends:
     port: 8443
 ```
 
+**HTTPS Support Status:** The load balancer currently detects HTTPS backends based on port 443 or `https://` URL prefix. Full HTTPS client support is actively being developed in `client.zig` and will be released soon. The architecture is designed for seamless integration once the client implementation is complete.
+
 ### Hot Reload
 
 Enable configuration hot reloading to update backends without restart:
@@ -220,6 +222,7 @@ zig build test              # Run unit tests
 
 - **[zzz](https://github.com/zigzap/zzz)**: Core HTTP framework
 - **[tardy](https://github.com/tardy-org/tardy)**: Async runtime
+- **[secsock](https://github.com/tardy-org/secsock)**: Secure socket abstractions for HTTPS support
 - **[clap](https://github.com/Hejsil/zig-clap)**: Command line argument parsing
 - **[yaml](https://github.com/kubkon/zig-yaml)**: YAML configuration parsing
 
