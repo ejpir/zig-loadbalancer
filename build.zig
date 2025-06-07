@@ -3,16 +3,15 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    
+
     // Set install directory to local zig-out
     b.install_prefix = "./zig-out";
 
     // Get access to zzz module
-    const zzz_module = b.addModule("zzz", .{
-        .root_source_file = b.path("../../src/lib.zig"),
+    const zzz_module = b.dependency("zzz", .{
         .target = target,
         .optimize = optimize,
-    });
+    }).module("zzz");
 
     // Add dependencies
     const tardy = b.dependency("tardy", .{
@@ -47,7 +46,7 @@ pub fn build(b: *std.Build) void {
     backend1.root_module.addImport("zzz", zzz_module);
     const build_backend1 = b.addInstallArtifact(backend1, .{});
     const run_backend1 = b.addRunArtifact(backend1);
-    
+
     // Backend 2
     const backend2 = b.addExecutable(.{
         .name = "backend2",
