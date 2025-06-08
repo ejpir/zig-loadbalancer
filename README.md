@@ -1,6 +1,9 @@
 # Zig Load Balancer
 
-A high-performance, production-ready HTTP load balancer implemented in Zig using the zzz framework. Features advanced optimizations including SIMD operations, zero-copy buffers, lock-free data structures, and comprehensive load balancing strategies.
+A high-performance, "production-ready -- SOON :D" HTTP load balancer implemented in Zig using the zzz framework. Features advanced optimizations including SIMD operations, zero-copy buffers, lock-free data structures, and comprehensive load balancing strategies.
+
+
+`FOR SSL: git clone https://github.com/tardy-org/secsock/pull/5 and put it in ../../vendor/secsock or adjust build.zig.zon`
 
 ## Features
 
