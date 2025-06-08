@@ -5,6 +5,8 @@ A high-performance, "production-ready -- SOON :D" HTTP load balancer implemented
 
 `FOR SSL: git clone https://github.com/tardy-org/secsock/pull/5 and put it in ../../vendor/secsock or adjust build.zig.zon`
 
+NOTE: THIS IS A WIP/ALPHA, it does work, but there are bugs to fix and code needs to be cleaned up.
+
 ## Features
 
 ### Core Functionality
