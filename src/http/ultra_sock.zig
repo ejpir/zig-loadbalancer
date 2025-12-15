@@ -90,7 +90,7 @@ pub const UltraSock = struct {
     /// Connect using BearSSL implementation
     fn connectWithBearSSL(self: *UltraSock, sock: Socket, runtime: *Runtime) !void {
         // Add small delay to prevent rapid BearSSL context creation issues
-        std.time.sleep(50 * std.time.ns_per_ms); // 50ms delay
+        std.Thread.sleep(50 * std.time.ns_per_ms); // 50ms delay
         
         // Initialize BearSSL with trust store for verification
         var bearssl = secsock.BearSSL.init(self.allocator);

@@ -98,21 +98,21 @@ fn configUpdateTaskAsync(task: ConfigUpdateTask) !void {
     }
 
     // Create a temporary list to copy the old backends
-    var old_backends_copy = BackendsList.init(allocator);
-    defer old_backends_copy.deinit();
+    var old_backends_copy = try BackendsList.initCapacity(allocator, 0);
+    defer old_backends_copy.deinit(allocator);
 
     // Copy the old backends so we can free them after applying the changes
     for (global_backends.items) |backend| {
         const host_copy = try allocator.dupe(u8, backend.getFullHost());
         const backend_copy = BackendServer.init(host_copy, backend.port, backend.weight);
-        try old_backends_copy.append(backend_copy);
+        try old_backends_copy.append(allocator, backend_copy);
     }
 
     // Create a new array of backends
     try config_context.connection_pool.reconfigureBackends(new_backends.items.len);
 
     // Apply the new configuration by replacing the global_backends items
-    global_backends.deinit();
+    global_backends.deinit(allocator);
     global_backends.* = new_backends;
 
     // Update the proxy config to use the new backends
@@ -164,7 +164,8 @@ pub fn onConfigChanged(rt: *Runtime, watcher: *ConfigWatcher, new_backends: Back
         for (new_backends.items) |backend| {
             allocator.free(backend.getFullHost());
         }
-        new_backends.deinit();
+        var backends_to_free = new_backends;
+        backends_to_free.deinit(allocator);
         
         return err;
     };

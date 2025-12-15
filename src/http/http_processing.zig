@@ -69,9 +69,9 @@ pub fn addProxyHeaders(
 ) !void {
     // Add Via header for HTTP transparency
     const via_value = try req_ctx.printf("1.1 zzz-load-balancer", .{});
-    try headers.append(.{ "Via", via_value });
-    
+    try headers.append(req_ctx.allocator(), .{ "Via", via_value });
+
     // Add response time header
     const response_time = try req_ctx.printf("{d}ms", .{duration_ms});
-    try headers.append(.{ "X-Response-Time", response_time });
+    try headers.append(req_ctx.allocator(), .{ "X-Response-Time", response_time });
 }

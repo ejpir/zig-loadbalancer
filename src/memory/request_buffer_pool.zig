@@ -28,28 +28,30 @@ pub const BufferSize = enum(u16) {
 /// Simple stack-based buffer pool for a single request
 /// No atomic operations needed since it's request-local
 const BufferStack = struct {
+    allocator: std.mem.Allocator,
     buffers: std.ArrayList([]u8),
     buffer_size: BufferSize,
     max_cached: u32,
-    
+
     const Self = @This();
-    
+
     pub fn init(allocator: std.mem.Allocator, buffer_size: BufferSize, max_cached: u32) Self {
         return Self{
-            .buffers = std.ArrayList([]u8).init(allocator),
+            .allocator = allocator,
+            .buffers = std.ArrayList([]u8).initCapacity(allocator, 0) catch .{ .items = &.{}, .capacity = 0 },
             .buffer_size = buffer_size,
             .max_cached = max_cached,
         };
     }
-    
+
     pub fn deinit(self: *Self) void {
         // Free all cached buffers
         for (self.buffers.items) |buffer| {
-            self.buffers.allocator.free(buffer);
+            self.allocator.free(buffer);
         }
-        self.buffers.deinit();
+        self.buffers.deinit(self.allocator);
     }
-    
+
     pub fn getBuffer(self: *Self) ![]u8 {
         if (self.buffers.items.len > 0) {
             // Pop from cache (fast path) - manual implementation
@@ -58,30 +60,30 @@ const BufferStack = struct {
             return buffer;
         } else {
             // Allocate new buffer (slow path)
-            return try self.buffers.allocator.alloc(u8, self.buffer_size.toBytes());
+            return try self.allocator.alloc(u8, self.buffer_size.toBytes());
         }
     }
-    
+
     pub fn returnBuffer(self: *Self, buffer: []u8) void {
         // Validate buffer size
         if (buffer.len != self.buffer_size.toBytes()) {
             log.warn("Buffer size mismatch: expected {d}, got {d} - freeing directly", .{ self.buffer_size.toBytes(), buffer.len });
-            self.buffers.allocator.free(buffer);
+            self.allocator.free(buffer);
             return;
         }
-        
+
         // Check if we have space to cache it
         if (self.buffers.items.len < self.max_cached) {
             // Add to cache for reuse
-            self.buffers.append(buffer) catch {
+            self.buffers.append(self.allocator, buffer) catch {
                 // If append fails, just free the buffer
-                self.buffers.allocator.free(buffer);
+                self.allocator.free(buffer);
                 return;
             };
             log.debug("Cached {s} buffer ({d}/{d} cached)", .{ @tagName(self.buffer_size), self.buffers.items.len, self.max_cached });
         } else {
             // Cache full, free the buffer
-            self.buffers.allocator.free(buffer);
+            self.allocator.free(buffer);
             log.debug("Cache full for {s} buffers, freed directly", .{@tagName(self.buffer_size)});
         }
     }

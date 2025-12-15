@@ -89,16 +89,16 @@ pub fn generateHeaderProcessor(comptime headers_to_copy: []const CommonHeaders) 
         
         /// Process headers with comptime-unrolled loops for maximum efficiency
         pub fn processHeaders(parsed: anytype, arena_allocator: std.mem.Allocator) !std.ArrayList([2][]const u8) {
-            var response_headers = std.ArrayList([2][]const u8).init(arena_allocator);
-            
+            var response_headers = try std.ArrayList([2][]const u8).initCapacity(arena_allocator, headers_to_copy.len);
+
             // Comptime-unrolled header copying - no runtime loops!
             inline for (headers_to_copy) |header_enum| {
                 const header_name = comptime header_enum.toString();
                 if (parsed.headers.get(header_name)) |value| {
-                    try response_headers.append(.{ header_name, value });
+                    try response_headers.append(arena_allocator, .{ header_name, value });
                 }
             }
-            
+
             return response_headers;
         }
         

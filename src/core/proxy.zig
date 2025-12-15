@@ -443,7 +443,7 @@ pub fn proxyRequest(
         }
 
         total_bytes += bytes_read;
-        try response_buffer.appendSlice(recv_buffer[0..bytes_read]);
+        try response_buffer.appendSlice(ctx.allocator, recv_buffer[0..bytes_read]);
         log.debug("Received {d} bytes (total: {d})", .{ bytes_read, total_bytes });
 
         // Check if we've received the complete headers
@@ -546,7 +546,7 @@ pub fn proxyRequest(
                     }
                     
                     // Small delay to avoid spinning
-                    std.time.sleep(10 * std.time.ns_per_ms);
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
                     continue;
                 }
                 
@@ -555,7 +555,7 @@ pub fn proxyRequest(
                 
                 // Append to response buffer
                 total_bytes += bytes_read;
-                try response_buffer.appendSlice(recv_buffer[0..bytes_read]);
+                try response_buffer.appendSlice(ctx.allocator, recv_buffer[0..bytes_read]);
                 body_size += bytes_read;
                 
                 log.debug("Received {d} bytes of chunked data (total: {d})", .{bytes_read, total_bytes});
@@ -597,7 +597,7 @@ pub fn proxyRequest(
                 }
                 
                 total_bytes += bytes_read;
-                try response_buffer.appendSlice(recv_buffer[0..bytes_read]);
+                try response_buffer.appendSlice(ctx.allocator, recv_buffer[0..bytes_read]);
                 
                 body_size += bytes_read;
                 log.debug("Received {d} bytes (total: {d}, body: {d}/{d})", .{ 
@@ -657,7 +657,7 @@ pub fn proxyRequest(
                 }
                 
                 total_bytes += bytes_read;
-                try response_buffer.appendSlice(recv_buffer[0..bytes_read]);
+                try response_buffer.appendSlice(ctx.allocator, recv_buffer[0..bytes_read]);
                 log.debug("Received {d} bytes (total: {d})", .{bytes_read, total_bytes});
             }
         }
@@ -791,7 +791,7 @@ pub fn generateSpecializedHandler(comptime strategy: types.LoadBalancerStrategy)
             var req_ctx = RequestContext.init(ctx.allocator);
             defer req_ctx.deinit();
             
-            var response_buffer = std.ArrayList(u8).init(req_ctx.allocator());
+            var response_buffer = try std.ArrayList(u8).initCapacity(req_ctx.allocator(), 0);
             var is_chunked_response = false;
             var has_compression = false;
             
@@ -827,7 +827,7 @@ fn handleRequestWithBackendSpecialized(ctx: *const Context, config: *const types
     defer req_ctx.deinit(); // Reports statistics and bulk cleanup
     
     // Create a buffer for the response data - will be cleaned up by arena
-    var response_buffer = std.ArrayList(u8).init(req_ctx.allocator());
+    var response_buffer = try std.ArrayList(u8).initCapacity(req_ctx.allocator(), 0);
     
     // Tracking for response encoding and transfer modes
     var is_chunked_response = false;
