@@ -229,26 +229,26 @@ fn proxyRequestWithSocket(
     log.debug("Proxy request completed in {d}ms", .{duration_ms});
 }
 
-/// Unified request builder using clean interface
+/// Optimized request builder - single allocation, no intermediate buffers
 fn buildRequest(ctx: *const Context, backend: *const BackendServer, backend_index: usize) ![]u8 {
-    var req_ctx = RequestContext.init(ctx.allocator);
-    defer req_ctx.deinit();
-    
-    // Use clean interface (complexity hidden)
     const method = @tagName(ctx.request.method orelse .GET);
     const uri = ctx.request.uri orelse "/";
     const body = ctx.request.body orelse "";
-    const headers = ctx.request.headers;
-    
-    const request_data = try http_processing.buildZeroCopyRequest(
-        &req_ctx, method, uri, headers, body, backend.getFullHost(), backend.port
+    const host = backend.getFullHost();
+    const port = backend.port;
+
+    // Single allocation - format directly to final buffer
+    const request_data = try std.fmt.allocPrint(
+        ctx.allocator,
+        "{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: keep-alive\r\n\r\n{s}",
+        .{ method, uri, host, port, body }
     );
-    
+
     log.debug("Built request for backend {d}: {d} bytes", .{
         backend_index + 1, request_data.len
     });
-    
-    return try ctx.allocator.dupe(u8, request_data);
+
+    return request_data;
 }
 
 pub fn proxyRequest(
