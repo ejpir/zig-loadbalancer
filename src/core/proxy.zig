@@ -790,14 +790,68 @@ pub fn generateSpecializedHandler(comptime strategy: types.LoadBalancerStrategy)
 
             var req_ctx = RequestContext.init(ctx.allocator);
             defer req_ctx.deinit();
-            
+
             var response_buffer = try std.ArrayList(u8).initCapacity(req_ctx.allocator(), 0);
             var is_chunked_response = false;
             var has_compression = false;
-            
+
+            // Try the originally selected backend with circuit breaker + failover
             proxyRequest(ctx.runtime, ctx, backend_ref, backend_idx, connection_pool, &response_buffer) catch |err| {
                 log.err("Failed to proxy request to backend {d}: {s}", .{ backend_idx + 1, @errorName(err) });
-                return createErrorResponse(ctx, .@"Bad Gateway", "Backend Error", "The backend server is temporarily unavailable or returned an error.");
+
+                // Circuit breaker: immediately mark backend unhealthy based on error type
+                switch (err) {
+                    error.SocketTimeout, error.SocketSendTimeout => {
+                        log.warn("Circuit breaker: marking backend {d} unhealthy (timeout)", .{backend_idx + 1});
+                        backend_ref.healthy.store(false, .release);
+                        _ = backend_ref.consecutive_failures.fetchAdd(1, .monotonic);
+                    },
+                    error.ConnectionFailed => {
+                        log.warn("Circuit breaker: marking backend {d} unhealthy (connection failed)", .{backend_idx + 1});
+                        backend_ref.healthy.store(false, .release);
+                        _ = backend_ref.consecutive_failures.fetchAdd(2, .monotonic);
+                    },
+                    else => {
+                        _ = backend_ref.consecutive_failures.fetchAdd(1, .monotonic);
+                    },
+                }
+
+                // Failover: find another healthy backend
+                var found_healthy = false;
+                var failover_idx: usize = 0;
+                for (backends.items, 0..) |fb, i| {
+                    if (i != backend_idx and fb.healthy.load(.acquire)) {
+                        failover_idx = i;
+                        found_healthy = true;
+                        break;
+                    }
+                }
+
+                if (!found_healthy) {
+                    return createErrorResponse(ctx, .@"Service Unavailable", "No Backends Available", "No healthy backend servers available for failover.");
+                }
+
+                const failover_ref = &backends.items[failover_idx];
+                log.info("Failover: trying backend {d} ({s}:{d})", .{failover_idx + 1, failover_ref.getFullHost(), failover_ref.port});
+
+                response_buffer.clearRetainingCapacity();
+
+                proxyRequest(ctx.runtime, ctx, failover_ref, failover_idx, connection_pool, &response_buffer) catch |retry_err| {
+                    log.err("Failover to backend {d} also failed: {s}", .{failover_idx + 1, @errorName(retry_err)});
+
+                    // Mark failover backend unhealthy too
+                    switch (retry_err) {
+                        error.SocketTimeout, error.SocketSendTimeout, error.ConnectionFailed => {
+                            failover_ref.healthy.store(false, .release);
+                            _ = failover_ref.consecutive_failures.fetchAdd(2, .monotonic);
+                        },
+                        else => {
+                            _ = failover_ref.consecutive_failures.fetchAdd(1, .monotonic);
+                        },
+                    }
+
+                    return createErrorResponse(ctx, .@"Service Unavailable", "Service Unavailable", "All backend servers failed to respond.");
+                };
             };
 
             return parseAndReturnResponse(strategy, ctx, config, backend_idx, &response_buffer, &is_chunked_response, &has_compression, handler_start_time, &req_ctx);
