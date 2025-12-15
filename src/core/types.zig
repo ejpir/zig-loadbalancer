@@ -15,13 +15,17 @@ pub const LoadBalancerStrategy = enum {
     weighted_round_robin,
     random,
     sticky,
-    
+
+    /// Comptime string map for O(1) strategy lookup
+    const strategy_map = std.StaticStringMap(LoadBalancerStrategy).initComptime(.{
+        .{ "round-robin", .round_robin },
+        .{ "weighted-round-robin", .weighted_round_robin },
+        .{ "random", .random },
+        .{ "sticky", .sticky },
+    });
+
     pub fn fromString(str: []const u8) !LoadBalancerStrategy {
-        if (std.mem.eql(u8, str, "round-robin")) return .round_robin;
-        if (std.mem.eql(u8, str, "weighted-round-robin")) return .weighted_round_robin;
-        if (std.mem.eql(u8, str, "random")) return .random;
-        if (std.mem.eql(u8, str, "sticky")) return .sticky;
-        return error.InvalidStrategy;
+        return strategy_map.get(str) orelse error.InvalidStrategy;
     }
 };
 
@@ -230,6 +234,38 @@ pub const ProxyConfig = struct {
     sticky_session_cookie_name: []const u8 = "ZZZ_BACKEND_ID", // Default cookie name for sticky sessions
     request_queues: ?[]RequestQueue = null, // Optional pipelining request queues
     backend_version: std.atomic.Value(u64) = std.atomic.Value(u64).init(1), // Version counter for backend state caching
+    /// Bitmap tracking healthy backends for O(1) failover lookup.
+    /// Bit N is set if backend N is healthy. Supports up to 64 backends.
+    healthy_bitmap: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     const connection_pool_mod = @import("../memory/connection_pool.zig");
+
+    /// Mark a backend as healthy in the bitmap
+    pub fn markHealthy(self: *ProxyConfig, idx: usize) void {
+        if (idx >= 64) return;
+        _ = self.healthy_bitmap.fetchOr(@as(u64, 1) << @intCast(idx), .release);
+    }
+
+    /// Mark a backend as unhealthy in the bitmap
+    pub fn markUnhealthy(self: *ProxyConfig, idx: usize) void {
+        if (idx >= 64) return;
+        _ = self.healthy_bitmap.fetchAnd(~(@as(u64, 1) << @intCast(idx)), .release);
+    }
+
+    /// Find any healthy backend excluding the given index. Returns null if none found.
+    pub fn findHealthyExcluding(self: *const ProxyConfig, exclude_idx: usize) ?usize {
+        var mask = self.healthy_bitmap.load(.acquire);
+        if (exclude_idx < 64) {
+            mask &= ~(@as(u64, 1) << @intCast(exclude_idx));
+        }
+        if (mask == 0) return null;
+        return @ctz(mask);
+    }
+
+    /// Check if a specific backend is healthy via bitmap
+    pub fn isHealthyBitmap(self: *const ProxyConfig, idx: usize) bool {
+        if (idx >= 64) return false;
+        const mask = self.healthy_bitmap.load(.acquire);
+        return (mask & (@as(u64, 1) << @intCast(idx))) != 0;
+    }
 };

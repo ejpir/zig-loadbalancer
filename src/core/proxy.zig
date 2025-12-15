@@ -87,6 +87,16 @@ const ProxyError = error{
     ResponseReceiveFailed,
 };
 
+/// Proxy timeout and buffer configuration
+pub const ProxyConfig = struct {
+    /// Socket receive timeout in milliseconds
+    pub const SOCKET_RECV_TIMEOUT_MS: i64 = 3000;
+    /// Threshold for logging slow sends (ms)
+    pub const SLOW_SEND_THRESHOLD_MS: i64 = 2000;
+    /// Receive buffer size in bytes
+    pub const RECV_BUFFER_SIZE: usize = 8192;
+};
+
 /// Create an error response with a nice HTML error page
 fn createErrorResponse(ctx: *const Context, status: http.Status, title: []const u8, message: []const u8) !Respond {
     const error_html = try std.fmt.allocPrint(ctx.allocator,
@@ -362,7 +372,7 @@ pub fn proxyRequest(
     };
 
     const send_duration_ms = std.time.milliTimestamp() - send_start_time;
-    if (send_duration_ms > 2000) {
+    if (send_duration_ms > ProxyConfig.SLOW_SEND_THRESHOLD_MS) {
         log.warn("Slow send to backend {s}:{d}: {d}ms", .{
             backend.getFullHost(), backend.port, send_duration_ms,
         });
@@ -373,12 +383,12 @@ pub fn proxyRequest(
     response_buffer.clearRetainingCapacity();
 
     log.debug("Reading response from backend", .{});
-    var recv_buffer: [8192]u8 = undefined;
+    var recv_buffer: [ProxyConfig.RECV_BUFFER_SIZE]u8 = undefined;
     var total_bytes: usize = 0;
     var did_receive_headers = false;
 
     // Read response with timeout
-    const socket_timeout_ms = 3000; // 3 second timeout
+    const socket_timeout_ms = ProxyConfig.SOCKET_RECV_TIMEOUT_MS;
     const start_recv_time = std.time.milliTimestamp();
     
     // First phase: Read headers only
