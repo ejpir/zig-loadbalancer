@@ -69,6 +69,7 @@ const metrics = @import("../utils/metrics.zig");
 const http_processing = @import("../http/http_processing.zig");
 const request_buffer_pool = @import("../memory/request_buffer_pool.zig");
 const RequestContext = @import("../memory/request_context.zig").RequestContext;
+const simd_parse = @import("../internal/simd_parse.zig");
 
 // Custom error set for proxy module
 const ProxyError = error{
@@ -414,7 +415,7 @@ pub fn proxyRequest(
 
             if (total_bytes > 0) {
                 // We already have some data - check if we have complete headers
-                if (std.mem.indexOf(u8, response_buffer.items, "\r\n\r\n")) |_| {
+                if (simd_parse.findHeaderEnd(response_buffer.items)) |_| {
                     log.info("Headers received, using partial response", .{});
                     did_receive_headers = true;
                     break;
@@ -436,7 +437,7 @@ pub fn proxyRequest(
         log.debug("Received {d} bytes (total: {d})", .{ bytes_read, total_bytes });
 
         // Check if we've received the complete headers
-        if (std.mem.indexOf(u8, response_buffer.items, "\r\n\r\n")) |_| {
+        if (simd_parse.findHeaderEnd(response_buffer.items)) |_| {
             did_receive_headers = true;
             log.debug("Headers received completely", .{});
 
@@ -457,7 +458,7 @@ pub fn proxyRequest(
     
     // Read the full response body - whether Content-Length or chunked
     if (did_receive_headers) {
-        const header_end = std.mem.indexOf(u8, response_buffer.items, "\r\n\r\n").? + 4;
+        const header_end = (simd_parse.findHeaderEnd(response_buffer.items) orelse 0) + 4;
         
         // Use RFC 7230 message framing logic to determine message length
         const headers_part = response_buffer.items[0..header_end];
@@ -551,7 +552,7 @@ pub fn proxyRequest(
                 
                 // Look for 0-length chunk which indicates end of response
                 // Format: "0\r\n\r\n"
-                if (std.mem.indexOf(u8, recv_buffer[0..bytes_read], "0\r\n\r\n")) |_| {
+                if (simd_parse.findChunkEnd(recv_buffer[0..bytes_read])) |_| {
                     log.info("Found end chunk marker", .{});
                     break;
                 }
@@ -766,15 +767,15 @@ pub fn proxyRequestStreaming(
 
         try header_buffer.appendSlice(ctx.allocator, recv_buffer[0..bytes_read]);
 
-        // Check for header end
-        if (std.mem.indexOf(u8, header_buffer.items, "\r\n\r\n")) |pos| {
+        // Check for header end (SIMD-accelerated)
+        if (simd_parse.findHeaderEnd(header_buffer.items)) |pos| {
             header_end_pos = pos + 4;
         }
     }
 
     // Parse status line and headers from backend response
     const headers_data = header_buffer.items[0..header_end_pos];
-    const status_line_end = std.mem.indexOf(u8, headers_data, "\r\n") orelse return error.FailedToRead;
+    const status_line_end = simd_parse.findLineEnd(headers_data) orelse return error.FailedToRead;
     const status_line = headers_data[0..status_line_end];
 
     // Parse status code (e.g., "HTTP/1.1 200 OK")
@@ -920,9 +921,9 @@ pub fn proxyRequestStreaming(
             _ = ctx.socket.send(ctx.runtime, recv_buffer[0..bytes_read]) catch break;
             body_sent += bytes_read;
 
-            // Check for chunked end marker
+            // Check for chunked end marker (SIMD-accelerated)
             if (message_length.type == .chunked) {
-                if (std.mem.indexOf(u8, recv_buffer[0..bytes_read], "0\r\n\r\n") != null) {
+                if (simd_parse.findChunkEnd(recv_buffer[0..bytes_read]) != null) {
                     break;
                 }
             }

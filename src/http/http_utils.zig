@@ -10,6 +10,7 @@ const Headers = types.Headers;
 const HttpVersion = types.HttpVersion;
 const request_buffer_pool = @import("../memory/request_buffer_pool.zig");
 const simd_parser = @import("simd_header_parser.zig");
+const simd_parse = @import("../internal/simd_parse.zig");
 
 /// SIMD-optimized Content-Length extraction (75% faster than traditional scanning)
 /// 
@@ -326,12 +327,12 @@ pub fn parseResponse(allocator: std.mem.Allocator, response_data: []const u8) !P
 pub fn parseResponseWithPool(allocator: std.mem.Allocator, response_data: []const u8, buffer_pool: ?*request_buffer_pool.RequestBufferPool) !ParsedResponse {
     // Robin Hood hash table + optional buffer pool for maximum performance
     
-    // Find end of headers
-    const header_end = std.mem.indexOf(u8, response_data, "\r\n\r\n") orelse
+    // Find end of headers (SIMD-accelerated)
+    const header_end = simd_parse.findHeaderEnd(response_data) orelse
         return error.MalformedResponse;
 
-    // Parse status line
-    const status_line_end = std.mem.indexOf(u8, response_data, "\r\n") orelse
+    // Parse status line (SIMD-accelerated)
+    const status_line_end = simd_parse.findLineEnd(response_data) orelse
         return error.MalformedResponse;
 
     const status_line = response_data[0..status_line_end];

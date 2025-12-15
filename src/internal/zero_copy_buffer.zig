@@ -1,5 +1,6 @@
 const std = @import("std");
 const log = std.log.scoped(.zero_copy);
+const simd_parse = @import("simd_parse.zig");
 
 /// Zero-copy buffer management system for load balancer proxy operations
 /// Provides 30-50% reduction in memory bandwidth through eliminated copy operations
@@ -193,8 +194,8 @@ pub const ZeroCopyProcessor = struct {
             self.version_ref = self.source_buffer.subRef(version_start, version.len);
         }
         
-        // Find headers end
-        const headers_end = std.mem.indexOf(u8, data[first_line_end + 2..], "\r\n\r\n") orelse return error.InvalidHttp;
+        // Find headers end (SIMD-accelerated)
+        const headers_end = simd_parse.findHeaderEnd(data[first_line_end + 2..]) orelse return error.InvalidHttp;
         const headers_section = data[first_line_end + 2..first_line_end + 2 + headers_end];
         
         // Headers start reference
@@ -460,8 +461,8 @@ pub const ProxyUsageExample = struct {
         var writer = ZeroCopyResponseWriter.init(allocator);
         defer writer.deinit();
         
-        // Parse response to find header/body boundary
-        if (std.mem.indexOf(u8, response_data, "\r\n\r\n")) |headers_end| {
+        // Parse response to find header/body boundary (SIMD-accelerated)
+        if (simd_parse.findHeaderEnd(response_data)) |headers_end| {
             // Add response headers (zero-copy reference)
             try writer.addSegment(response_data[0..headers_end + 2]);
             
