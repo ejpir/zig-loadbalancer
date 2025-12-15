@@ -93,8 +93,10 @@ pub const ProxyConfig = struct {
     pub const SOCKET_RECV_TIMEOUT_MS: i64 = 3000;
     /// Threshold for logging slow sends (ms)
     pub const SLOW_SEND_THRESHOLD_MS: i64 = 2000;
-    /// Receive buffer size in bytes
-    pub const RECV_BUFFER_SIZE: usize = 8192;
+    /// Receive buffer size in bytes - larger = fewer syscalls
+    pub const RECV_BUFFER_SIZE: usize = 32768; // 32KB for better throughput
+    /// How often to check timeout in streaming loop (every N iterations)
+    pub const TIMEOUT_CHECK_INTERVAL: usize = 16;
 };
 
 /// Create an error response with a nice HTML error page
@@ -846,26 +848,21 @@ pub fn proxyRequestStreaming(
     // End headers
     try writer.writeAll("\r\n");
 
-    // Send headers to client
+    // Combine headers + any initial body data into single send (one syscall)
+    if (header_buffer.items.len > header_end_pos) {
+        const initial_body = header_buffer.items[header_end_pos..];
+        try response_headers.appendSlice(ctx.allocator, initial_body);
+    }
+
+    // Single send for headers + initial body
     const sent = try ctx.socket.send_all(ctx.runtime, response_headers.items);
     if (sent != response_headers.items.len) {
-        log.err("Failed to send all headers", .{});
+        log.err("Failed to send headers", .{});
         return_to_pool = false;
         return error.RequestSendFailed;
     }
 
-    log.debug("Streamed headers to client ({d} bytes)", .{response_headers.items.len});
-
-    // Stream any body data we already have in header_buffer
-    if (header_buffer.items.len > header_end_pos) {
-        const initial_body = header_buffer.items[header_end_pos..];
-        _ = ctx.socket.send(ctx.runtime, initial_body) catch |err| {
-            log.err("Failed to stream initial body: {s}", .{@errorName(err)});
-            return_to_pool = false;
-            return .responded; // Headers already sent
-        };
-        log.debug("Streamed initial body ({d} bytes)", .{initial_body.len});
-    }
+    log.debug("Streamed headers+body ({d} bytes)", .{response_headers.items.len});
 
     // Calculate how much body we've already sent
     var body_sent = header_buffer.items.len - header_end_pos;
@@ -875,16 +872,19 @@ pub fn proxyRequestStreaming(
         // No body to stream
     } else if (message_length.type == .content_length) {
         const total_length = message_length.length;
+        var iterations: usize = 0;
         while (body_sent < total_length) {
-            const current_time = std.time.milliTimestamp();
-            if (current_time - start_recv_time > ProxyConfig.SOCKET_RECV_TIMEOUT_MS * 10) {
-                log.err("Timeout streaming body", .{});
-                return_to_pool = false;
-                break;
+            // Check timeout less frequently (every N iterations)
+            iterations += 1;
+            if (iterations % ProxyConfig.TIMEOUT_CHECK_INTERVAL == 0) {
+                const current_time = std.time.milliTimestamp();
+                if (current_time - start_recv_time > ProxyConfig.SOCKET_RECV_TIMEOUT_MS * 10) {
+                    return_to_pool = false;
+                    break;
+                }
             }
 
-            const bytes_read = sock.recv(rt, &recv_buffer) catch |err| {
-                log.err("Error reading body: {s}", .{@errorName(err)});
+            const bytes_read = sock.recv(rt, &recv_buffer) catch {
                 return_to_pool = false;
                 break;
             };
@@ -894,34 +894,28 @@ pub fn proxyRequestStreaming(
                 break;
             }
 
-            _ = ctx.socket.send(ctx.runtime, recv_buffer[0..bytes_read]) catch |err| {
-                log.err("Error streaming to client: {s}", .{@errorName(err)});
-                break;
-            };
-
+            _ = ctx.socket.send(ctx.runtime, recv_buffer[0..bytes_read]) catch break;
             body_sent += bytes_read;
         }
     } else {
         // Chunked or close-delimited: stream until connection closes or chunk ends
-        var read_failures: u8 = 0;
-        while (read_failures < 3) {
-            const current_time = std.time.milliTimestamp();
-            if (current_time - start_recv_time > ProxyConfig.SOCKET_RECV_TIMEOUT_MS * 10) {
-                return_to_pool = false;
-                break;
+        var iterations: usize = 0;
+        while (true) {
+            iterations += 1;
+            if (iterations % ProxyConfig.TIMEOUT_CHECK_INTERVAL == 0) {
+                const current_time = std.time.milliTimestamp();
+                if (current_time - start_recv_time > ProxyConfig.SOCKET_RECV_TIMEOUT_MS * 10) {
+                    return_to_pool = false;
+                    break;
+                }
             }
 
-            const bytes_read = sock.recv(rt, &recv_buffer) catch {
-                read_failures += 1;
-                continue;
-            };
+            const bytes_read = sock.recv(rt, &recv_buffer) catch break;
 
             if (bytes_read == 0) {
                 return_to_pool = false;
                 break;
             }
-
-            read_failures = 0;
 
             _ = ctx.socket.send(ctx.runtime, recv_buffer[0..bytes_read]) catch break;
             body_sent += bytes_read;
