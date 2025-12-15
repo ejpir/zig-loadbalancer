@@ -992,3 +992,45 @@ The ~4% improvement from removing atomics seems modest, but:
 
 - `main_multiprocess.zig` - Added `MultiProcessProxyConfig`, `multiprocessStreamingProxy()`, `generateMultiProcessHandler()`
 - `src/memory/simple_connection_pool.zig` - NEW: Non-atomic connection pool for single-threaded workers
+
+
+---
+todo:
+
+⏺ Based on comparing the implementations, here's what's missing from the multi-process version:
+
+  Missing Features in Multi-Process
+
+  | Feature              | Multi-Threaded                                | Multi-Process                     | Difficulty |
+  |----------------------|-----------------------------------------------|-----------------------------------|------------|
+  | Health Checking      | ✅ Background thread pings backends every 2s  | ❌ Backends always marked healthy | Medium     |
+  | Circuit Breaker      | ✅ Marks backend unhealthy on timeout/failure | ❌ No failure tracking            | Easy       |
+  | Failover             | ✅ Tries another backend on failure           | ❌ Returns error immediately      | Easy       |
+  | YAML Config          | ✅ Reads from config/backends.yaml            | ❌ Hardcoded backends only        | Easy       |
+  | Weighted Round Robin | ✅ Respects weight field                      | ❌ Weight ignored                 | Easy       |
+  | Sticky Sessions      | ✅ Cookie-based affinity                      | ❌ Not implemented                | Medium     |
+  | Config Hot Reload    | ✅ Watches file for changes                   | ❌ Restart required               | Hard       |
+  | File Logging         | ✅ Logs to logs/                              | ❌ stderr only                    | Easy       |
+
+  Implementation Approach
+
+  The challenge is multi-process workers don't share memory. Options:
+
+  1. Per-Worker Health Checking (Recommended)
+    - Each worker runs its own health checks
+    - Simple, no IPC needed
+    - Slight redundancy (N workers × health checks) but acceptable
+  2. Circuit Breaker / Failover
+    - Easy: just add the logic from proxy.zig:markBackendUnhealthy and findHealthyBackend
+    - Works per-worker, no shared state needed
+  3. YAML Config
+    - Load in master, pass to workers at fork time
+    - Workers get snapshot of config
+  4. Sticky Sessions
+    - Needs hash-based routing (hash(cookie) % backends)
+    - Pure computation, no shared state
+
+  Want me to implement these? I'd suggest starting with:
+  1. Health checking + circuit breaker + failover (most impactful)
+  2. YAML config loading
+  3. Weighted round robin
