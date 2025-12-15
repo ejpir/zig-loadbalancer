@@ -3,7 +3,7 @@ const log = std.log.scoped(.@"examples/load_balancer");
 
 // Override the root log level for all release builds to ensure debug/info messages are visible
 pub const std_options: std.Options = .{
-    .log_level = .info,
+    .log_level = .err, // Use .info for debugging, .err for benchmarks
     .logFn = @import("src/utils/logging.zig").customLog,
 };
 
