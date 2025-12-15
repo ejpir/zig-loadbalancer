@@ -667,6 +667,283 @@ pub fn proxyRequest(
 }
 
 
+/// Streaming proxy - sends response to client as it arrives from backend
+/// This eliminates buffering of the entire response body, reducing memory usage
+/// and improving time-to-first-byte for large responses.
+pub fn proxyRequestStreaming(
+    rt: *Runtime,
+    ctx: *const Context,
+    backend: *const BackendServer,
+    backend_index: usize,
+    connection_pool: *connection_pool_mod.LockFreeConnectionPool,
+) !Respond {
+    const protocol_str = if (backend.isHttps()) "HTTPS" else "HTTP";
+    log.debug("Streaming proxy to backend {d} at {s}:{d} ({s})", .{
+        backend_index + 1, backend.getHost(), backend.port, protocol_str
+    });
+
+    const start_time = std.time.milliTimestamp();
+    var return_to_pool = true;
+
+    // Get or create backend connection
+    var sock = connection_pool.getConnection(backend_index) orelse blk: {
+        log.debug("STREAM: No pooled connection for backend {d}, creating new", .{backend_index + 1});
+        var ultra_sock = UltraSock.fromBackendServer(ctx.allocator, backend) catch |err| {
+            log.err("Failed to init socket to backend {d}: {s}", .{ backend_index + 1, @errorName(err) });
+            return error.ConnectionFailed;
+        };
+
+        ultra_sock.connect(rt) catch |err| {
+            ultra_sock.close_blocking();
+            log.err("Socket connect error: {s}", .{@errorName(err)});
+            return error.ConnectionFailed;
+        };
+
+        break :blk ultra_sock;
+    };
+
+    // Validate socket
+    if (sock.socket == null or !sock.connected) {
+        log.warn("Invalid pooled socket - creating new connection", .{});
+        sock = UltraSock.fromBackendServer(ctx.allocator, backend) catch |err| {
+            log.err("Failed to init socket: {s}", .{@errorName(err)});
+            return error.ConnectionFailed;
+        };
+        return_to_pool = false;
+        sock.connect(rt) catch {
+            sock.close_blocking();
+            return error.ConnectionFailed;
+        };
+        return_to_pool = true;
+    }
+
+    defer {
+        if (return_to_pool) {
+            connection_pool.returnConnection(backend_index, sock);
+        } else {
+            sock.close_blocking();
+        }
+    }
+
+    // Build and send request to backend
+    const request_data = try buildRequest(ctx, backend, backend_index);
+    defer ctx.allocator.free(request_data);
+
+    _ = sock.send_all(rt, request_data) catch |err| {
+        log.err("Failed to send request: {s}", .{@errorName(err)});
+        return_to_pool = false;
+        return error.RequestSendFailed;
+    };
+
+    // Read headers from backend (buffer until \r\n\r\n)
+    var header_buffer = try std.ArrayList(u8).initCapacity(ctx.allocator, 4096);
+    defer header_buffer.deinit(ctx.allocator);
+
+    var recv_buffer: [ProxyConfig.RECV_BUFFER_SIZE]u8 = undefined;
+    const start_recv_time = std.time.milliTimestamp();
+    var header_end_pos: usize = 0;
+
+    while (header_end_pos == 0) {
+        const current_time = std.time.milliTimestamp();
+        if (current_time - start_recv_time > ProxyConfig.SOCKET_RECV_TIMEOUT_MS) {
+            log.err("Timeout reading headers from backend", .{});
+            return_to_pool = false;
+            return error.SocketTimeout;
+        }
+
+        const bytes_read = sock.recv(rt, &recv_buffer) catch |err| {
+            log.err("Error reading headers: {s}", .{@errorName(err)});
+            return_to_pool = false;
+            return error.FailedToRead;
+        };
+
+        if (bytes_read == 0) {
+            return_to_pool = false;
+            return error.EmptyResponse;
+        }
+
+        try header_buffer.appendSlice(ctx.allocator, recv_buffer[0..bytes_read]);
+
+        // Check for header end
+        if (std.mem.indexOf(u8, header_buffer.items, "\r\n\r\n")) |pos| {
+            header_end_pos = pos + 4;
+        }
+    }
+
+    // Parse status line and headers from backend response
+    const headers_data = header_buffer.items[0..header_end_pos];
+    const status_line_end = std.mem.indexOf(u8, headers_data, "\r\n") orelse return error.FailedToRead;
+    const status_line = headers_data[0..status_line_end];
+
+    // Parse status code (e.g., "HTTP/1.1 200 OK")
+    const status_code_start = std.mem.indexOf(u8, status_line, " ") orelse return error.FailedToRead;
+    const status_code_str = status_line[status_code_start + 1 ..][0..3];
+    const status_code = std.fmt.parseInt(u16, status_code_str, 10) catch 200;
+
+    // Map to zzz status enum
+    const http_module = @import("zzz").HTTP;
+    const status: http_module.Status = @enumFromInt(status_code);
+
+    // Determine content length and transfer encoding from backend headers
+    const message_length = http_utils.determineMessageLength("GET", status_code, headers_data, false);
+
+    // Check for Connection: close
+    if (std.mem.indexOf(u8, headers_data, "Connection: close") != null) {
+        return_to_pool = false;
+    }
+
+    // Build response headers manually to avoid dangling pointers
+    // (response.headers stores slices, but our header_buffer gets freed)
+    // Pre-allocate 512 bytes - typical response headers fit in this
+    var response_headers = try std.ArrayList(u8).initCapacity(ctx.allocator, 512);
+    defer response_headers.deinit(ctx.allocator);
+
+    // Use single writer to avoid repeated struct creation
+    var writer = response_headers.writer(ctx.allocator);
+
+    // Status line
+    const status_reason = @tagName(status);
+    try writer.print("HTTP/1.1 {d} {s}\r\nServer: zzz-lb\r\nConnection: keep-alive\r\nVia: 1.1 zzz-lb\r\n", .{status_code, status_reason});
+
+    // O(1) lookup for hop-by-hop headers to skip
+    const skip_header_map = std.StaticStringMap(void).initComptime(.{
+        .{ "connection", {} }, .{ "keep-alive", {} }, .{ "transfer-encoding", {} },
+        .{ "te", {} }, .{ "trailer", {} }, .{ "upgrade", {} },
+        .{ "proxy-authorization", {} }, .{ "proxy-authenticate", {} }, .{ "server", {} },
+    });
+
+    // Forward relevant headers from backend (copy directly to output)
+    var line_start: usize = status_line_end + 2;
+    while (line_start < header_end_pos - 2) {
+        const line_end = std.mem.indexOfPos(u8, headers_data, line_start, "\r\n") orelse break;
+        const line = headers_data[line_start..line_end];
+
+        if (std.mem.indexOf(u8, line, ":")) |colon_pos| {
+            const header_name = line[0..colon_pos];
+
+            // O(1) skip check via StaticStringMap (case-insensitive via lowercase keys)
+            var lower_buf: [64]u8 = undefined;
+            const lower_name = if (header_name.len <= 64) blk: {
+                for (header_name, 0..) |c, i| {
+                    lower_buf[i] = std.ascii.toLower(c);
+                }
+                break :blk lower_buf[0..header_name.len];
+            } else header_name; // Fallback for very long headers
+
+            if (skip_header_map.get(lower_name) == null) {
+                try writer.print("{s}\r\n", .{line});
+            }
+        }
+
+        line_start = line_end + 2;
+    }
+
+    // Add Content-Length if known
+    if (message_length.type == .content_length) {
+        try writer.print("Content-Length: {d}\r\n", .{message_length.length});
+    }
+
+    // End headers
+    try writer.writeAll("\r\n");
+
+    // Send headers to client
+    const sent = try ctx.socket.send_all(ctx.runtime, response_headers.items);
+    if (sent != response_headers.items.len) {
+        log.err("Failed to send all headers", .{});
+        return_to_pool = false;
+        return error.RequestSendFailed;
+    }
+
+    log.debug("Streamed headers to client ({d} bytes)", .{response_headers.items.len});
+
+    // Stream any body data we already have in header_buffer
+    if (header_buffer.items.len > header_end_pos) {
+        const initial_body = header_buffer.items[header_end_pos..];
+        _ = ctx.socket.send(ctx.runtime, initial_body) catch |err| {
+            log.err("Failed to stream initial body: {s}", .{@errorName(err)});
+            return_to_pool = false;
+            return .responded; // Headers already sent
+        };
+        log.debug("Streamed initial body ({d} bytes)", .{initial_body.len});
+    }
+
+    // Calculate how much body we've already sent
+    var body_sent = header_buffer.items.len - header_end_pos;
+
+    // Stream remaining body from backend to client
+    if (message_length.type == .no_body) {
+        // No body to stream
+    } else if (message_length.type == .content_length) {
+        const total_length = message_length.length;
+        while (body_sent < total_length) {
+            const current_time = std.time.milliTimestamp();
+            if (current_time - start_recv_time > ProxyConfig.SOCKET_RECV_TIMEOUT_MS * 10) {
+                log.err("Timeout streaming body", .{});
+                return_to_pool = false;
+                break;
+            }
+
+            const bytes_read = sock.recv(rt, &recv_buffer) catch |err| {
+                log.err("Error reading body: {s}", .{@errorName(err)});
+                return_to_pool = false;
+                break;
+            };
+
+            if (bytes_read == 0) {
+                return_to_pool = false;
+                break;
+            }
+
+            _ = ctx.socket.send(ctx.runtime, recv_buffer[0..bytes_read]) catch |err| {
+                log.err("Error streaming to client: {s}", .{@errorName(err)});
+                break;
+            };
+
+            body_sent += bytes_read;
+        }
+    } else {
+        // Chunked or close-delimited: stream until connection closes or chunk ends
+        var read_failures: u8 = 0;
+        while (read_failures < 3) {
+            const current_time = std.time.milliTimestamp();
+            if (current_time - start_recv_time > ProxyConfig.SOCKET_RECV_TIMEOUT_MS * 10) {
+                return_to_pool = false;
+                break;
+            }
+
+            const bytes_read = sock.recv(rt, &recv_buffer) catch {
+                read_failures += 1;
+                continue;
+            };
+
+            if (bytes_read == 0) {
+                return_to_pool = false;
+                break;
+            }
+
+            read_failures = 0;
+
+            _ = ctx.socket.send(ctx.runtime, recv_buffer[0..bytes_read]) catch break;
+            body_sent += bytes_read;
+
+            // Check for chunked end marker
+            if (message_length.type == .chunked) {
+                if (std.mem.indexOf(u8, recv_buffer[0..bytes_read], "0\r\n\r\n") != null) {
+                    break;
+                }
+            }
+        }
+    }
+
+    const duration_ms = std.time.milliTimestamp() - start_time;
+    log.info("Streaming proxy completed: {d} bytes in {d}ms", .{body_sent, duration_ms});
+
+    // Record metrics
+    metrics.global_metrics.recordRequest(duration_ms, status_code);
+
+    return .responded;
+}
+
 /// Parse response and return with optimized header processing
 fn parseAndReturnResponse(
     comptime strategy: types.LoadBalancerStrategy,
@@ -722,10 +999,132 @@ fn parseAndReturnResponse(
     });
 }
 
+/// Handle streaming proxy with failover support
+fn handleStreamingProxy(
+    ctx: *const Context,
+    config: *const types.ProxyConfig,
+    backends: *const types.BackendsList,
+    backend_idx: usize,
+    backend_ref: *const BackendServer,
+    connection_pool: *connection_pool_mod.LockFreeConnectionPool,
+) !Respond {
+    _ = config;
+
+    // Try primary backend with streaming
+    return proxyRequestStreaming(ctx.runtime, ctx, backend_ref, backend_idx, connection_pool) catch |err| {
+        log.err("Streaming proxy failed to backend {d}: {s}", .{backend_idx + 1, @errorName(err)});
+
+        // Circuit breaker: mark backend unhealthy
+        markBackendUnhealthy(backend_ref, err);
+
+        // Failover: find another healthy backend
+        const failover_idx = findHealthyBackend(backends, backend_idx) orelse {
+            return createErrorResponse(ctx, .@"Service Unavailable", "No Backends Available",
+                "No healthy backend servers available for failover.");
+        };
+
+        const failover_ref = &backends.items[failover_idx];
+        log.info("Failover: trying backend {d} ({s}:{d})", .{
+            failover_idx + 1, failover_ref.getFullHost(), failover_ref.port
+        });
+
+        // Try failover backend
+        return proxyRequestStreaming(ctx.runtime, ctx, failover_ref, failover_idx, connection_pool) catch |retry_err| {
+            log.err("Failover to backend {d} also failed: {s}", .{failover_idx + 1, @errorName(retry_err)});
+            markBackendUnhealthy(failover_ref, retry_err);
+            return createErrorResponse(ctx, .@"Service Unavailable", "Service Unavailable",
+                "All backend servers failed to respond.");
+        };
+    };
+}
+
+/// Handle buffered proxy (legacy mode) with failover support
+fn handleBufferedProxy(
+    comptime strategy: types.LoadBalancerStrategy,
+    ctx: *const Context,
+    config: *const types.ProxyConfig,
+    backends: *const types.BackendsList,
+    backend_idx: usize,
+    backend_ref: *const BackendServer,
+    connection_pool: *connection_pool_mod.LockFreeConnectionPool,
+    handler_start_time: i64,
+) !Respond {
+    var req_ctx = RequestContext.init(ctx.allocator);
+    defer req_ctx.deinit();
+
+    var response_buffer = try std.ArrayList(u8).initCapacity(req_ctx.allocator(), 0);
+    var is_chunked_response = false;
+    var has_compression = false;
+
+    // Try the originally selected backend
+    proxyRequest(ctx.runtime, ctx, backend_ref, backend_idx, connection_pool, &response_buffer) catch |err| {
+        log.err("Failed to proxy request to backend {d}: {s}", .{backend_idx + 1, @errorName(err)});
+        markBackendUnhealthy(backend_ref, err);
+
+        // Failover: find another healthy backend
+        const failover_idx = findHealthyBackend(backends, backend_idx) orelse {
+            return createErrorResponse(ctx, .@"Service Unavailable", "No Backends Available",
+                "No healthy backend servers available for failover.");
+        };
+
+        const failover_ref = &backends.items[failover_idx];
+        log.info("Failover: trying backend {d} ({s}:{d})", .{
+            failover_idx + 1, failover_ref.getFullHost(), failover_ref.port
+        });
+
+        response_buffer.clearRetainingCapacity();
+
+        proxyRequest(ctx.runtime, ctx, failover_ref, failover_idx, connection_pool, &response_buffer) catch |retry_err| {
+            log.err("Failover to backend {d} also failed: {s}", .{failover_idx + 1, @errorName(retry_err)});
+            markBackendUnhealthy(failover_ref, retry_err);
+            return createErrorResponse(ctx, .@"Service Unavailable", "Service Unavailable",
+                "All backend servers failed to respond.");
+        };
+    };
+
+    return parseAndReturnResponse(strategy, ctx, config, backend_idx, &response_buffer,
+        &is_chunked_response, &has_compression, handler_start_time, &req_ctx);
+}
+
+/// Mark backend as unhealthy based on error type (circuit breaker)
+/// Note: Uses @constCast because atomic operations are inherently safe for concurrent modification,
+/// but the BackendServer pointer may be const due to the ProxyConfig's const BackendsList pointer.
+fn markBackendUnhealthy(backend_ref: *const BackendServer, err: anyerror) void {
+    // Atomics are designed for concurrent modification - safe to cast away const
+    const healthy_ptr = @constCast(&backend_ref.healthy);
+    const failures_ptr = @constCast(&backend_ref.consecutive_failures);
+
+    switch (err) {
+        error.SocketTimeout, error.SocketSendTimeout => {
+            log.warn("Circuit breaker: marking backend unhealthy (timeout)", .{});
+            healthy_ptr.store(false, .release);
+            _ = failures_ptr.fetchAdd(1, .monotonic);
+        },
+        error.ConnectionFailed => {
+            log.warn("Circuit breaker: marking backend unhealthy (connection failed)", .{});
+            healthy_ptr.store(false, .release);
+            _ = failures_ptr.fetchAdd(2, .monotonic);
+        },
+        else => {
+            _ = failures_ptr.fetchAdd(1, .monotonic);
+        },
+    }
+}
+
+/// Find a healthy backend excluding the given index
+fn findHealthyBackend(backends: *const types.BackendsList, exclude_idx: usize) ?usize {
+    for (backends.items, 0..) |fb, i| {
+        if (i != exclude_idx and fb.healthy.load(.acquire)) {
+            return i;
+        }
+    }
+    return null;
+}
+
 /// Simplified load balance handler with clean strategy interface
 pub fn generateSpecializedHandler(comptime strategy: types.LoadBalancerStrategy) fn(ctx: *const Context, config: *const types.ProxyConfig) anyerror!Respond {
     // Use clean header processing interface (complexity hidden)
-    
+
     return struct {
         pub fn handleRequest(ctx: *const Context, config: *const types.ProxyConfig) !Respond {
             // Start timer for overall request handling
@@ -775,73 +1174,13 @@ pub fn generateSpecializedHandler(comptime strategy: types.LoadBalancerStrategy)
                 backend_idx + 1, backend_ref.getFullHost(), backend_ref.port, backend_ref.weight
             });
 
-            var req_ctx = RequestContext.init(ctx.allocator);
-            defer req_ctx.deinit();
+            // Use streaming mode if enabled (default: true)
+            if (config.streaming) {
+                return handleStreamingProxy(ctx, config, backends, backend_idx, backend_ref, connection_pool);
+            }
 
-            var response_buffer = try std.ArrayList(u8).initCapacity(req_ctx.allocator(), 0);
-            var is_chunked_response = false;
-            var has_compression = false;
-
-            // Try the originally selected backend with circuit breaker + failover
-            proxyRequest(ctx.runtime, ctx, backend_ref, backend_idx, connection_pool, &response_buffer) catch |err| {
-                log.err("Failed to proxy request to backend {d}: {s}", .{ backend_idx + 1, @errorName(err) });
-
-                // Circuit breaker: immediately mark backend unhealthy based on error type
-                switch (err) {
-                    error.SocketTimeout, error.SocketSendTimeout => {
-                        log.warn("Circuit breaker: marking backend {d} unhealthy (timeout)", .{backend_idx + 1});
-                        backend_ref.healthy.store(false, .release);
-                        _ = backend_ref.consecutive_failures.fetchAdd(1, .monotonic);
-                    },
-                    error.ConnectionFailed => {
-                        log.warn("Circuit breaker: marking backend {d} unhealthy (connection failed)", .{backend_idx + 1});
-                        backend_ref.healthy.store(false, .release);
-                        _ = backend_ref.consecutive_failures.fetchAdd(2, .monotonic);
-                    },
-                    else => {
-                        _ = backend_ref.consecutive_failures.fetchAdd(1, .monotonic);
-                    },
-                }
-
-                // Failover: find another healthy backend
-                var found_healthy = false;
-                var failover_idx: usize = 0;
-                for (backends.items, 0..) |fb, i| {
-                    if (i != backend_idx and fb.healthy.load(.acquire)) {
-                        failover_idx = i;
-                        found_healthy = true;
-                        break;
-                    }
-                }
-
-                if (!found_healthy) {
-                    return createErrorResponse(ctx, .@"Service Unavailable", "No Backends Available", "No healthy backend servers available for failover.");
-                }
-
-                const failover_ref = &backends.items[failover_idx];
-                log.info("Failover: trying backend {d} ({s}:{d})", .{failover_idx + 1, failover_ref.getFullHost(), failover_ref.port});
-
-                response_buffer.clearRetainingCapacity();
-
-                proxyRequest(ctx.runtime, ctx, failover_ref, failover_idx, connection_pool, &response_buffer) catch |retry_err| {
-                    log.err("Failover to backend {d} also failed: {s}", .{failover_idx + 1, @errorName(retry_err)});
-
-                    // Mark failover backend unhealthy too
-                    switch (retry_err) {
-                        error.SocketTimeout, error.SocketSendTimeout, error.ConnectionFailed => {
-                            failover_ref.healthy.store(false, .release);
-                            _ = failover_ref.consecutive_failures.fetchAdd(2, .monotonic);
-                        },
-                        else => {
-                            _ = failover_ref.consecutive_failures.fetchAdd(1, .monotonic);
-                        },
-                    }
-
-                    return createErrorResponse(ctx, .@"Service Unavailable", "Service Unavailable", "All backend servers failed to respond.");
-                };
-            };
-
-            return parseAndReturnResponse(strategy, ctx, config, backend_idx, &response_buffer, &is_chunked_response, &has_compression, handler_start_time, &req_ctx);
+            // Buffered mode (legacy)
+            return handleBufferedProxy(strategy, ctx, config, backends, backend_idx, backend_ref, connection_pool, handler_start_time);
         }
     }.handleRequest;
 }
