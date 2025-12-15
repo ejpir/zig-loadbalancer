@@ -257,3 +257,35 @@ Contributions are welcome! Areas of particular interest:
 - Security enhancements (mTLS, authentication)
 
 Please ensure all contributions maintain the high-performance design principles and include appropriate tests.
+
+---
+
+## Performance Notes
+
+The proxy is on the critical path of every request:
+
+```
+Client → [Proxy] → Backend → [Proxy] → Client
+           ↑                    ↑
+        overhead             overhead
+```
+
+**Latency breakdown:**
+
+| Step | Time |
+|------|------|
+| Backend processing | ~50μs (20k req/s = 50μs each) |
+| Proxy overhead | ~15-20μs (parsing, headers, pool) |
+| Extra network hops | ~10-15μs (2 extra hops) |
+| **Total per request** | **~75-85μs** |
+
+**Current benchmarks (ReleaseFast, macOS):**
+- Multi-threaded: 17,148 req/s
+- Multi-process (nginx-style): 17,770 req/s
+- Backend direct: ~20,000 req/s
+- **Proxy efficiency: 85-89%**
+
+To scale further:
+1. Multiple proxy instances (horizontal scaling behind L4 LB)
+2. HTTP/2 multiplexing (multiple requests per connection)
+3. Linux with io_uring (better async I/O than kqueue)

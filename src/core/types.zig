@@ -239,6 +239,7 @@ pub const ProxyConfig = struct {
     healthy_bitmap: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Enable streaming mode: send response to client as it arrives from backend.
     /// Reduces memory usage and improves TTFB for large responses.
+    /// For small responses, buffered mode (false) may be faster due to fewer I/O ops.
     streaming: bool = true,
 
     const connection_pool_mod = @import("../memory/connection_pool.zig");

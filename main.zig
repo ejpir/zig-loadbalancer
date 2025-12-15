@@ -64,8 +64,13 @@ pub fn main() !void {
     // Add backends to the connection pool
     try connection_pool.addBackends(config.backends.items.len);
 
-    // Initialize tardy runtime
-    var t = try Tardy.init(allocator, .{ .threading = .{ .multi = 10 }, .pooling = .grow, .size_tasks_initial = 1024, .size_aio_reap_max = 1024 });
+    // Initialize tardy runtime with higher limits for better concurrency
+    var t = try Tardy.init(allocator, .{
+        .threading = .{ .multi = 50 },
+        .pooling = .grow,
+        .size_tasks_initial = 4096, // More task slots
+        .size_aio_reap_max = 4096, // Process more I/O events per cycle
+    });
     defer t.deinit();
 
     // Set up request queues for pipelining (one per backend for thread safety)
