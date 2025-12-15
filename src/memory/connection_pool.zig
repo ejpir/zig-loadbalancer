@@ -3,6 +3,10 @@ const log = std.log.scoped(.connection_pool);
 const UltraSock = @import("../http/ultra_sock.zig").UltraSock;
 const cas_pool = @import("cas_optimized_connection_pool.zig");
 
+/// Enable verbose debug logging for connection pool operations.
+/// Set to true only for debugging - adds overhead in hot paths.
+const POOL_DEBUG = false;
+
 /// Lock-free atomic stack for socket connection pooling
 /// 
 /// This is a high-performance, thread-safe connection pool implementation that uses
@@ -158,41 +162,41 @@ const AtomicConnectionStack = struct {
         while (true) {
             // Atomically check size and increment if within bounds
             const current_size = self.size.load(.acquire);
-            log.debug("PUSH: current_size={d}, max_size={d}", .{ current_size, self.max_size });
-            
+            if (comptime POOL_DEBUG) log.debug("PUSH: current_size={d}, max_size={d}", .{ current_size, self.max_size });
+
             if (current_size >= self.max_size) {
                 // Pool is full, clean up and return error
-                log.debug("PUSH: Pool full, rejecting connection", .{});
+                if (comptime POOL_DEBUG) log.debug("PUSH: Pool full, rejecting connection", .{});
                 self.allocator.destroy(node);
                 return error.PoolFull;
             }
-            
+
             // Try to reserve a slot by incrementing size
             const cas_result = self.size.cmpxchgWeak(current_size, current_size + 1, .acq_rel, .acquire);
             if (cas_result != null) {
                 // Size changed between load and CAS, retry the size check
-                log.debug("PUSH: Size CAS failed, retrying. Expected {d}, got {d}", .{ current_size, cas_result.? });
+                if (comptime POOL_DEBUG) log.debug("PUSH: Size CAS failed, retrying. Expected {d}, got {d}", .{ current_size, cas_result.? });
                 continue;
             }
-            
-            log.debug("PUSH: Reserved size slot {d} -> {d}", .{ current_size, current_size + 1 });
-            
+
+            if (comptime POOL_DEBUG) log.debug("PUSH: Reserved size slot {d} -> {d}", .{ current_size, current_size + 1 });
+
             // We successfully reserved a slot, now try to add the node
             var head_cas_attempts: u32 = 0;
             const max_head_cas_attempts = 1000; // Reasonable upper bound to prevent infinite loops
-            
+
             while (head_cas_attempts < max_head_cas_attempts) {
                 const current_head = self.head.load(.acquire);
                 node.next.store(current_head, .release);
-                
+
                 if (self.head.cmpxchgWeak(current_head, node, .acq_rel, .acquire)) |_| {
                     // CAS failed - another thread modified head, retry the head CAS
                     head_cas_attempts += 1;
-                    log.debug("PUSH: Head CAS failed, attempt {d}/{d}", .{ head_cas_attempts, max_head_cas_attempts });
+                    if (comptime POOL_DEBUG) log.debug("PUSH: Head CAS failed, attempt {d}/{d}", .{ head_cas_attempts, max_head_cas_attempts });
                     continue;
                 } else {
                     // CAS succeeded - node is in the stack and size is already incremented
-                    log.debug("PUSH: SUCCESS - connection added to pool", .{});
+                    if (comptime POOL_DEBUG) log.debug("PUSH: SUCCESS - connection added to pool", .{});
                     return;
                 }
             }
@@ -234,29 +238,35 @@ const AtomicConnectionStack = struct {
     /// - We see all writes that happened before the node was pushed
     /// - Other threads see that the node is removed before we free it
     fn pop(self: *AtomicConnectionStack) ?UltraSock {
-        const current_size = self.size.load(.acquire);
-        log.debug("POP: Starting with size={d}", .{current_size});
-        
+        if (comptime POOL_DEBUG) {
+            const current_size = self.size.load(.acquire);
+            log.debug("POP: Starting with size={d}", .{current_size});
+        }
+
         // Lock-free CAS retry loop
         while (true) {
             const current_head = self.head.load(.acquire);
             if (current_head == null) {
-                log.debug("POP: Stack is empty, returning null", .{});
+                if (comptime POOL_DEBUG) log.debug("POP: Stack is empty, returning null", .{});
                 return null; // Stack is empty
             }
-            
+
             const next = current_head.?.next.load(.acquire);
-            
+
             if (self.head.cmpxchgWeak(current_head, next, .acq_rel, .acquire)) |_| {
                 // CAS failed - another thread modified head, retry
-                log.debug("POP: Head CAS failed, retrying", .{});
+                if (comptime POOL_DEBUG) log.debug("POP: Head CAS failed, retrying", .{});
                 continue;
             } else {
                 // CAS succeeded - we successfully popped the node
                 const socket = current_head.?.socket;
                 self.allocator.destroy(current_head.?);
-                const new_size = self.size.fetchSub(1, .acq_rel);
-                log.debug("POP: SUCCESS - popped connection, size: {d} -> {d}", .{ new_size, new_size - 1 });
+                if (comptime POOL_DEBUG) {
+                    const new_size = self.size.fetchSub(1, .acq_rel);
+                    log.debug("POP: SUCCESS - popped connection, size: {d} -> {d}", .{ new_size, new_size - 1 });
+                } else {
+                    _ = self.size.fetchSub(1, .acq_rel);
+                }
                 return socket;
             }
         }
@@ -713,7 +723,7 @@ pub const LockFreeConnectionPool = struct {
     /// ## Thread Safety
     /// Fully thread-safe. Multiple threads can call this simultaneously.
     pub fn returnConnection(self: *LockFreeConnectionPool, backend_idx: usize, sock: UltraSock) void {
-        log.debug("RETURN: Starting return for backend {d}", .{backend_idx + 1});
+        if (comptime POOL_DEBUG) log.debug("RETURN: Starting return for backend {d}", .{backend_idx + 1});
         
         if (!self.initialized or backend_idx >= self.pools.items.len) {
             var mutable_sock = sock;
