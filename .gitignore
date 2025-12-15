@@ -1,0 +1,14 @@
+# Build artifacts
+zig-out/
+.zig-cache/
+*.o
+
+# Logs
+logs/
+
+# Profiling
+*.json.gz
+profile.json
+
+# Temp files
+simple_deps

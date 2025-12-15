@@ -5,20 +5,20 @@
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .tardy = .{
-            .path = "../../../tardy",
+            .path = "vendor/tardy",
         },
         .secsock = .{
-            .path = "../../../secsock",
+            .path = "vendor/secsock",
         },
         .clap = .{
-            .path = "../../../zig-clap",
+            .path = "vendor/zig-clap",
         },
         .yaml = .{
             .url = "git+https://github.com/kubkon/zig-yaml?ref=main#a6c2cd8760bf45c49b17a3f6259c4dfe3ded528e",
             .hash = "zig_yaml-0.2.0-C1161pmrAgDnipDTh_4v4RQD27XN5GNaVlzzvlXf1jfW",
         },
         .zzz = .{
-            .path = "../../../zzz-lib",
+            .path = "vendor/zzz",
         },
     },
 
@@ -27,8 +27,10 @@
         "build.zig.zon",
         "src",
         "main.zig",
+        "main_multiprocess.zig",
         "backend1.zig",
         "backend2.zig",
         "config",
+        "vendor",
     },
 }

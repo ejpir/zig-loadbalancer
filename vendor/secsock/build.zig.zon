@@ -1,0 +1,20 @@
+.{
+    .name = .secsock,
+    .fingerprint = 0x68f68567adae4aa7,
+    .version = "0.0.0",
+
+    .dependencies = .{
+        .tardy = .{
+            .path = "../tardy",
+        },
+        .bearssl = .{ .path = "vendor/bearssl" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "vendor",
+        "LICENSE",
+        "README.md",
+    },
+}
