@@ -91,16 +91,6 @@ pub fn createOptimizedRouter(allocator: std.mem.Allocator, proxy_config: *types.
     };
 }
 
-/// Legacy router creation (kept for compatibility)
-pub fn createRouter(allocator: std.mem.Allocator, proxy_config: *types.ProxyConfig) !Router {
-    const router = try Router.init(allocator, &.{
-        Route.init("/metrics").get({}, metrics.metricsHandler).layer(),
-        Route.init("/").all(proxy_config, proxy.loadBalanceHandler).layer(),
-    }, .{});
-    
-    return router;
-}
-
 // Create and bind socket for the HTTP server
 pub fn createSocket(host: []const u8, port: u16) !Socket {
     var socket = try Socket.init(.{ .tcp = .{ .host = host, .port = port } });

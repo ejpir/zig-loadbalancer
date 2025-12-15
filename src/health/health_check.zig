@@ -257,10 +257,10 @@ const HealthCheckResults = struct {
     }
 };
 
-/// Simple thread-local storage for hazard pointer index
-/// Each thread gets a unique index into the hazard pointer array
-/// This avoids the need for complex thread ID mapping
-var thread_local_hazard_index: ?usize = null;
+/// Cached hazard pointer index for the health checker thread.
+/// Since health checks run on a single dedicated thread, we cache
+/// the assigned index to avoid repeated atomic operations.
+var cached_hazard_index: ?usize = null;
 var next_hazard_index = std.atomic.Value(usize).init(0);
 
 /// Health checker that periodically checks backend health
@@ -361,16 +361,15 @@ pub const HealthChecker = struct {
         self.cached_connections.deinit();
     }
 
-    /// Get a unique hazard pointer index for the current thread
-    /// Each thread gets its own slot in the hazard pointer array
+    /// Get the hazard pointer index for health check operations.
+    /// Caches the index after first assignment to avoid repeated atomics.
     fn getHazardIndex() usize {
-        if (thread_local_hazard_index) |idx| {
+        if (cached_hazard_index) |idx| {
             return idx;
         }
-        
-        // Assign a new index to this thread
+
         const idx = next_hazard_index.fetchAdd(1, .acq_rel) % MAX_THREADS;
-        thread_local_hazard_index = idx;
+        cached_hazard_index = idx;
         return idx;
     }
     
@@ -462,60 +461,71 @@ pub const HealthChecker = struct {
         log.info("Health checker backends updated successfully using hazard pointers", .{});
     }
 
-    /// Thread-safe helper to get the current backends using hazard pointers
-    /// This method prevents use-after-free by protecting the container from
-    /// being freed while this thread is accessing it.
-    ///
-    /// Algorithm:
-    /// 1. Load current container pointer
-    /// 2. Protect it with a hazard pointer (announces usage to other threads)
-    /// 3. Verify container hasn't changed (prevents ABA problem)
-    /// 4. Use container safely (protected from deallocation)
-    /// 5. Clear hazard pointer when done
-    fn getBackends(self: *HealthChecker) []BackendServer {
-        const hazard_idx = getHazardIndex();
-        
-        // Hazard pointer protocol: protect -> load -> verify -> use -> clear
-        while (true) {
-            // Step 1: Load the current container pointer atomically
-            const container = self.backends_container.load(.acquire);
-            
-            // Step 2: Protect this container with our hazard pointer
-            // This announces to other threads that we're using this container
-            self.hazard_ptrs[hazard_idx].protect(container);
-            
-            // Step 3: Verify the container hasn't changed (ABA prevention)
-            // If it changed between load and protect, we need to retry
-            if (self.backends_container.load(.acquire) == container) {
-                // Success! The container is now protected and verified current
-                defer self.hazard_ptrs[hazard_idx].clear(); // Always clear when done
-                
-                // Step 4: Safe to use the container - it won't be freed
-                if (container == null or @intFromPtr(container.?) == 0) {
-                    log.err("Health checker container is null or invalid, returning empty list", .{});
-                    return &[_]BackendServer{};
-                }
-                
-                const backends = container.?.backends;
-                
-                // Sanity check on backends length
-                if (backends.len > 1000) { // Suspicious length check
-                    log.err("Invalid backends.len: {d}, likely memory corruption", .{backends.len});
-                    return &[_]BackendServer{};
-                }
-                
-                if (backends.len == 0) {
-                    log.warn("Health checker has zero backends", .{});
-                }
-                
-                return backends;
-            }
-            
-            // Container changed between load and protect - retry
-            // Clear our hazard pointer and try again
-            self.hazard_ptrs[hazard_idx].clear();
-            std.atomic.spinLoopHint(); // Brief pause before retry
+    /// Protected backends reference - caller MUST call release() when done.
+    const ProtectedBackends = struct {
+        backends: []BackendServer,
+        checker: *HealthChecker,
+        hazard_idx: usize,
+
+        /// Release the hazard pointer protection. MUST be called when done with backends.
+        pub fn release(self: *const ProtectedBackends) void {
+            self.checker.hazard_ptrs[self.hazard_idx].clear();
         }
+    };
+
+    /// Thread-safe helper to get the current backends using hazard pointers.
+    /// Returns a ProtectedBackends struct - caller MUST call release() when done.
+    ///
+    /// This prevents use-after-free by keeping the hazard pointer active until
+    /// the caller explicitly releases it.
+    fn getBackendsProtected(self: *HealthChecker) ProtectedBackends {
+        const hazard_idx = getHazardIndex();
+
+        // Hazard pointer protocol: protect -> load -> verify -> return protected
+        while (true) {
+            const container = self.backends_container.load(.acquire);
+            self.hazard_ptrs[hazard_idx].protect(container);
+
+            // Verify container hasn't changed (ABA prevention)
+            if (self.backends_container.load(.acquire) == container) {
+                if (container == null or @intFromPtr(container.?) == 0) {
+                    log.err("Health checker container is null or invalid", .{});
+                    return .{
+                        .backends = &[_]BackendServer{},
+                        .checker = self,
+                        .hazard_idx = hazard_idx,
+                    };
+                }
+
+                const backends = container.?.backends;
+                if (backends.len > 1000) {
+                    log.err("Invalid backends.len: {d}, likely memory corruption", .{backends.len});
+                    return .{
+                        .backends = &[_]BackendServer{},
+                        .checker = self,
+                        .hazard_idx = hazard_idx,
+                    };
+                }
+
+                return .{
+                    .backends = backends,
+                    .checker = self,
+                    .hazard_idx = hazard_idx,
+                };
+            }
+
+            // Container changed - retry
+            self.hazard_ptrs[hazard_idx].clear();
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Convenience wrapper for quick read-only access to backends.
+    /// For operations that just need the slice briefly (e.g., logging length).
+    fn getBackends(self: *HealthChecker) []BackendServer {
+        const protected = self.getBackendsProtected();
+        defer protected.release();
+        return protected.backends;
     }
 
     /// Helper to validate backends array is safe to iterate
@@ -539,8 +549,10 @@ pub const HealthChecker = struct {
         var invalid_backends: usize = 0;
 
         for (backends, 0..) |*backend, i| {
+            const host = backend.getFullHost();
+
             // Skip backends with empty host
-            if (backend.host.len == 0) {
+            if (host.len == 0) {
                 log.warn("Backend {d} has empty host, skipping validation", .{i});
                 invalid_backends += 1;
                 continue;
@@ -548,7 +560,7 @@ pub const HealthChecker = struct {
 
             // Create a socket for the health check
             var sock = Socket.init(.{ .tcp = .{
-                .host = backend.host,
+                .host = host,
                 .port = backend.port,
             } }) catch |err| {
                 log.err("Failed to create socket for backend {d}: {s}", .{ i, @errorName(err) });
@@ -560,7 +572,7 @@ pub const HealthChecker = struct {
             // Try to connect to the backend
             if (sock.connect(runtime)) {
                 // Connection successful
-                log.info("Successfully connected to backend {d} at {s}:{d}", .{ i, backend.host, backend.port });
+                log.info("Successfully connected to backend {d} at {s}:{d}", .{ i, host, backend.port });
             } else |err| {
                 log.err("Failed to connect to backend {d}: {s}", .{ i, @errorName(err) });
                 invalid_backends += 1;
@@ -568,7 +580,7 @@ pub const HealthChecker = struct {
             }
 
             // Send a GET request to make sure the server responds
-            const request = std.fmt.allocPrint(self.allocator, "GET / HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n", .{ backend.host, backend.port }) catch {
+            const request = std.fmt.allocPrint(self.allocator, "GET / HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n", .{ host, backend.port }) catch {
                 log.err("Failed to format health check request for backend {d}", .{i});
                 invalid_backends += 1;
                 continue;
@@ -598,10 +610,10 @@ pub const HealthChecker = struct {
             // Check if the response looks like HTTP
             const response = buffer[0..bytes_read];
             if (std.mem.startsWith(u8, response, "HTTP/1.")) {
-                log.info("Backend {d} at {s}:{d} is responding to HTTP requests", .{ i, backend.host, backend.port });
+                log.info("Backend {d} at {s}:{d} is responding to HTTP requests", .{ i, host, backend.port });
                 valid_backends += 1;
             } else {
-                log.warn("Backend {d} at {s}:{d} response doesn't look like HTTP: '{s}'", .{ i, backend.host, backend.port, if (response.len > 20) response[0..20] else response });
+                log.warn("Backend {d} at {s}:{d} response doesn't look like HTTP: '{s}'", .{ i, host, backend.port, if (response.len > 20) response[0..20] else response });
                 // Still count as valid since it responded, just not with HTTP
                 valid_backends += 1;
             }
@@ -624,8 +636,10 @@ pub const HealthChecker = struct {
             self.runtime = runtime;
         }
 
-        // Get current backends
-        const backends = self.getBackends();
+        // Get current backends with hazard pointer protection
+        const protected = self.getBackendsProtected();
+        defer protected.release();
+        const backends = protected.backends;
 
         log.info("Starting health checker:", .{});
         log.info("  - Interval: {d}ms", .{self.config.interval_ms});
@@ -725,8 +739,10 @@ pub const HealthChecker = struct {
     }
 
     fn checkAllBackends(self: *HealthChecker) !void {
-        // Get current backends atomically
-        const backends = self.getBackends();
+        // Get current backends with hazard pointer protection
+        const protected = self.getBackendsProtected();
+        defer protected.release();
+        const backends = protected.backends;
 
         // Safety check for zero or suspicious length
         if (backends.len == 0) {
@@ -756,7 +772,7 @@ pub const HealthChecker = struct {
                 valid_backend_count += 1;
             }
         }
-        
+
         // Initialize results tracking in HealthChecker (safe from stack issues)
         self.parallel_results = HealthCheckResults.init(valid_backend_count);
         self.parallel_results_initialized.store(true, .release);

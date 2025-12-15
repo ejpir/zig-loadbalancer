@@ -83,6 +83,8 @@ const ProxyError = error{
     ConnectionReset,
     ConnectionRefused,
     ProxyFailure,
+    RequestSendFailed,
+    ResponseReceiveFailed,
 };
 
 /// Create an error response with a nice HTML error page
@@ -174,34 +176,15 @@ pub fn proxyRequestOptimized(
         };
     };
     
-    // Continue with the rest of the proxy logic (same as original proxyRequest)
+    // Return connection to pool or close on function exit
     defer {
         if (return_to_pool) {
-            if (comptime backend_index < connection_pool_mod.LockFreeConnectionPool.MAX_BACKENDS) {
-                // Use optimized pool return for comptime-verified backends
-                connection_pool.returnConnection(backend_index, sock);
-            } else {
-                // Use standard pool return for runtime backends
-                connection_pool.returnConnection(backend_index, sock);
-            }
+            connection_pool.returnConnection(backend_index, sock);
         } else {
             sock.close_blocking();
         }
     }
-    
-    // Use main proxy implementation with pooled connection
-    defer {
-        if (return_to_pool) {
-            if (comptime backend_index < connection_pool_mod.LockFreeConnectionPool.MAX_BACKENDS) {
-                connection_pool.returnConnectionOptimized(backend_index, sock);
-            } else {
-                connection_pool.returnConnection(backend_index, sock);
-            }
-        } else {
-            sock.close_blocking();
-        }
-    }
-    
+
     return proxyRequestWithSocket(rt, ctx, backend, backend_index, sock, response_buffer, start_time);
 }
 
@@ -368,29 +351,23 @@ pub fn proxyRequest(
     const request_data = try buildRequest(ctx, backend, backend_index);
     defer ctx.allocator.free(request_data);
 
-    // Send optimized request to backend with timeout
-    log.debug("Sending optimized request to backend ({d} bytes)", .{request_data.len});
-    const send_timeout_ms = 2000; // 2 second timeout
+    // Send request to backend
+    log.debug("Sending request to backend ({d} bytes)", .{request_data.len});
     const send_start_time = std.time.milliTimestamp();
-    
-    // Check for timeout during send
-    const send_current_time = std.time.milliTimestamp();
-    if (send_current_time - send_start_time > send_timeout_ms) {
-        log.err("Socket send timeout after {d}ms for backend {s}:{d}", .{
-            send_timeout_ms, backend.getFullHost(), backend.port
-        });
-        return_to_pool = false;
-        return error.SocketSendTimeout;
-    }
-    
-    // Try to send the optimized request
+
     _ = sock.send_all(rt, request_data) catch |err| {
         log.err("Socket send error: {s}", .{@errorName(err)});
         return_to_pool = false;
         return error.SocketSendTimeout;
     };
-    
-    log.debug("Request sent successfully", .{});
+
+    const send_duration_ms = std.time.milliTimestamp() - send_start_time;
+    if (send_duration_ms > 2000) {
+        log.warn("Slow send to backend {s}:{d}: {d}ms", .{
+            backend.getFullHost(), backend.port, send_duration_ms,
+        });
+    }
+    log.debug("Request sent successfully in {d}ms", .{send_duration_ms});
 
     // Clear the response buffer in case it already has content
     response_buffer.clearRetainingCapacity();
@@ -857,346 +834,4 @@ pub fn generateSpecializedHandler(comptime strategy: types.LoadBalancerStrategy)
             return parseAndReturnResponse(strategy, ctx, config, backend_idx, &response_buffer, &is_chunked_response, &has_compression, handler_start_time, &req_ctx);
         }
     }.handleRequest;
-}
-
-
-/// Legacy request handling (simplified)
-fn handleRequestWithBackendSpecialized(ctx: *const Context, config: *const types.ProxyConfig, backend_idx: usize, handler_start_time: i64) !Respond {
-    const backends = config.backends;
-    const connection_pool = config.connection_pool;
-
-    // Direct reference to the backend in the array
-    const backend_ref = &backends.items[backend_idx];
-
-    log.info("Request forwarded to backend {d} ({s}:{d}, weight: {d})", .{
-        backend_idx + 1,
-        backend_ref.host,
-        backend_ref.port,
-        backend_ref.weight,
-    });
-
-    // Use optimized request context for maximum performance
-    // Combines arena allocation + buffer pooling for 5-6x faster allocation
-    var req_ctx = RequestContext.init(ctx.allocator);
-    defer req_ctx.deinit(); // Reports statistics and bulk cleanup
-    
-    // Create a buffer for the response data - will be cleaned up by arena
-    var response_buffer = try std.ArrayList(u8).initCapacity(req_ctx.allocator(), 0);
-    
-    // Tracking for response encoding and transfer modes
-    var is_chunked_response = false;
-    var has_compression = false;
-    
-    // Try the originally selected backend
-    proxyRequest(ctx.runtime, ctx, backend_ref, backend_idx, connection_pool, &response_buffer) catch |err| {
-        log.err("Failed to proxy request to backend {d}: {s}", .{ backend_idx + 1, @errorName(err) });
-        
-        // Enhanced error handling with better connection management
-        // Update health status based on error type
-        switch (err) {
-            error.SocketTimeout, error.SocketSendTimeout => {
-                log.warn("Marking backend {d} as unhealthy due to timeout", .{backend_idx + 1});
-                backend_ref.healthy.store(false, .release);
-                _ = backend_ref.consecutive_failures.fetchAdd(1, .monotonic);
-            },
-            error.ConnectionFailed => {
-                log.err("Connection to backend {d} failed: {s}", .{backend_idx + 1, @errorName(err)});
-                backend_ref.healthy.store(false, .release);
-                _ = backend_ref.consecutive_failures.fetchAdd(2, .monotonic); // Higher penalty for connection failures
-            },
-            // Future error types that will be implemented:
-            // error.ConnectionReset, error.ConnectionRefused, error.BackendNotAvailable, error.TlsHandshakeFailed
-            //
-            // For now, handle more connection errors in the catch-all else
-            // UnsupportedTransferCoding error not returned by proxyRequest yet, handled during response processing
-            // error.UnsupportedTransferCoding => {
-            //     log.err("Backend {d} returned unsupported transfer coding", .{backend_idx + 1});
-            //     // Don't mark as unhealthy, but increment failure counter
-            //     _ = backend_ref.consecutive_failures.fetchAdd(1, .monotonic);
-            // },
-            else => {
-                log.err("Failed to proxy request to backend {d}: {s}", .{backend_idx + 1, @errorName(err)});
-                // Increment failure counter but don't mark unhealthy for other errors
-                _ = backend_ref.consecutive_failures.fetchAdd(1, .monotonic);
-            },
-        }
-
-        // Find a healthy backend for failover
-        var found_healthy_backend = false;
-        var failover_index: usize = 0;
-
-        for (backends.items, 0..) |fb, i| {
-            if (i != backend_idx and fb.healthy.load(.acquire)) {
-                failover_index = i;
-                found_healthy_backend = true;
-                break;
-            }
-        }
-
-        // If no healthy backends found, return error
-        if (!found_healthy_backend) {
-            return ctx.response.apply(.{
-                .status = .@"Service Unavailable",
-                .mime = http.Mime.HTML,
-                .body = "No healthy backends available for failover",
-            });
-        }
-
-        // Direct reference to the failover backend
-        const failover_ref = &backends.items[failover_index];
-
-        log.info("Immediately failing over to backend {d} ({s}:{d})", .{
-            failover_index + 1, failover_ref.host, failover_ref.port,
-        });
-
-        // Clear the buffer for reuse
-        response_buffer.clearRetainingCapacity();
-        
-        // Try the failover backend
-        proxyRequest(ctx.runtime, ctx, failover_ref, failover_index, connection_pool, &response_buffer) catch |retry_err| {
-            log.err("Failed to proxy to failover backend {d}: {s}", .{ failover_index + 1, @errorName(retry_err) });
-
-            // Enhanced error handling with better connection management for failover
-            // Update health status based on error type
-            switch (retry_err) {
-                error.SocketTimeout, error.SocketSendTimeout => {
-                    log.warn("Marking failover backend {d} as unhealthy due to timeout", .{failover_index + 1});
-                    failover_ref.healthy.store(false, .release);
-                    _ = failover_ref.consecutive_failures.fetchAdd(1, .monotonic);
-                },
-                error.ConnectionFailed => {
-                    log.err("Connection to failover backend {d} failed: {s}", .{failover_index + 1, @errorName(retry_err)});
-                    failover_ref.healthy.store(false, .release);
-                    _ = failover_ref.consecutive_failures.fetchAdd(2, .monotonic);
-                },
-                // Future error types that will be implemented:
-                // error.ConnectionReset, error.ConnectionRefused, error.BackendNotAvailable, error.TlsHandshakeFailed
-                //
-                // For now, handle more connection errors in the catch-all else
-                // UnsupportedTransferCoding error not returned by proxyRequest yet, handled during response processing
-                // error.UnsupportedTransferCoding => {
-                //     log.err("Failover backend {d} returned unsupported transfer coding", .{failover_index + 1});
-                //     _ = failover_ref.consecutive_failures.fetchAdd(1, .monotonic);
-                // },
-                else => {
-                    log.err("Failed to proxy to failover backend {d}: {s}", .{failover_index + 1, @errorName(retry_err)});
-                    _ = failover_ref.consecutive_failures.fetchAdd(1, .monotonic);
-                },
-            }
-
-            // All backends failed - use the helper to create error response
-            return createErrorResponse(
-                ctx,
-                .@"Service Unavailable",
-                "Service Temporarily Unavailable",
-                "The server is temporarily unable to handle your request due to maintenance or capacity issues. Please try again in a few moments."
-            );
-        };
-    };
-
-    // Check if the response has chunked transfer encoding using the RFC-compliant utility
-    is_chunked_response = http_utils.hasChunkedEncoding(response_buffer.items);
-    log.debug("Response is chunked: {}", .{is_chunked_response});
-    
-    // Check for compression in Transfer-Encoding
-    has_compression = http_utils.hasCompressionCoding(response_buffer.items);
-    if (has_compression) {
-        log.info("Detected compression in Transfer-Encoding", .{});
-        
-        // Parse the Transfer-Encoding header to get all codings
-        const transfer_codings = try http_utils.parseTransferEncodings(response_buffer.items, req_ctx.allocator());
-        
-        // Log all transfer codings
-        log.debug("Transfer-Encoding codings ({d}):", .{transfer_codings.len});
-        for (transfer_codings, 0..) |coding, i| {
-            const coding_type = http_utils.TransferCoding.fromString(coding);
-            log.debug("  {d}. {s} ({s})", .{ i + 1, coding, @tagName(coding_type) });
-            
-            // Check if we have unsupported codings that aren't the final chunked
-            if (coding_type != .chunked and coding_type != .identity) {
-                if (i == transfer_codings.len - 1 or 
-                    (i == transfer_codings.len - 2 and 
-                     http_utils.TransferCoding.fromString(transfer_codings[transfer_codings.len - 1]) == .chunked)) {
-                    // This is the last coding before potentially chunked - we support passing it through
-                    log.info("Passing through compressed response with coding: {s}", .{coding});
-                } else {
-                    // RFC 7230 requires chunked to be the final coding - this is invalid
-                    log.warn("Unsupported transfer coding order: {s} is not the final coding", .{coding});
-                }
-            }
-        }
-    }
-    
-    // Parse the response using buffer pool for optimal performance
-    var parsed = http_utils.parseResponseWithPool(req_ctx.allocator(), response_buffer.items, &req_ctx.buffer_pool) catch {
-        return ctx.response.apply(.{
-            .status = .@"Bad Gateway",
-            .mime = http.Mime.TEXT,
-            .body = "Failed to parse backend server response",
-        });
-    };
-    
-    // Log message framing type according to RFC 7230
-    log.debug("Response message length type: {s}", .{@tagName(parsed.length_type)});
-    
-    // Log the HTTP version received from the backend
-    const version_str = try parsed.version.toString(req_ctx.allocator());
-    log.debug("Backend responded with HTTP version: {s}", .{version_str});
-
-    // Extract content type from backend response or use default
-    const content_type = parsed.headers.get("Content-Type") orelse "text/html";
-
-    // Use SIMD-optimized MIME type detection with @bitCast comparisons
-    const mime_type = http_processing.detectMimeType(content_type);
-
-    // Use clean header processing interface
-    var response_headers = try http_processing.processHeaders(config.strategy, parsed, req_ctx.allocator());
-    
-    // If using sticky sessions, add a cookie to track the selected backend
-    if (config.strategy == .sticky) {
-        const sticky = @import("../strategies/sticky.zig");
-        const session_config = blk: {
-            if (ctx.storage.get(sticky.StickySessionConfig)) |config_from_storage| {
-                break :blk config_from_storage;
-            }
-            
-            // Fallback if not found in storage
-            log.err("No sticky session config found in storage", .{});
-            
-            // Return a StickySessionConfig for the rest of the function to use
-            break :blk sticky.StickySessionConfig{
-                .cookie_name = config.sticky_session_cookie_name,
-            };
-        };
-        
-        // Use the cookie name from storage
-        const cookie = http.Cookie{
-            .name = session_config.cookie_name,
-            .value = try req_ctx.printf("{d}", .{backend_idx}),
-            .path = "/",
-            .max_age = 3600 * 24, // 24 hours
-            .http_only = true,
-        };
-        
-        const cookie_str = try cookie.to_string_alloc(req_ctx.allocator());
-        try response_headers.append(.{
-            "Set-Cookie", // No need to dupe for final response
-            cookie_str,
-        });
-        
-        log.info("Set sticky session cookie: {s}={d}", .{session_config.cookie_name, backend_idx});
-    }
-    
-    // Add Via header for HTTP/1.1 transparency - RFC 7230 Section 5.7.1
-    const proxy_name = "zzz-load-balancer";
-    const via_value = try req_ctx.printf("1.1 {s}", .{proxy_name});
-    try response_headers.append(.{
-        "Via",
-        via_value,
-    });
-    
-    // Log HTTP pipelining info if request queues are available
-    if (config.request_queues) |queues| {
-        if (backend_idx < queues.len) {
-            const queue = &queues[backend_idx];
-            log.debug("Backend {d} has {d} pipelined requests in queue", .{
-                backend_idx + 1, queue.count()
-            });
-        }
-    }
-
-    // Access the body directly (no copy needed)
-    const body = parsed.body;
-
-    // Debug output to show the content length and first 30 chars of body
-    log.info("Forwarding response to client: status={s}, body_length={d}, body_preview='{s}'", .{ 
-        @tagName(parsed.status), 
-        body.len, 
-        if (body.len > 0) 
-            if (body.len > 30) body[0..30] else body 
-        else 
-            "<empty>" 
-    });
-
-    // Calculate total request handling time
-    const handler_end_time = std.time.milliTimestamp();
-    const handler_duration_ms = handler_end_time - handler_start_time;
-    log.info("Total request processing completed in {d} ms", .{handler_duration_ms});
-    
-    // Record metrics for this request
-    metrics.global_metrics.recordRequest(handler_duration_ms, @intFromEnum(parsed.status));
-    
-    // Add X-Response-Time header
-    try response_headers.append(.{
-        "X-Response-Time",
-        try req_ctx.printf("{d}ms", .{handler_duration_ms}),
-    });
-
-    // Return response to client - body is owned by our arena
-    // We need to create a copy of the response body for the final response
-    // This is unavoidable since the HTTP library needs to own this memory
-    // 
-    // Why we need this final copy:
-    // 1. The response_buffer is allocated with arena_allocator
-    // 2. When arena.deinit() is called, all that memory is freed
-    // 3. But the HTTP response is processed AFTER we return from this function
-    // 4. So we need to copy data into memory owned by ctx.allocator to survive
-    const final_body = try ctx.allocator.dupe(u8, body);
-    
-    // For headers, we also need to copy them to the ctx allocator for the same reason
-    var final_headers = try std.ArrayList([2][]const u8).initCapacity(ctx.allocator, response_headers.items.len);
-    for (response_headers.items) |header| {
-        try final_headers.append(.{
-            try ctx.allocator.dupe(u8, header[0]),
-            try ctx.allocator.dupe(u8, header[1]),
-        });
-    }
-    
-    return ctx.response.apply(.{
-        .status = parsed.status,
-        .mime = mime_type,
-        .headers = try final_headers.toOwnedSlice(),
-        .body = final_body,
-    });
-}
-
-/// Legacy load balance handler with runtime dispatch (kept for compatibility)
-pub fn loadBalanceHandler(ctx: *const Context, config: *const types.ProxyConfig) !Respond {
-    // Start timer for overall request handling
-    const handler_start_time = std.time.milliTimestamp();
-    
-    // Access the data from the config struct
-    const backends = config.backends;
-    const strategy = config.strategy;
-
-    if (backends.items.len == 0) {
-        return createErrorResponse(
-            ctx,
-            .@"Service Unavailable",
-            "No Backends Available",
-            "The load balancer is not configured with any backend servers."
-        );
-    }
-
-    // For sticky sessions, store the cookie name in context storage
-    if (load_balancer.needsSessionStorage(strategy)) {
-        const sticky = @import("../strategies/sticky.zig");
-        try ctx.storage.put(sticky.StickySessionConfig, .{
-            .cookie_name = config.sticky_session_cookie_name,
-        });
-    }
-
-    // Select a backend using the clean strategy interface
-    const backend_idx = load_balancer.selectBackend(strategy, ctx, backends) catch |err| {
-        log.err("Load balancer failed to select backend: {s}", .{@errorName(err)});
-        return createErrorResponse(
-            ctx,
-            .@"Service Unavailable",
-            "No Healthy Backends",
-            "No healthy backend servers are currently available to handle your request. Please try again later."
-        );
-    };
-
-    // Continue with common request handling logic using default header processor
-    return handleRequestWithBackendSpecialized(ctx, config, backend_idx, handler_start_time);
 }
