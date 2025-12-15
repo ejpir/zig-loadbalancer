@@ -31,8 +31,12 @@ const Route = http.Route;
 const types = @import("src/core/types.zig");
 const proxy = @import("src/core/proxy.zig");
 const connection_pool_mod = @import("src/memory/connection_pool.zig");
+const simple_pool = @import("src/memory/simple_connection_pool.zig");
 const metrics = @import("src/utils/metrics.zig");
 const cli = @import("src/utils/cli.zig");
+const UltraSock = @import("src/http/ultra_sock.zig").UltraSock;
+const http_utils = @import("src/http/http_utils.zig");
+const simd_parse = @import("src/internal/simd_parse.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .err, // Use .info for debugging, .err for benchmarks
@@ -204,12 +208,9 @@ fn workerMain(config: WorkerConfig) !void {
     log.info("Worker {d}: Starting", .{config.worker_id});
 
     // === Each worker creates its own connection pool (no sharing = no locks!) ===
-    var connection_pool = connection_pool_mod.LockFreeConnectionPool{
-        .pools = undefined,
-        .allocator = undefined,
-        .initialized = false,
-    };
-    try connection_pool.init(allocator);
+    // Using SimpleConnectionPool - no atomics needed in single-threaded workers!
+    var connection_pool = simple_pool.SimpleConnectionPool{};
+    connection_pool.init();
     defer connection_pool.deinit();
 
     // Initialize backends for this worker
@@ -224,33 +225,32 @@ fn workerMain(config: WorkerConfig) !void {
         ));
     }
 
-    try connection_pool.addBackends(backends.items.len);
+    connection_pool.addBackends(backends.items.len);
 
-    // Create proxy config for this worker
-    var proxy_config = types.ProxyConfig{
+    // Create multiprocess proxy config (uses SimpleConnectionPool - no atomics!)
+    var mp_config = MultiProcessProxyConfig{
         .backends = &backends,
         .connection_pool = &connection_pool,
         .strategy = config.strategy,
-        .streaming = true,
     };
 
     // Initialize healthy bitmap
     for (backends.items, 0..) |_, idx| {
-        proxy_config.markHealthy(idx);
+        mp_config.markHealthy(idx);
     }
 
     // === Each worker creates its own Tardy runtime (SINGLE THREADED!) ===
     var t = try Tardy.init(allocator, .{
         .threading = .single, // KEY: Single-threaded per worker!
         .pooling = .grow,
-        .size_tasks_initial = 1024,
-        .size_aio_reap_max = 1024,
+        .size_tasks_initial = 4096, // More task slots for high concurrency
+        .size_aio_reap_max = 4096, // Process more I/O events per cycle
     });
     defer t.deinit();
 
-    // Create router for this worker (use inline switch for comptime strategy)
+    // Create router using multiprocess-optimized handler
     var router = switch (config.strategy) {
-        inline else => |s| try createWorkerRouter(allocator, &proxy_config, s),
+        inline else => |s| try createWorkerRouter(allocator, &mp_config, s),
     };
     defer router.deinit(allocator);
 
@@ -284,9 +284,9 @@ fn workerEntry(rt: *Runtime, ctx: WorkerContext) !void {
     log.info("Worker {d}: HTTP server starting", .{ctx.worker_id});
 
     var server = Server.init(.{
-        .stack_size = 1024 * 1024 * 8,
-        .socket_buffer_bytes = 1024 * 16,
-        .keepalive_count_max = 100,
+        .stack_size = 1024 * 1024 * 4, // 4MB stack (sufficient for most requests)
+        .socket_buffer_bytes = 1024 * 32, // 32KB buffer (matches SIMD recv buffer)
+        .keepalive_count_max = 1000, // More keepalive reuse
         .connection_count_max = 10000,
     });
 
@@ -295,14 +295,181 @@ fn workerEntry(rt: *Runtime, ctx: WorkerContext) !void {
     };
 }
 
-/// Create router with comptime-specialized handler
-fn createWorkerRouter(allocator: std.mem.Allocator, proxy_config: *types.ProxyConfig, comptime strategy: types.LoadBalancerStrategy) !Router {
-    const handler = proxy.generateSpecializedHandler(strategy);
+/// Multiprocess-specific proxy config (no atomics)
+const MultiProcessProxyConfig = struct {
+    backends: *const types.BackendsList,
+    connection_pool: *simple_pool.SimpleConnectionPool,
+    strategy: types.LoadBalancerStrategy = .round_robin,
+    healthy_bitmap: u64 = 0,
+    rr_counter: usize = 0,
+
+    pub fn markHealthy(self: *MultiProcessProxyConfig, idx: usize) void {
+        if (idx >= 64) return;
+        self.healthy_bitmap |= @as(u64, 1) << @intCast(idx);
+    }
+};
+
+/// Create router with multiprocess-optimized handler
+fn createWorkerRouter(allocator: std.mem.Allocator, mp_config: *MultiProcessProxyConfig, comptime strategy: types.LoadBalancerStrategy) !Router {
+    const handler = generateMultiProcessHandler(strategy);
 
     return try Router.init(allocator, &.{
         Route.init("/metrics").get({}, metrics.metricsHandler).layer(),
-        Route.init("/").all(proxy_config, handler).layer(),
+        Route.init("/").all(mp_config, handler).layer(),
     }, .{});
+}
+
+/// Generate multiprocess-optimized handler (no atomics)
+fn generateMultiProcessHandler(comptime strategy: types.LoadBalancerStrategy) fn (*const http.Context, *MultiProcessProxyConfig) anyerror!http.Respond {
+    return struct {
+        pub fn handle(ctx: *const http.Context, config: *MultiProcessProxyConfig) !http.Respond {
+            const backends = config.backends;
+            if (backends.items.len == 0) {
+                return ctx.response.apply(.{ .status = .@"Service Unavailable", .mime = http.Mime.TEXT, .body = "No backends" });
+            }
+
+            // Round-robin selection (no atomics!)
+            const backend_idx = switch (strategy) {
+                .round_robin, .weighted_round_robin => blk: {
+                    const idx = config.rr_counter % backends.items.len;
+                    config.rr_counter +%= 1;
+                    break :blk idx;
+                },
+                .random => @as(usize, @intCast(std.time.milliTimestamp())) % backends.items.len,
+                .sticky => 0,
+            };
+
+            return multiprocessStreamingProxy(ctx, &backends.items[backend_idx], backend_idx, config);
+        }
+    }.handle;
+}
+
+/// Streaming proxy optimized for multiprocess (no atomics, arena allocator)
+fn multiprocessStreamingProxy(ctx: *const http.Context, backend: *const types.BackendServer, backend_idx: usize, config: *MultiProcessProxyConfig) !http.Respond {
+    const start_time = std.time.milliTimestamp();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var return_to_pool = true;
+
+    // Get or create connection (no atomics!)
+    var sock = config.connection_pool.getConnection(backend_idx) orelse blk: {
+        var ultra_sock = UltraSock.fromBackendServer(alloc, backend) catch {
+            return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.TEXT, .body = "Connection failed" });
+        };
+        ultra_sock.connect(ctx.runtime) catch {
+            ultra_sock.close_blocking();
+            return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.TEXT, .body = "Backend unavailable" });
+        };
+        break :blk ultra_sock;
+    };
+
+    if (sock.socket == null or !sock.connected) {
+        return_to_pool = false;
+        sock = UltraSock.fromBackendServer(alloc, backend) catch {
+            return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.TEXT, .body = "Connection failed" });
+        };
+        sock.connect(ctx.runtime) catch {
+            sock.close_blocking();
+            return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.TEXT, .body = "Backend unavailable" });
+        };
+        return_to_pool = true;
+    }
+
+    defer {
+        if (return_to_pool) config.connection_pool.returnConnection(backend_idx, sock) else sock.close_blocking();
+    }
+
+    // Build and send request
+    const request_data = try std.fmt.allocPrint(alloc, "{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: keep-alive\r\n\r\n{s}", .{
+        @tagName(ctx.request.method orelse .GET), ctx.request.uri orelse "/",
+        backend.getFullHost(), backend.port, ctx.request.body orelse "",
+    });
+
+    _ = sock.send_all(ctx.runtime, request_data) catch {
+        return_to_pool = false;
+        return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.TEXT, .body = "Send failed" });
+    };
+
+    // Read headers
+    var header_buffer = try std.ArrayList(u8).initCapacity(alloc, 4096);
+    var recv_buffer: [32768]u8 = undefined;
+    const start_recv = std.time.milliTimestamp();
+    var header_end: usize = 0;
+
+    while (header_end == 0) {
+        if (std.time.milliTimestamp() - start_recv > 3000) {
+            return_to_pool = false;
+            return ctx.response.apply(.{ .status = .@"Gateway Timeout", .mime = http.Mime.TEXT, .body = "Timeout" });
+        }
+        const n = sock.recv(ctx.runtime, &recv_buffer) catch {
+            return_to_pool = false;
+            return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.TEXT, .body = "Read failed" });
+        };
+        if (n == 0) { return_to_pool = false; return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.TEXT, .body = "Empty" }); }
+        try header_buffer.appendSlice(alloc, recv_buffer[0..n]);
+        if (simd_parse.findHeaderEnd(header_buffer.items)) |pos| header_end = pos + 4;
+    }
+
+    // Parse status
+    const headers = header_buffer.items[0..header_end];
+    const line_end = simd_parse.findLineEnd(headers) orelse return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.TEXT, .body = "Invalid" });
+    const space = std.mem.indexOf(u8, headers[0..line_end], " ") orelse return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.TEXT, .body = "Invalid" });
+    const status_code = std.fmt.parseInt(u16, headers[space + 1 ..][0..3], 10) catch 200;
+    const msg_len = http_utils.determineMessageLength("GET", status_code, headers, false);
+
+    if (std.mem.indexOf(u8, headers, "Connection: close") != null) return_to_pool = false;
+
+    // Build response headers
+    var resp = try std.ArrayList(u8).initCapacity(alloc, 512);
+    var w = resp.writer(alloc);
+    const status: http.Status = @enumFromInt(status_code);
+    try w.print("HTTP/1.1 {d} {s}\r\nServer: zzz-lb-mp\r\nConnection: keep-alive\r\n", .{ status_code, @tagName(status) });
+
+    // Forward headers (O(1) skip lookup)
+    const skip = std.StaticStringMap(void).initComptime(.{
+        .{ "connection", {} }, .{ "keep-alive", {} }, .{ "transfer-encoding", {} }, .{ "server", {} },
+    });
+    var pos: usize = line_end + 2;
+    while (pos < header_end - 2) {
+        const end = std.mem.indexOfPos(u8, headers, pos, "\r\n") orelse break;
+        const line = headers[pos..end];
+        if (std.mem.indexOf(u8, line, ":")) |c| {
+            var lb: [64]u8 = undefined;
+            const len = @min(line[0..c].len, 64);
+            for (line[0..len], 0..) |ch, i| lb[i] = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+            if (skip.get(lb[0..len]) == null) try w.print("{s}\r\n", .{line});
+        }
+        pos = end + 2;
+    }
+    if (msg_len.type == .content_length) try w.print("Content-Length: {d}\r\n", .{msg_len.length});
+    try w.writeAll("\r\n");
+    if (header_buffer.items.len > header_end) try resp.appendSlice(alloc, header_buffer.items[header_end..]);
+
+    _ = try ctx.socket.send_all(ctx.runtime, resp.items);
+    var sent = header_buffer.items.len - header_end;
+
+    // Stream body
+    if (msg_len.type == .content_length) {
+        while (sent < msg_len.length) {
+            const n = sock.recv(ctx.runtime, &recv_buffer) catch break;
+            if (n == 0) { return_to_pool = false; break; }
+            _ = ctx.socket.send(ctx.runtime, recv_buffer[0..n]) catch break;
+            sent += n;
+        }
+    } else if (msg_len.type == .chunked or msg_len.type == .close_delimited) {
+        while (true) {
+            const n = sock.recv(ctx.runtime, &recv_buffer) catch break;
+            if (n == 0) { return_to_pool = false; break; }
+            _ = ctx.socket.send(ctx.runtime, recv_buffer[0..n]) catch break;
+            sent += n;
+            if (msg_len.type == .chunked and simd_parse.findChunkEnd(recv_buffer[0..n]) != null) break;
+        }
+    }
+
+    metrics.global_metrics.recordRequest(std.time.milliTimestamp() - start_time, status_code);
+    return .responded;
 }
 
 /// Set CPU affinity to pin worker to specific core
