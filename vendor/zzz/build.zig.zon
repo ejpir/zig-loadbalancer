@@ -1,0 +1,22 @@
+.{
+    .name = .zzz,
+    .fingerprint = 0xc3273dca261a7ae0,
+    .version = "0.3.0",
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{
+        .tardy = .{
+            .path = "../tardy",
+        },
+        .secsock = .{
+            .path = "../secsock",
+        },
+    },
+
+    .paths = .{
+        "README.md",
+        "LICENSE",
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
