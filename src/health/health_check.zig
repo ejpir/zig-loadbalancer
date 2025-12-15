@@ -81,6 +81,27 @@ const metrics = @import("../utils/metrics.zig");
 const arena_memory = @import("../memory/arena_memory_manager.zig");
 const config_updater = @import("../config/config_updater.zig");
 
+/// Sync health status from health checker's copy to the original backends used by the load balancer
+///
+/// The health checker maintains its own copy of backends for thread-safety during config updates.
+/// When health status changes, we must also update the original backends in config_updater.global_backends
+/// that the load balancer uses for routing decisions.
+fn syncHealthToOriginalBackend(backend_idx: usize, is_healthy: bool) void {
+    const original_backends = config_updater.global_backends;
+    if (backend_idx < original_backends.items.len) {
+        original_backends.items[backend_idx].healthy.store(is_healthy, .release);
+        log.debug("Synced health status to original backend {d}: {s}", .{
+            backend_idx + 1,
+            if (is_healthy) "HEALTHY" else "UNHEALTHY",
+        });
+    } else {
+        log.warn("Cannot sync health: backend_idx {d} >= original_backends.len {d}", .{
+            backend_idx,
+            original_backends.items.len,
+        });
+    }
+}
+
 /// Health check configuration
 pub const HealthCheckConfig = struct {
     path: []const u8 = "/", // HTTP path to check
@@ -613,11 +634,15 @@ pub const HealthChecker = struct {
         log.info("  - Healthy threshold: {d}, Unhealthy threshold: {d}", .{ self.config.healthy_threshold, self.config.unhealthy_threshold });
 
         // Mark all backends as unhealthy initially
-        for (backends) |*backend| {
+        for (backends, 0..) |*backend, idx| {
             const host = backend.getFullHost();
             if (host.len > 0) {
                 backend.healthy.store(false, .release);
                 backend.consecutive_failures.store(0, .release);
+
+                // CRITICAL: Also mark the original backend as unhealthy
+                syncHealthToOriginalBackend(idx, false);
+
                 log.debug("  - Backend {s}:{d} marked as initially unhealthy", .{ host, backend.port });
             } else {
                 log.warn("  - Invalid backend with empty host found", .{});
@@ -1083,8 +1108,12 @@ pub const HealthChecker = struct {
             // If it was unhealthy but is now healthy, update status
             if (!was_healthy) {
                 task.backend.healthy.store(true, .release);
+
+                // CRITICAL: Also update the original backend used by the load balancer
+                syncHealthToOriginalBackend(backend_idx, true);
+
                 log.info("⬆️ Backend {d} ({s}:{d}) is now HEALTHY", .{ backend_idx + 1, task.backend.getFullHost(), task.backend.port });
-                
+
                 // Increment backend version to invalidate cached state
                 const old_version = config_updater.proxy_config.backend_version.fetchAdd(1, .monotonic);
                 log.debug("Backend health changed: version {d} -> {d} (cache invalidated)", .{old_version, old_version + 1});
@@ -1102,8 +1131,12 @@ pub const HealthChecker = struct {
                 // Mark as unhealthy if we've crossed the threshold
                 if (failures >= task.health_checker.config.unhealthy_threshold) {
                     task.backend.healthy.store(false, .release);
+
+                    // CRITICAL: Also update the original backend used by the load balancer
+                    syncHealthToOriginalBackend(backend_idx, false);
+
                     log.err("⬇️ Backend {d} ({s}:{d}) is now UNHEALTHY", .{ backend_idx + 1, task.backend.getFullHost(), task.backend.port });
-                    
+
                     // Increment backend version to invalidate cached state
                     const old_version = config_updater.proxy_config.backend_version.fetchAdd(1, .monotonic);
                     log.debug("Backend health changed: version {d} -> {d} (cache invalidated)", .{old_version, old_version + 1});
