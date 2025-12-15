@@ -516,8 +516,8 @@ pub fn Pool(comptime T: type) type {
 /// from multiple threads without any external synchronization.
 pub const LockFreeConnectionPool = struct {
     /// Maximum number of idle connections to keep per backend
-    /// This limits memory usage and prevents connection hoarding
-    pub const MAX_IDLE_CONNS: usize = 32;
+    /// Higher values allow more parallelism but use more memory/file descriptors
+    pub const MAX_IDLE_CONNS: usize = 256;
     
     /// Maximum number of backend servers supported
     /// This is a reasonable upper bound for most load balancer deployments
