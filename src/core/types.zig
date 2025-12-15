@@ -69,25 +69,25 @@ pub const HttpVersion = struct {
 pub const RequestQueue = struct {
     requests: std.ArrayList(PipelinedRequest),
     allocator: std.mem.Allocator,
-    
+
     pub fn init(allocator: std.mem.Allocator) RequestQueue {
         return .{
-            .requests = std.ArrayList(PipelinedRequest).init(allocator),
+            .requests = std.ArrayList(PipelinedRequest).initCapacity(allocator, 0) catch .{ .items = &.{}, .capacity = 0 },
             .allocator = allocator,
         };
     }
-    
+
     pub fn deinit(self: *RequestQueue) void {
         for (self.requests.items) |*req| {
-            req.deinit();
+            req.deinit(self.allocator);
         }
-        self.requests.deinit();
+        self.requests.deinit(self.allocator);
     }
-    
+
     pub fn enqueue(self: *RequestQueue, request: []const u8) !void {
         var pipelined_req = PipelinedRequest.init(self.allocator);
-        try pipelined_req.buffer.appendSlice(request);
-        try self.requests.append(pipelined_req);
+        try pipelined_req.buffer.appendSlice(self.allocator, request);
+        try self.requests.append(self.allocator, pipelined_req);
     }
     
     pub fn dequeue(self: *RequestQueue) ?PipelinedRequest {
@@ -105,27 +105,29 @@ pub const RequestQueue = struct {
 };
 
 pub const PipelinedRequest = struct {
+    allocator: std.mem.Allocator,
     buffer: std.ArrayList(u8),
     response: ?std.ArrayList(u8) = null,
-    
+
     pub fn init(allocator: std.mem.Allocator) PipelinedRequest {
         return .{
-            .buffer = std.ArrayList(u8).init(allocator),
+            .allocator = allocator,
+            .buffer = std.ArrayList(u8).initCapacity(allocator, 0) catch .{ .items = &.{}, .capacity = 0 },
         };
     }
-    
-    pub fn deinit(self: *PipelinedRequest) void {
-        self.buffer.deinit();
+
+    pub fn deinit(self: *PipelinedRequest, allocator: std.mem.Allocator) void {
+        self.buffer.deinit(allocator);
         if (self.response) |*resp| {
-            resp.deinit();
+            resp.deinit(allocator);
         }
     }
-    
+
     pub fn setResponse(self: *PipelinedRequest, response_data: []const u8) !void {
         if (self.response == null) {
-            self.response = std.ArrayList(u8).init(self.buffer.allocator);
+            self.response = try std.ArrayList(u8).initCapacity(self.allocator, 0);
         }
-        try self.response.?.appendSlice(response_data);
+        try self.response.?.appendSlice(self.allocator, response_data);
     }
 };
 

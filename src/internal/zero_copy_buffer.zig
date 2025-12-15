@@ -154,13 +154,13 @@ pub const ZeroCopyProcessor = struct {
             .version_ref = null,
             .headers_start_ref = null,
             .body_ref = null,
-            .header_refs = std.ArrayList(HeaderRef).init(allocator),
+            .header_refs = std.ArrayList(HeaderRef).initCapacity(allocator, 0) catch .{ .items = &.{}, .capacity = 0 },
             .allocator = allocator,
         };
     }
-    
+
     pub fn deinit(self: *Self) void {
-        self.header_refs.deinit();
+        self.header_refs.deinit(self.allocator);
         // Note: No buffer copying was done, so no cleanup needed for the referenced data
     }
     
@@ -219,7 +219,7 @@ pub const ZeroCopyProcessor = struct {
                 .value = self.source_buffer.subRef(value_start, value.len),
             };
             
-            try self.header_refs.append(header_ref);
+            try self.header_refs.append(self.allocator, header_ref);
         }
         
         // Body reference (zero-copy)

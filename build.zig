@@ -37,48 +37,60 @@ pub fn build(b: *std.Build) void {
     }).module("yaml");
 
     // Backend 1
-    const backend1 = b.addExecutable(.{
-        .name = "backend1",
+    const backend1_mod = b.createModule(.{
         .root_source_file = b.path("backend1.zig"),
         .target = target,
         .optimize = optimize,
     });
-    backend1.root_module.addImport("zzz", zzz_module);
+    backend1_mod.addImport("zzz", zzz_module);
+    const backend1 = b.addExecutable(.{
+        .name = "backend1",
+        .root_module = backend1_mod,
+    });
     const build_backend1 = b.addInstallArtifact(backend1, .{});
     const run_backend1 = b.addRunArtifact(backend1);
 
     // Backend 2
-    const backend2 = b.addExecutable(.{
-        .name = "backend2",
+    const backend2_mod = b.createModule(.{
         .root_source_file = b.path("backend2.zig"),
         .target = target,
         .optimize = optimize,
     });
-    backend2.root_module.addImport("zzz", zzz_module);
+    backend2_mod.addImport("zzz", zzz_module);
+    const backend2 = b.addExecutable(.{
+        .name = "backend2",
+        .root_module = backend2_mod,
+    });
     const build_backend2 = b.addInstallArtifact(backend2, .{});
     const run_backend2 = b.addRunArtifact(backend2);
 
     // Load balancer executable
-    const load_balancer = b.addExecutable(.{
-        .name = "load_balancer",
+    const load_balancer_mod = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    load_balancer.root_module.addImport("zzz", zzz_module);
-    load_balancer.root_module.addImport("clap", clap);
-    load_balancer.root_module.addImport("yaml", yaml);
+    load_balancer_mod.addImport("zzz", zzz_module);
+    load_balancer_mod.addImport("clap", clap);
+    load_balancer_mod.addImport("yaml", yaml);
+    const load_balancer = b.addExecutable(.{
+        .name = "load_balancer",
+        .root_module = load_balancer_mod,
+    });
     const build_load_balancer = b.addInstallArtifact(load_balancer, .{});
     const run_load_balancer_cmd = b.addRunArtifact(load_balancer);
 
     // Unit tests
-    const unit_tests = b.addTest(.{
-        .name = "unit_tests",
+    const unit_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/test_load_balancer.zig"),
         .target = target,
         .optimize = optimize,
     });
-    unit_tests.root_module.addImport("zzz", zzz_module);
+    unit_tests_mod.addImport("zzz", zzz_module);
+    const unit_tests = b.addTest(.{
+        .name = "unit_tests",
+        .root_module = unit_tests_mod,
+    });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     // Steps

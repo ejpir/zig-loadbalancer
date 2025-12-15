@@ -53,13 +53,13 @@ pub fn parseYamlConfig(allocator: std.mem.Allocator, file_path: []const u8) !Bac
     const log = std.log.scoped(.@"yaml_config");
     log.info("Loading YAML configuration from file: {s}", .{file_path});
     
-    var backends = BackendsList.init(allocator);
+    var backends = try BackendsList.initCapacity(allocator, 0);
     errdefer {
         // Free all allocated host strings on error
         for (backends.items) |backend| {
             allocator.free(backend.getFullHost());
         }
-        backends.deinit();
+        backends.deinit(allocator);
     }
     
     // Open file
@@ -126,7 +126,7 @@ pub fn parseYamlConfig(allocator: std.mem.Allocator, file_path: []const u8) !Bac
         const host_copy = try allocator.dupe(u8, host);
         errdefer allocator.free(host_copy);
         
-        try backends.append(BackendServer.init(host_copy, port, weight));
+        try backends.append(allocator, BackendServer.init(host_copy, port, weight));
     }
     
     // Check if we found any backends
@@ -252,7 +252,8 @@ pub const ConfigWatcher = struct {
                     for (new_backends.items) |backend| {
                         watcher.allocator.free(backend.getFullHost());
                     }
-                    new_backends.deinit();
+                    var backends_to_free = new_backends;
+                    backends_to_free.deinit(watcher.allocator);
                 };
                 
                 // Update the last modified time

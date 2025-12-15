@@ -526,7 +526,7 @@ pub const LockFreeConnectionPool = struct {
 
     pub fn init(self: *LockFreeConnectionPool, allocator: std.mem.Allocator) !void {
         if (!self.initialized) {
-            self.pools = std.ArrayList(AtomicConnectionStack).init(allocator);
+            self.pools = try std.ArrayList(AtomicConnectionStack).initCapacity(allocator, 0);
             self.allocator = allocator;
             self.initialized = true;
             log.info("Simple connection pool initialized with max {d} connections per backend", .{MAX_IDLE_CONNS});
@@ -535,8 +535,8 @@ pub const LockFreeConnectionPool = struct {
 
     pub fn addBackends(self: *LockFreeConnectionPool, backends_count: usize) !void {
         if (!self.initialized) return error.NotInitialized;
-        
-        try self.pools.resize(backends_count);
+
+        try self.pools.resize(self.allocator, backends_count);
         
         for (self.pools.items, 0..) |*stack, i| {
             stack.* = AtomicConnectionStack.init(self.allocator, MAX_IDLE_CONNS);
@@ -563,14 +563,14 @@ pub const LockFreeConnectionPool = struct {
             }
             
             // Resize the pools list
-            try self.pools.resize(new_backends_count);
+            try self.pools.resize(self.allocator, new_backends_count);
             log.info("Removed {d} backend pools", .{current_count - new_backends_count});
-        } 
+        }
         // If we need to add more backends
         else if (new_backends_count > current_count) {
             // Resize the pools list to accommodate all backends
             const old_len = self.pools.items.len;
-            try self.pools.resize(new_backends_count);
+            try self.pools.resize(self.allocator, new_backends_count);
             
             // Initialize new stacks
             for (self.pools.items[old_len..], old_len..) |*pool, i| {
@@ -634,7 +634,7 @@ pub const LockFreeConnectionPool = struct {
                 pool.deinit();
             }
 
-            self.pools.deinit();
+            self.pools.deinit(self.allocator);
             self.initialized = false;
         }
     }
