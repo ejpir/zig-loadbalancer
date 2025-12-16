@@ -25,29 +25,167 @@ zig build -Doptimize=ReleaseFast
 curl http://localhost:8080
 ```
 
-## Architectures
+## Architecture
 
-### Multi-Process (Recommended)
+### Multi-Process Overview (Recommended)
+
+```
+                            ┌─────────────────────────────────────────────────────────┐
+                            │                    MASTER PROCESS                       │
+                            │                                                         │
+                            │   • Forks worker processes                              │
+                            │   • Monitors workers via waitpid()                      │
+                            │   • Restarts crashed workers                            │
+                            │   • Does NOT handle requests                            │
+                            │                                                         │
+                            └────────────────────────┬────────────────────────────────┘
+                                                     │ fork()
+                       ┌─────────────────────────────┼─────────────────────────────┐
+                       │                             │                             │
+                       ▼                             ▼                             ▼
+        ┌──────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
+        │       WORKER 0           │  │       WORKER 1           │  │       WORKER N           │
+        │                          │  │                          │  │                          │
+        │  ┌────────────────────┐  │  │  ┌────────────────────┐  │  │  ┌────────────────────┐  │
+        │  │   Tardy Runtime    │  │  │  │   Tardy Runtime    │  │  │  │   Tardy Runtime    │  │
+        │  │  (single-threaded) │  │  │  │  (single-threaded) │  │  │  │  (single-threaded) │  │
+        │  └────────────────────┘  │  │  └────────────────────┘  │  │  └────────────────────┘  │
+        │                          │  │                          │  │                          │
+        │  ┌────────────────────┐  │  │  ┌────────────────────┐  │  │  ┌────────────────────┐  │
+        │  │  Connection Pool   │  │  │  │  Connection Pool   │  │  │  │  Connection Pool   │  │
+        │  │   (no atomics!)    │  │  │  │   (no atomics!)    │  │  │  │   (no atomics!)    │  │
+        │  └────────────────────┘  │  │  └────────────────────┘  │  │  └────────────────────┘  │
+        │                          │  │                          │  │                          │
+        │  ┌────────────────────┐  │  │  ┌────────────────────┐  │  │  ┌────────────────────┐  │
+        │  │   Health State     │  │  │  │   Health State     │  │  │  │   Health State     │  │
+        │  │ (circuit breaker)  │  │  │  │ (circuit breaker)  │  │  │  │ (circuit breaker)  │  │
+        │  └────────────────────┘  │  │  └────────────────────┘  │  │  └────────────────────┘  │
+        │                          │  │                          │  │                          │
+        └──────────┬───────────────┘  └──────────┬───────────────┘  └──────────┬───────────────┘
+                   │                             │                             │
+                   │ SO_REUSEPORT                │ SO_REUSEPORT                │ SO_REUSEPORT
+                   │                             │                             │
+                   └─────────────────────────────┼─────────────────────────────┘
+                                                 │
+                                          ┌──────┴──────┐
+                                          │  Port 8080  │
+                                          │   (kernel   │
+                                          │   balances) │
+                                          └──────┬──────┘
+                                                 │
+                                            Clients
+```
+
+**Key Benefits:**
+- **Zero lock contention**: Each worker has its own state (no shared memory)
+- **Crash isolation**: One worker dies, others continue serving
+- **SO_REUSEPORT**: Kernel distributes connections across workers
+- **CPU affinity**: Each worker pinned to a CPU core (Linux)
+
+### Multi-Process Request Flow
+
+```
+┌────────┐     ┌──────────────────────────────────────────────────────────────────────┐
+│ Client │     │                         WORKER PROCESS                               │
+└───┬────┘     │                                                                      │
+    │          │  ┌─────────┐    ┌─────────────┐    ┌─────────────┐    ┌───────────┐  │
+    │ Request  │  │  HTTP   │    │   Router    │    │   Proxy     │    │  Backend  │  │
+    ├─────────►│  │ Server  ├───►│ (strategy)  ├───►│ (streaming) ├───►│  Select   │  │
+    │          │  └─────────┘    └─────────────┘    └──────┬──────┘    └─────┬─────┘  │
+    │          │                                          │                  │        │
+    │          │                                          │   ┌──────────────┴─────┐  │
+    │          │                                          │   │ Health-aware pick: │  │
+    │          │                                          │   │ • Round-robin      │  │
+    │          │                                          │   │ • Skip unhealthy   │  │
+    │          │                                          │   └──────────────┬─────┘  │
+    │          │                                          │                  │        │
+    │          │                                          ▼                  │        │
+    │          │                                   ┌─────────────┐           │        │
+    │          │                                   │ Connection  │◄──────────┘        │
+    │          │                                   │    Pool     │                    │
+    │          │                                   │ (get/return)│                    │
+    │          │                                   └──────┬──────┘                    │
+    │          │                                          │                           │
+    │          └──────────────────────────────────────────┼───────────────────────────┘
+    │                                                     │
+    │                                                     ▼
+    │                                              ┌─────────────┐
+    │                                              │  Backend 1  │──► Success: record success
+    │                                              │  (primary)  │    Update circuit breaker
+    │                                              └──────┬──────┘
+    │                                                     │
+    │                                                     │ Fail?
+    │                                                     ▼
+    │                                              ┌─────────────┐
+    │                                              │  Backend 2  │──► Failover attempt
+    │                                              │ (failover)  │    Record failure on primary
+    │                                              └──────┬──────┘
+    │                                                     │
+    │          ┌──────────────────────────────────────────┘
+    │          │
+    │◄─────────┤  Response (streamed back)
+    │          │
+    │          │  Meanwhile, async health probe runs:
+    │          │  ┌─────────────────────────────────────┐
+    │          │  │  Timer.delay(5s) ──► Probe backends │
+    │          │  │  Update health bitmap               │
+    │          │  │  (non-blocking, same event loop)    │
+    │          │  └─────────────────────────────────────┘
+    │          │
+└───┴──────────┘
+```
+
+### Startup Flow
+
+```
+main() ─────────────────────────────────────────────────────────────────────────────────►
+
+    │
+    ├─► Parse CLI args (--workers, --port, --backend)
+    │
+    ├─► for worker_id in 0..worker_count:
+    │       │
+    │       ├─► fork()
+    │       │     │
+    │       │     ├─► [CHILD] setCpuAffinity(worker_id)
+    │       │     │           workerMain(config)
+    │       │     │             ├─► Create GPA (thread_safe=false)
+    │       │     │             ├─► Create ConnectionPool
+    │       │     │             ├─► Create BackendsList
+    │       │     │             ├─► Create Tardy runtime (single-threaded)
+    │       │     │             ├─► Create Router with proxy handler
+    │       │     │             ├─► Socket.init() with SO_REUSEPORT
+    │       │     │             ├─► socket.bind(), socket.listen()
+    │       │     │             └─► tardy.entry():
+    │       │     │                   ├─► Spawn health probe task
+    │       │     │                   └─► HTTP server.serve()
+    │       │     │
+    │       │     └─► [PARENT] worker_pids[worker_id] = pid
+    │
+    └─► [MASTER] Loop forever:
+            waitpid(-1) ──► Worker died? ──► Fork replacement
+```
+
+### Multi-Process vs Multi-Threaded
+
 ```bash
+# Multi-process (recommended)
 ./zig-out/bin/load_balancer_mp --workers 4 --port 8080
 ```
 
-nginx-style architecture with separate worker processes:
-- Each worker is single-threaded (no locks!)
-- SO_REUSEPORT for kernel-level load balancing
-- Crash isolation (one worker dies, master restarts it)
-- Health checking with circuit breaker and failover
-- ~17,770 req/s on macOS
+| Aspect | Multi-Process | Multi-Threaded |
+|--------|--------------|----------------|
+| Isolation | Full process isolation | Shared memory |
+| Locks | None (nothing shared) | Atomics for health bitmap |
+| Crash handling | Master restarts worker | Whole process dies |
+| Memory | Separate heaps per worker | Shared heap |
+| Connection pool | SimpleConnectionPool | Lock-free pool |
+| Performance | ~17,770 req/s | ~17,148 req/s |
 
-### Multi-Threaded
 ```bash
+# Multi-threaded
 ./zig-out/bin/load_balancer --port 8080
 ```
-
-Traditional multi-threaded with shared state:
-- Lock-free connection pooling
-- Atomic health bitmap
-- ~17,148 req/s on macOS
 
 ## Health Checking & Failover
 

@@ -12,7 +12,7 @@ const UltraSock = @import("../http/ultra_sock.zig").UltraSock;
 const http_utils = @import("../http/http_utils.zig");
 const simd_parse = @import("../internal/simd_parse.zig");
 const metrics = @import("../utils/metrics.zig");
-const Config = @import("config.zig").Config;
+const WorkerState = @import("worker_state.zig").WorkerState;
 
 pub const ProxyError = error{
     ConnectionFailed,
@@ -25,43 +25,42 @@ pub const ProxyError = error{
 };
 
 /// Generate handler with health-aware load balancing
-pub fn generateHandler(comptime strategy: types.LoadBalancerStrategy) fn (*const http.Context, *Config) anyerror!http.Respond {
+pub fn generateHandler(comptime strategy: types.LoadBalancerStrategy) fn (*const http.Context, *WorkerState) anyerror!http.Respond {
     return struct {
-        pub fn handle(ctx: *const http.Context, config: *Config) !http.Respond {
-            if (config.backends.items.len == 0) {
+        pub fn handle(ctx: *const http.Context, state: *WorkerState) !http.Respond {
+            if (state.backends.items.len == 0) {
                 return ctx.response.apply(.{ .status = .@"Service Unavailable", .mime = http.Mime.TEXT, .body = "No backends configured" });
             }
 
-            config.request_count +%= 1;
-
-            const backend_idx = config.selectBackend(strategy) orelse {
+            // Note: selectBackend manages its own counter for round-robin
+            const backend_idx = state.selectBackend(strategy) orelse {
                 return ctx.response.apply(.{ .status = .@"Service Unavailable", .mime = http.Mime.TEXT, .body = "No backends available" });
             };
 
-            return proxyWithFailover(ctx, backend_idx, config);
+            return proxyWithFailover(ctx, backend_idx, state);
         }
     }.handle;
 }
 
 /// Proxy with automatic failover
-fn proxyWithFailover(ctx: *const http.Context, primary_idx: usize, config: *Config) !http.Respond {
-    const backends = config.backends;
+fn proxyWithFailover(ctx: *const http.Context, primary_idx: usize, state: *WorkerState) !http.Respond {
+    const backends = state.backends;
 
-    if (streamingProxy(ctx, &backends.items[primary_idx], primary_idx, config)) |response| {
-        config.recordSuccess(primary_idx);
+    if (streamingProxy(ctx, &backends.items[primary_idx], primary_idx, state)) |response| {
+        state.recordSuccess(primary_idx);
         return response;
     } else |err| {
-        config.recordFailure(primary_idx);
+        state.recordFailure(primary_idx);
         log.warn("Backend {d} failed: {s}", .{ primary_idx + 1, @errorName(err) });
 
-        if (config.findHealthyBackend(primary_idx)) |failover_idx| {
+        if (state.findHealthyBackend(primary_idx)) |failover_idx| {
             log.debug("Failing over to backend {d}", .{failover_idx + 1});
 
-            if (streamingProxy(ctx, &backends.items[failover_idx], failover_idx, config)) |response| {
-                config.recordSuccess(failover_idx);
+            if (streamingProxy(ctx, &backends.items[failover_idx], failover_idx, state)) |response| {
+                state.recordSuccess(failover_idx);
                 return response;
             } else |failover_err| {
-                config.recordFailure(failover_idx);
+                state.recordFailure(failover_idx);
                 log.warn("Failover to backend {d} failed: {s}", .{ failover_idx + 1, @errorName(failover_err) });
             }
         }
@@ -71,7 +70,7 @@ fn proxyWithFailover(ctx: *const http.Context, primary_idx: usize, config: *Conf
 }
 
 /// Streaming proxy implementation
-fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer, backend_idx: usize, config: *Config) ProxyError!http.Respond {
+fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer, backend_idx: usize, state: *WorkerState) ProxyError!http.Respond {
     const start_time = std.time.milliTimestamp();
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
@@ -80,7 +79,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     var return_to_pool = true;
 
     // Get or create connection
-    var sock = config.connection_pool.getConnection(backend_idx) orelse blk: {
+    var sock = state.connection_pool.getConnection(backend_idx) orelse blk: {
         var ultra_sock = UltraSock.fromBackendServer(alloc, backend) catch return ProxyError.ConnectionFailed;
         ultra_sock.connect(ctx.runtime) catch {
             ultra_sock.close_blocking();
@@ -100,7 +99,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     }
 
     defer {
-        if (return_to_pool) config.connection_pool.returnConnection(backend_idx, sock) else sock.close_blocking();
+        if (return_to_pool) state.connection_pool.returnConnection(backend_idx, sock) else sock.close_blocking();
     }
 
     // Send request
