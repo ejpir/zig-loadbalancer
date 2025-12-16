@@ -80,11 +80,13 @@ pub fn getContentLengthSIMD(response_data: []const u8) ?usize {
         // Check if any matches found (like existing SIMD code pattern)
         if (@reduce(.Or, search_vector == c_lower) or @reduce(.Or, search_vector == c_upper)) {
             // Found potential match - verify with fallback method
+            // Use original slice for per-byte checks (can't index vector at runtime in Zig 0.16+)
             var k: usize = 0;
             while (k < vector_len) : (k += 1) {
-                if (search_vector[k] == 'c' or search_vector[k] == 'C') {
+                const byte = response_data[i + k];
+                if (byte == 'c' or byte == 'C') {
                     const remaining = response_data[i + k..];
-                    if (remaining.len >= 15 and 
+                    if (remaining.len >= 15 and
                         (std.mem.startsWith(u8, remaining, "content-length:") or
                          std.mem.startsWith(u8, remaining, "Content-Length:"))) {
                         const value_start = i + k + 15;
@@ -164,11 +166,13 @@ pub fn hasTransferEncodingSIMD(data: []const u8) bool {
         
         if (@reduce(.Or, search_vector == t_lower) or @reduce(.Or, search_vector == t_upper)) {
             // Found potential match - verify with fallback
+            // Use original slice for per-byte checks (can't index vector at runtime in Zig 0.16+)
             var k: usize = 0;
             while (k < vector_len) : (k += 1) {
-                if (search_vector[k] == 't' or search_vector[k] == 'T') {
+                const byte = data[i + k];
+                if (byte == 't' or byte == 'T') {
                     const remaining = data[i + k..];
-                    if (remaining.len >= 18 and 
+                    if (remaining.len >= 18 and
                         (std.mem.startsWith(u8, remaining, "transfer-encoding:") or
                          std.mem.startsWith(u8, remaining, "Transfer-Encoding:"))) {
                         return true;
@@ -319,9 +323,10 @@ inline fn findColonSIMD(line: []const u8) ?usize {
         const colon_char: Vector = @splat(':');
         
         if (@reduce(.Or, search_vector == colon_char)) {
+            // Use original slice for per-byte checks (can't index vector at runtime in Zig 0.16+)
             var k: usize = 0;
             while (k < vector_len) : (k += 1) {
-                if (search_vector[k] == ':') {
+                if (line[i + k] == ':') {
                     return i + k;
                 }
             }
@@ -363,9 +368,11 @@ inline fn trimSIMD(str: []const u8) []const u8 {
         // If not all characters are whitespace, we found the start
         if (!(@reduce(.And, search_vector == space_char) and @reduce(.And, search_vector == tab_char))) {
             // Find exact position within the vector
+            // Use original slice for per-byte checks (can't index vector at runtime in Zig 0.16+)
             var k: usize = 0;
             while (k < vector_len) : (k += 1) {
-                if (search_vector[k] != ' ' and search_vector[k] != '\t') {
+                const byte = str[start + k];
+                if (byte != ' ' and byte != '\t') {
                     start += k;
                     break;
                 }

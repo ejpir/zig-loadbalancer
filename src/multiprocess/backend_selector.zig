@@ -61,7 +61,12 @@ pub const BackendSelector = struct {
         self.random_state ^= self.random_state >> 7;
         self.random_state ^= self.random_state << 17;
         if (self.random_state == 0) {
-            self.random_state = @intCast(std.time.nanoTimestamp() & 0xFFFFFFFF);
+            // Seed from monotonic clock
+            if (std.posix.clock_gettime(.MONOTONIC)) |ts| {
+                self.random_state = @as(u64, @intCast(ts.nsec)) ^ @as(u64, @intCast(ts.sec));
+            } else |_| {
+                self.random_state = 1;
+            }
             if (self.random_state == 0) self.random_state = 1;
         }
 

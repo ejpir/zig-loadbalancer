@@ -151,8 +151,8 @@ pub const SimpleConnectionPool = struct {
 // Helper to create a mock UltraSock for testing (no actual network)
 fn createMockSocket(allocator: std.mem.Allocator) UltraSock {
     return UltraSock{
-        .socket = null,
-        .secure_socket = null,
+        .stream = null,
+        .io = null,
         .protocol = .http,
         .host = "test",
         .port = 8080,

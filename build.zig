@@ -7,34 +7,11 @@ pub fn build(b: *std.Build) void {
     // Set install directory to local zig-out
     b.install_prefix = "./zig-out";
 
-    // Get access to zzz module
+    // Get access to zzz module (zzz.io - uses Zig 0.16 native async I/O)
     const zzz_module = b.dependency("zzz", .{
         .target = target,
         .optimize = optimize,
     }).module("zzz");
-
-    // Add dependencies
-    const tardy = b.dependency("tardy", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("tardy");
-    zzz_module.addImport("tardy", tardy);
-
-    const secsock = b.dependency("secsock", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("secsock");
-    zzz_module.addImport("secsock", secsock);
-
-    const clap = b.dependency("clap", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("clap");
-
-    const yaml = b.dependency("yaml", .{
-        .target = target,
-        .optimize = optimize,
-    }).module("yaml");
 
     // Backend 1
     const backend1_mod = b.createModule(.{
@@ -64,22 +41,6 @@ pub fn build(b: *std.Build) void {
     const build_backend2 = b.addInstallArtifact(backend2, .{});
     const run_backend2 = b.addRunArtifact(backend2);
 
-    // Load balancer executable (multi-threaded)
-    const load_balancer_mod = b.createModule(.{
-        .root_source_file = b.path("main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    load_balancer_mod.addImport("zzz", zzz_module);
-    load_balancer_mod.addImport("clap", clap);
-    load_balancer_mod.addImport("yaml", yaml);
-    const load_balancer = b.addExecutable(.{
-        .name = "load_balancer",
-        .root_module = load_balancer_mod,
-    });
-    const build_load_balancer = b.addInstallArtifact(load_balancer, .{});
-    const run_load_balancer_cmd = b.addRunArtifact(load_balancer);
-
     // Load balancer multi-process (nginx-style)
     const load_balancer_mp_mod = b.createModule(.{
         .root_source_file = b.path("main_multiprocess.zig"),
@@ -108,17 +69,13 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     // Steps
-    const build_all = b.step("build-all", "Build both backends and load balancer");
+    const build_all = b.step("build-all", "Build backends and load balancer");
     build_all.dependOn(&build_backend1.step);
     build_all.dependOn(&build_backend2.step);
-    build_all.dependOn(&build_load_balancer.step);
     build_all.dependOn(&build_load_balancer_mp.step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
-
-    const run_lb_step = b.step("run-lb", "Run load balancer (multi-threaded)");
-    run_lb_step.dependOn(&run_load_balancer_cmd.step);
 
     const run_lb_mp_step = b.step("run-lb-mp", "Run load balancer (multi-process, nginx-style)");
     run_lb_mp_step.dependOn(&run_load_balancer_mp_cmd.step);

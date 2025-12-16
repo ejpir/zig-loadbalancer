@@ -2,23 +2,11 @@
     .name = .load_balancer,
     .fingerprint = 0x76c4befbe0cec3f4,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
-        .tardy = .{
-            .path = "vendor/tardy",
-        },
-        .secsock = .{
-            .path = "vendor/secsock",
-        },
-        .clap = .{
-            .path = "vendor/zig-clap",
-        },
-        .yaml = .{
-            .url = "git+https://github.com/kubkon/zig-yaml?ref=main#a6c2cd8760bf45c49b17a3f6259c4dfe3ded528e",
-            .hash = "zig_yaml-0.2.0-C1161pmrAgDnipDTh_4v4RQD27XN5GNaVlzzvlXf1jfW",
-        },
         .zzz = .{
-            .path = "vendor/zzz",
+            .url = "git+https://github.com/philipmv/zzz.io#05081e2d0601668c6104d3e1eab41b95ea6497c6",
+            .hash = "zzz-0.0.1-YfaUFztqAgAGfNB_teyaSzxEJjtyBmcVewomdA_YSATs",
         },
     },
 
