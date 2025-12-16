@@ -1,6 +1,6 @@
 FROM alpine:latest
 
-RUN apk add --no-cache zig
+RUN apk add --no-cache zig netcat-openbsd
 
 WORKDIR /app
 
