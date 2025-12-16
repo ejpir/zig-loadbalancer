@@ -23,7 +23,7 @@ const Socket = tardy.Socket;
 const types = @import("src/core/types.zig");
 const simple_pool = @import("src/memory/simple_connection_pool.zig");
 const metrics = @import("src/utils/metrics.zig");
-const mp = @import("src/mp.zig");
+const mp = @import("src/multiprocess/mod.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .warn, // .debug for verbose, .warn for health changes, .err for benchmarks
