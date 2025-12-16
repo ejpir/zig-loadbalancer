@@ -3,8 +3,15 @@
 /// Composite state for a single-threaded worker process.
 /// Combines health tracking, circuit breaker, backend selection, and connection pooling.
 const std = @import("std");
+const posix = std.posix;
 
 const types = @import("../core/types.zig");
+
+/// Get current time in milliseconds using monotonic clock
+fn currentTimeMillis() i64 {
+    const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
 const simple_pool = @import("../memory/simple_connection_pool.zig");
 
 pub const health_state = @import("health_state.zig");
@@ -131,7 +138,7 @@ pub const WorkerState = struct {
     /// Check if it's time to probe a backend
     pub fn shouldProbe(self: *const WorkerState, backend_idx: usize) bool {
         if (backend_idx >= MAX_BACKENDS) return false;
-        const now = std.time.milliTimestamp();
+        const now = currentTimeMillis();
         const last = self.last_check_time[backend_idx];
         return (now - last) >= @as(i64, @intCast(self.config.probe_interval_ms));
     }
@@ -139,7 +146,7 @@ pub const WorkerState = struct {
     /// Update last probe time
     pub fn updateProbeTime(self: *WorkerState, backend_idx: usize) void {
         if (backend_idx >= MAX_BACKENDS) return;
-        self.last_check_time[backend_idx] = std.time.milliTimestamp();
+        self.last_check_time[backend_idx] = currentTimeMillis();
     }
 
     /// Force a backend healthy (manual override)

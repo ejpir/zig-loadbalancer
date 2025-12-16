@@ -25,6 +25,7 @@ const types = @import("src/core/types.zig");
 const simple_pool = @import("src/memory/simple_connection_pool.zig");
 const metrics = @import("src/utils/metrics.zig");
 const mp = @import("src/multiprocess/mod.zig");
+const health = @import("src/multiprocess/health.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -187,7 +188,8 @@ fn shutdown(_: std.c.SIG) callconv(.c) void {
 }
 
 fn workerMain(config: WorkerConfig) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
+    // Thread-safe allocator since health probes run in separate thread
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
@@ -209,6 +211,13 @@ fn workerMain(config: WorkerConfig) !void {
     var worker_state = mp.WorkerState.init(&backends, &connection_pool, .{});
 
     log.info("Worker {d}: Starting with {d} backends", .{ config.worker_id, backends.items.len });
+
+    // Start health probe thread
+    const health_thread = health.startHealthProbes(&worker_state, config.worker_id) catch |err| {
+        log.err("Worker {d}: Failed to start health probes: {s}", .{ config.worker_id, @errorName(err) });
+        return err;
+    };
+    defer health_thread.detach();
 
     // Signal handling
     posix.sigaction(posix.SIG.TERM, &.{
