@@ -21,6 +21,7 @@ pub const health_state = @import("health_state.zig");
 pub const circuit_breaker = @import("circuit_breaker.zig");
 pub const backend_selector = @import("backend_selector.zig");
 pub const worker_state = @import("worker_state.zig");
+pub const connection_reuse = @import("connection_reuse.zig");
 
 // Primary exports
 pub const WorkerState = worker_state.WorkerState;

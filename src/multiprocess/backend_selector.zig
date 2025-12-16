@@ -20,17 +20,14 @@ pub const BackendSelector = struct {
 
     /// Select a backend using the specified strategy
     /// Hot path - comptime strategy eliminates switch at compile time
+    /// Returns null if no healthy backends are available
     pub inline fn select(self: *BackendSelector, comptime strategy: LoadBalancerStrategy) ?usize {
         if (self.backend_count == 0) return null;
 
         const healthy_count = self.health.countHealthy();
 
-        // If all backends unhealthy, fall back to round-robin without health check
-        if (healthy_count == 0) {
-            const idx = self.rr_counter % self.backend_count;
-            self.rr_counter +%= 1;
-            return idx;
-        }
+        // No healthy backends available
+        if (healthy_count == 0) return null;
 
         return switch (strategy) {
             .round_robin, .weighted_round_robin => self.selectRoundRobin(),
@@ -40,6 +37,7 @@ pub const BackendSelector = struct {
     }
 
     /// Round-robin selection among healthy backends
+    /// Precondition: at least one healthy backend exists (checked by select())
     fn selectRoundRobin(self: *BackendSelector) usize {
         var attempts: usize = 0;
         while (attempts < self.backend_count) : (attempts += 1) {
@@ -49,10 +47,8 @@ pub const BackendSelector = struct {
                 return candidate;
             }
         }
-        // Fallback: all unhealthy, just pick next
-        const fallback = self.rr_counter % self.backend_count;
-        self.rr_counter +%= 1;
-        return fallback;
+        // Should never reach here if precondition is met
+        unreachable;
     }
 
     /// Fast random selection using bit manipulation
@@ -132,21 +128,14 @@ test "BackendSelector: round-robin with single healthy backend" {
     try std.testing.expectEqual(@as(?usize, 2), selector.select(.round_robin));
 }
 
-test "BackendSelector: fallback when all unhealthy" {
-    var health = HealthState{}; // All unhealthy
+test "BackendSelector: returns null when all unhealthy" {
+    var health = HealthState{}; // All unhealthy (bitmap = 0)
 
     var selector = BackendSelector{ .health = &health, .backend_count = 3 };
 
-    // Should still round-robin as fallback
-    const first = selector.select(.round_robin);
-    const second = selector.select(.round_robin);
-    const third = selector.select(.round_robin);
-    const fourth = selector.select(.round_robin);
-
-    try std.testing.expectEqual(@as(?usize, 0), first);
-    try std.testing.expectEqual(@as(?usize, 1), second);
-    try std.testing.expectEqual(@as(?usize, 2), third);
-    try std.testing.expectEqual(@as(?usize, 0), fourth);
+    // Should return null - no healthy backends available
+    try std.testing.expectEqual(@as(?usize, null), selector.select(.round_robin));
+    try std.testing.expectEqual(@as(?usize, null), selector.select(.random));
 }
 
 test "BackendSelector: random only selects healthy backends" {
