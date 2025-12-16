@@ -42,7 +42,7 @@ const BackendDef = struct {
 const WorkerConfig = struct {
     host: []const u8,
     port: u16,
-    backends: []const BackendDef,
+    backends: []BackendDef,
     strategy: types.LoadBalancerStrategy,
     worker_id: usize,
     worker_count: usize,
@@ -65,6 +65,10 @@ pub fn main() !void {
     var port: u16 = 8080;
     var host: []const u8 = "0.0.0.0";
 
+    // Dynamic backend list
+    var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
+    defer backend_list.deinit(allocator);
+
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--workers") or std.mem.eql(u8, args[i], "-w")) {
@@ -82,26 +86,42 @@ pub fn main() !void {
                 host = args[i + 1];
                 i += 1;
             }
+        } else if (std.mem.eql(u8, args[i], "--backend") or std.mem.eql(u8, args[i], "-b")) {
+            if (i + 1 < args.len) {
+                const backend_str = args[i + 1];
+                // Parse "host:port" format
+                if (std.mem.lastIndexOf(u8, backend_str, ":")) |colon| {
+                    const backend_host = backend_str[0..colon];
+                    const backend_port = try std.fmt.parseInt(u16, backend_str[colon + 1 ..], 10);
+                    try backend_list.append(allocator, .{ .host = backend_host, .port = backend_port });
+                }
+                i += 1;
+            }
         }
     }
 
-    // Backend configuration
-    const backends = [_]BackendDef{
-        .{ .host = "127.0.0.1", .port = 9001 },
-        .{ .host = "127.0.0.1", .port = 9002 },
-    };
+    // Default backends if none specified
+    if (backend_list.items.len == 0) {
+        try backend_list.append(allocator, .{ .host = "127.0.0.1", .port = 9001 });
+        try backend_list.append(allocator, .{ .host = "127.0.0.1", .port = 9002 });
+    }
+
+    const backends = backend_list.items;
 
     const config = WorkerConfig{
         .host = host,
         .port = port,
-        .backends = &backends,
+        .backends = backends,
         .strategy = .round_robin,
         .worker_id = 0,
         .worker_count = worker_count,
     };
 
     log.info("=== Multi-Process Load Balancer ===", .{});
-    log.info("Workers: {d}, Listen: {s}:{d}, Backends: {d}", .{worker_count, host, port, backends.len});
+    log.info("Workers: {d}, Listen: {s}:{d}, Backends: {d}", .{ worker_count, host, port, backends.len });
+    for (backends, 0..) |b, idx| {
+        log.info("  Backend {d}: {s}:{d}", .{ idx + 1, b.host, b.port });
+    }
 
     // Fork workers
     var worker_pids = try allocator.alloc(posix.pid_t, worker_count);
@@ -266,10 +286,11 @@ fn setCpuAffinity(worker_id: usize) !void {
         const cpu_count = try std.Thread.getCpuCount();
         const target_cpu = worker_id % cpu_count;
 
-        var cpu_set: std.os.linux.cpu_set_t = .{ .bits = [_]usize{0} ** 16 };
-        cpu_set.bits[target_cpu / 64] |= @as(usize, 1) << @intCast(target_cpu % 64);
+        var cpu_set: std.os.linux.cpu_set_t = std.mem.zeroes(std.os.linux.cpu_set_t);
+        const word_idx = target_cpu / @bitSizeOf(usize);
+        const bit_idx: std.math.Log2Int(usize) = @intCast(target_cpu % @bitSizeOf(usize));
+        cpu_set[word_idx] |= @as(usize, 1) << bit_idx;
 
-        const rc = std.os.linux.sched_setaffinity(0, @sizeOf(std.os.linux.cpu_set_t), &cpu_set);
-        if (rc != 0) return error.SetAffinityFailed;
+        std.os.linux.sched_setaffinity(0, &cpu_set) catch return error.SetAffinityFailed;
     }
 }

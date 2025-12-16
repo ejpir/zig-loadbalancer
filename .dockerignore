@@ -1,0 +1,6 @@
+zig-out/
+.zig-cache/
+*.o
+logs/
+*.json.gz
+profile.json
