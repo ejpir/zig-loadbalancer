@@ -267,8 +267,8 @@ pub fn extractHttpVersion(line: []const u8) !HttpVersion {
     // Or in request line (e.g., "GET / HTTP/1.1")
     const http_pos = std.mem.indexOf(u8, line, "HTTP/") orelse return error.InvalidStatusLine;
     
-    // Ensure we have at least "HTTP/x.y" (9 chars)
-    if (http_pos + 8 >= line.len) return error.InvalidStatusLine;
+    // Ensure we have at least "HTTP/x.y" (8 chars from http_pos)
+    if (http_pos + 8 > line.len) return error.InvalidStatusLine;
     
     // Extract just the version part (e.g., "HTTP/1.1" -> "1.1")
     const version_part = line[http_pos + 5..];
@@ -418,4 +418,211 @@ pub fn parseResponseWithPool(allocator: std.mem.Allocator, response_data: []cons
         .version = version,
         .buffer_pool = buffer_pool, // Track buffer pool for cleanup
     };
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "determineMessageLength: HEAD request - no body" {
+    const headers = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+    const result = determineMessageLength("HEAD", 200, headers, false);
+    try std.testing.expectEqual(LengthType.no_body, result.type);
+}
+
+test "determineMessageLength: 204 No Content - no body" {
+    const headers = "HTTP/1.1 204 No Content\r\n\r\n";
+    const result = determineMessageLength("GET", 204, headers, false);
+    try std.testing.expectEqual(LengthType.no_body, result.type);
+}
+
+test "determineMessageLength: 304 Not Modified - no body" {
+    const headers = "HTTP/1.1 304 Not Modified\r\n\r\n";
+    const result = determineMessageLength("GET", 304, headers, false);
+    try std.testing.expectEqual(LengthType.no_body, result.type);
+}
+
+test "determineMessageLength: 1xx informational - no body" {
+    const headers = "HTTP/1.1 100 Continue\r\n\r\n";
+    const result = determineMessageLength("GET", 100, headers, false);
+    try std.testing.expectEqual(LengthType.no_body, result.type);
+}
+
+test "determineMessageLength: successful CONNECT - tunnel" {
+    const headers = "HTTP/1.1 200 Connection established\r\n\r\n";
+    const result = determineMessageLength("CONNECT", 200, headers, false);
+    try std.testing.expectEqual(LengthType.tunnel, result.type);
+}
+
+test "determineMessageLength: failed CONNECT - not tunnel" {
+    const headers = "HTTP/1.1 403 Forbidden\r\nContent-Length: 100\r\n\r\n";
+    const result = determineMessageLength("CONNECT", 403, headers, false);
+    try std.testing.expectEqual(LengthType.content_length, result.type);
+}
+
+test "determineMessageLength: chunked encoding" {
+    const headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const result = determineMessageLength("GET", 200, headers, false);
+    try std.testing.expectEqual(LengthType.chunked, result.type);
+}
+
+test "determineMessageLength: chunked as final encoding in list" {
+    const headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n";
+    const result = determineMessageLength("GET", 200, headers, false);
+    try std.testing.expectEqual(LengthType.chunked, result.type);
+}
+
+test "determineMessageLength: non-chunked transfer encoding response - close delimited" {
+    const headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n";
+    const result = determineMessageLength("GET", 200, headers, false);
+    try std.testing.expectEqual(LengthType.close_delimited, result.type);
+}
+
+test "determineMessageLength: non-chunked transfer encoding request - invalid" {
+    const headers = "POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n";
+    const result = determineMessageLength("POST", 200, headers, true);
+    try std.testing.expectEqual(LengthType.invalid, result.type);
+}
+
+test "determineMessageLength: Content-Length header" {
+    const headers = "HTTP/1.1 200 OK\r\nContent-Length: 1234\r\n\r\n";
+    const result = determineMessageLength("GET", 200, headers, false);
+    try std.testing.expectEqual(LengthType.content_length, result.type);
+    try std.testing.expectEqual(@as(usize, 1234), result.length);
+}
+
+test "determineMessageLength: no length headers response - close delimited" {
+    const headers = "HTTP/1.1 200 OK\r\n\r\n";
+    const result = determineMessageLength("GET", 200, headers, false);
+    try std.testing.expectEqual(LengthType.close_delimited, result.type);
+}
+
+test "determineMessageLength: no length headers request - no body" {
+    const headers = "GET / HTTP/1.1\r\n\r\n";
+    const result = determineMessageLength("GET", 200, headers, true);
+    try std.testing.expectEqual(LengthType.no_body, result.type);
+}
+
+test "isHeadRequest: HEAD method" {
+    try std.testing.expect(isHeadRequest("HEAD / HTTP/1.1\r\n"));
+}
+
+test "isHeadRequest: GET method" {
+    try std.testing.expect(!isHeadRequest("GET / HTTP/1.1\r\n"));
+}
+
+test "isHeadRequest: POST method" {
+    try std.testing.expect(!isHeadRequest("POST / HTTP/1.1\r\n"));
+}
+
+test "isBodylessStatus: 200 OK - has body" {
+    try std.testing.expect(!isBodylessStatus("HTTP/1.1 200 OK\r\n"));
+}
+
+test "isBodylessStatus: 204 No Content - no body" {
+    try std.testing.expect(isBodylessStatus("HTTP/1.1 204 No Content\r\n"));
+}
+
+test "isBodylessStatus: 304 Not Modified - no body" {
+    try std.testing.expect(isBodylessStatus("HTTP/1.1 304 Not Modified\r\n"));
+}
+
+test "isBodylessStatus: 100 Continue - no body" {
+    try std.testing.expect(isBodylessStatus("HTTP/1.1 100 Continue\r\n"));
+}
+
+test "isBodylessStatus: 101 Switching Protocols - no body" {
+    try std.testing.expect(isBodylessStatus("HTTP/1.1 101 Switching Protocols\r\n"));
+}
+
+test "isConnectRequest: CONNECT method" {
+    try std.testing.expect(isConnectRequest("CONNECT example.com:443 HTTP/1.1\r\n"));
+}
+
+test "isConnectRequest: GET method" {
+    try std.testing.expect(!isConnectRequest("GET / HTTP/1.1\r\n"));
+}
+
+test "hasConflictingContentLength: single header - no conflict" {
+    const headers = "Content-Length: 100\r\n\r\n";
+    try std.testing.expect(!hasConflictingContentLength(headers));
+}
+
+test "hasConflictingContentLength: duplicate same value - no conflict" {
+    const headers = "Content-Length: 100\r\nContent-Length: 100\r\n\r\n";
+    try std.testing.expect(!hasConflictingContentLength(headers));
+}
+
+test "hasConflictingContentLength: different values - conflict" {
+    const headers = "Content-Length: 100\r\nContent-Length: 200\r\n\r\n";
+    try std.testing.expect(hasConflictingContentLength(headers));
+}
+
+test "hasConflictingContentLength: invalid value - conflict" {
+    const headers = "Content-Length: abc\r\n\r\n";
+    try std.testing.expect(hasConflictingContentLength(headers));
+}
+
+test "hasTransferEncoding: present" {
+    const headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    try std.testing.expect(hasTransferEncoding(headers));
+}
+
+test "hasTransferEncoding: not present" {
+    const headers = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
+    try std.testing.expect(!hasTransferEncoding(headers));
+}
+
+test "hasChunkedEncoding: present" {
+    const headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    try std.testing.expect(hasChunkedEncoding(headers));
+}
+
+test "hasChunkedEncoding: not present" {
+    const headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n";
+    try std.testing.expect(!hasChunkedEncoding(headers));
+}
+
+test "hasCompressionCoding: gzip" {
+    const headers = "Transfer-Encoding: gzip\r\n\r\n";
+    try std.testing.expect(hasCompressionCoding(headers));
+}
+
+test "hasCompressionCoding: deflate" {
+    const headers = "Transfer-Encoding: deflate\r\n\r\n";
+    try std.testing.expect(hasCompressionCoding(headers));
+}
+
+test "hasCompressionCoding: chunked only" {
+    const headers = "Transfer-Encoding: chunked\r\n\r\n";
+    try std.testing.expect(!hasCompressionCoding(headers));
+}
+
+test "TransferCoding: fromString and toString" {
+    try std.testing.expectEqual(TransferCoding.chunked, TransferCoding.fromString("chunked"));
+    try std.testing.expectEqual(TransferCoding.gzip, TransferCoding.fromString("gzip"));
+    try std.testing.expectEqual(TransferCoding.unknown, TransferCoding.fromString("foo"));
+    try std.testing.expectEqualStrings("chunked", TransferCoding.chunked.toString());
+}
+
+test "extractHttpVersion: HTTP/1.1" {
+    const version = try extractHttpVersion("HTTP/1.1 200 OK");
+    try std.testing.expectEqual(@as(u8, 1), version.major);
+    try std.testing.expectEqual(@as(u8, 1), version.minor);
+}
+
+test "extractHttpVersion: HTTP/1.0" {
+    const version = try extractHttpVersion("HTTP/1.0 200 OK");
+    try std.testing.expectEqual(@as(u8, 1), version.major);
+    try std.testing.expectEqual(@as(u8, 0), version.minor);
+}
+
+test "extractHttpVersion: request line" {
+    const version = try extractHttpVersion("GET / HTTP/1.1");
+    try std.testing.expectEqual(@as(u8, 1), version.major);
+    try std.testing.expectEqual(@as(u8, 1), version.minor);
+}
+
+test "extractHttpVersion: invalid - no HTTP" {
+    try std.testing.expectError(error.InvalidStatusLine, extractHttpVersion("200 OK"));
 }

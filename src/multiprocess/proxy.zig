@@ -13,6 +13,7 @@ const http_utils = @import("../http/http_utils.zig");
 const simd_parse = @import("../internal/simd_parse.zig");
 const metrics = @import("../utils/metrics.zig");
 const WorkerState = @import("worker_state.zig").WorkerState;
+const connection_reuse = @import("connection_reuse.zig");
 
 pub const ProxyError = error{
     ConnectionFailed,
@@ -146,7 +147,8 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     const status_code = std.fmt.parseInt(u16, headers[space + 1 ..][0..3], 10) catch 200;
     const msg_len = http_utils.determineMessageLength("GET", status_code, headers, false);
 
-    if (std.mem.indexOf(u8, headers, "Connection: close") != null) return_to_pool = false;
+    // Check if headers allow connection reuse
+    if (!connection_reuse.checkHeadersForReuse(headers).canReuse()) return_to_pool = false;
 
     // Build response
     var resp = std.ArrayList(u8).initCapacity(alloc, 512) catch return ProxyError.ConnectionFailed;
@@ -180,30 +182,47 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     if (header_buffer.items.len > header_end) resp.appendSlice(alloc, header_buffer.items[header_end..]) catch {};
 
     _ = ctx.socket.send_all(ctx.runtime, resp.items) catch return ProxyError.SendFailed;
-    var sent = header_buffer.items.len - header_end;
+    var bytes_received = header_buffer.items.len - header_end;
+    var body_had_error = false;
+    var chunked_complete = false;
 
     // Stream body
     if (msg_len.type == .content_length) {
-        while (sent < msg_len.length) {
-            const n = sock.recv(ctx.runtime, &recv_buffer) catch break;
+        while (bytes_received < msg_len.length) {
+            const n = sock.recv(ctx.runtime, &recv_buffer) catch {
+                body_had_error = true;
+                break;
+            };
             if (n == 0) {
-                return_to_pool = false;
+                body_had_error = true;
                 break;
             }
             _ = ctx.socket.send(ctx.runtime, recv_buffer[0..n]) catch break;
-            sent += n;
+            bytes_received += n;
         }
     } else if (msg_len.type == .chunked or msg_len.type == .close_delimited) {
         while (true) {
-            const n = sock.recv(ctx.runtime, &recv_buffer) catch break;
+            const n = sock.recv(ctx.runtime, &recv_buffer) catch {
+                body_had_error = true;
+                break;
+            };
             if (n == 0) {
-                return_to_pool = false;
+                body_had_error = true;
                 break;
             }
             _ = ctx.socket.send(ctx.runtime, recv_buffer[0..n]) catch break;
-            sent += n;
-            if (msg_len.type == .chunked and simd_parse.findChunkEnd(recv_buffer[0..n]) != null) break;
+            bytes_received += n;
+            if (msg_len.type == .chunked and simd_parse.findChunkEnd(recv_buffer[0..n]) != null) {
+                chunked_complete = true;
+                break;
+            }
         }
+    }
+
+    // Check if body transfer allows connection reuse
+    const body_error = body_had_error or (msg_len.type == .chunked and !chunked_complete);
+    if (return_to_pool and !connection_reuse.checkBodyForReuse(msg_len.type, msg_len.length, bytes_received, body_error).canReuse()) {
+        return_to_pool = false;
     }
 
     metrics.global_metrics.recordRequest(std.time.milliTimestamp() - start_time, status_code);
