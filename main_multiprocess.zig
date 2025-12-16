@@ -26,7 +26,7 @@ const metrics = @import("src/utils/metrics.zig");
 const mp = @import("src/multiprocess/mod.zig");
 
 pub const std_options: std.Options = .{
-    .log_level = .warn, // .debug for verbose, .warn for health changes, .err for benchmarks
+    .log_level = .info, // .debug for verbose, .warn for health changes, .err for benchmarks
 };
 
 // ============================================================================
@@ -136,13 +136,13 @@ pub fn main() !void {
             worker_config.worker_id = worker_id;
             setCpuAffinity(worker_id) catch {};
             workerMain(worker_config) catch |err| {
-                log.err("Worker {d} fatal: {s}", .{worker_id, @errorName(err)});
+                log.err("Worker {d} fatal: {s}", .{ worker_id, @errorName(err) });
                 posix.exit(1);
             };
             posix.exit(0);
         } else {
             worker_pids[worker_id] = pid;
-            log.info("Spawned worker {d} (PID: {d})", .{worker_id, pid});
+            log.info("Spawned worker {d} (PID: {d})", .{ worker_id, pid });
         }
     }
 
@@ -162,7 +162,7 @@ pub fn main() !void {
                         worker_config.worker_id = worker_id;
                         setCpuAffinity(worker_id) catch {};
                         workerMain(worker_config) catch |err| {
-                            log.err("Worker {d} fatal: {s}", .{worker_id, @errorName(err)});
+                            log.err("Worker {d} fatal: {s}", .{ worker_id, @errorName(err) });
                             posix.exit(1);
                         };
                         posix.exit(0);
@@ -199,14 +199,10 @@ fn workerMain(config: WorkerConfig) !void {
     }
     connection_pool.addBackends(backends.items.len);
 
-    // Multi-process config (health state, circuit breaker)
-    var mp_config = mp.Config{
-        .backends = &backends,
-        .connection_pool = &connection_pool,
-        .strategy = config.strategy,
-    };
+    // Worker state (health state, circuit breaker, backend selector)
+    var worker_state = mp.WorkerState.init(&backends, &connection_pool, .{});
 
-    log.info("Worker {d}: Starting with {d} backends", .{config.worker_id, backends.items.len});
+    log.info("Worker {d}: Starting with {d} backends", .{ config.worker_id, backends.items.len });
 
     // Tardy runtime (single-threaded!)
     var t = try Tardy.init(allocator, .{
@@ -219,7 +215,7 @@ fn workerMain(config: WorkerConfig) !void {
 
     // Router
     var router = switch (config.strategy) {
-        inline else => |s| try createRouter(allocator, &mp_config, s),
+        inline else => |s| try createRouter(allocator, &worker_state, s),
     };
     defer router.deinit(allocator);
 
@@ -229,11 +225,11 @@ fn workerMain(config: WorkerConfig) !void {
     try socket.bind();
     try socket.listen(4096);
 
-    log.info("Worker {d}: Listening on {s}:{d}", .{config.worker_id, config.host, config.port});
+    log.info("Worker {d}: Listening on {s}:{d}", .{ config.worker_id, config.host, config.port });
 
     // Start
     try t.entry(
-        WorkerContext{ .router = &router, .socket = socket, .worker_id = config.worker_id, .mp_config = &mp_config, .allocator = allocator },
+        WorkerContext{ .router = &router, .socket = socket, .worker_id = config.worker_id, .worker_state = &worker_state, .allocator = allocator },
         workerEntry,
     );
 }
@@ -242,19 +238,19 @@ const WorkerContext = struct {
     router: *const http.Router,
     socket: Socket,
     worker_id: usize,
-    mp_config: *mp.Config,
+    worker_state: *mp.WorkerState,
     allocator: std.mem.Allocator,
 };
 
 fn workerEntry(rt: *Runtime, ctx: WorkerContext) !void {
     // Spawn health probe task
     rt.spawn(.{mp.HealthProbeContext{
-        .config = ctx.mp_config,
+        .state = ctx.worker_state,
         .allocator = ctx.allocator,
         .worker_id = ctx.worker_id,
         .runtime = rt,
     }}, mp.healthProbeTask, 1024 * 64) catch |err| {
-        log.warn("Worker {d}: Failed to spawn health probe: {s}", .{ctx.worker_id, @errorName(err)});
+        log.warn("Worker {d}: Failed to spawn health probe: {s}", .{ ctx.worker_id, @errorName(err) });
     };
 
     // HTTP server
@@ -266,14 +262,14 @@ fn workerEntry(rt: *Runtime, ctx: WorkerContext) !void {
     });
 
     server.serve(rt, ctx.router, .{ .normal = ctx.socket }) catch |err| {
-        log.err("Worker {d}: Server error: {s}", .{ctx.worker_id, @errorName(err)});
+        log.err("Worker {d}: Server error: {s}", .{ ctx.worker_id, @errorName(err) });
     };
 }
 
-fn createRouter(allocator: std.mem.Allocator, config: *mp.Config, comptime strategy: types.LoadBalancerStrategy) !http.Router {
+fn createRouter(allocator: std.mem.Allocator, state: *mp.WorkerState, comptime strategy: types.LoadBalancerStrategy) !http.Router {
     return try http.Router.init(allocator, &.{
         http.Route.init("/metrics").get({}, metrics.metricsHandler).layer(),
-        http.Route.init("/").all(config, mp.generateHandler(strategy)).layer(),
+        http.Route.init("/").all(state, mp.generateHandler(strategy)).layer(),
     }, .{});
 }
 
