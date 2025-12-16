@@ -2,6 +2,8 @@ services:
   backend1:
     build: .
     command: ["./zig-out/bin/backend1"]
+    ports:
+      - "9001:9001"
     security_opt:
       - seccomp:unconfined
     cap_add:
@@ -10,6 +12,8 @@ services:
   backend2:
     build: .
     command: ["./zig-out/bin/backend2"]
+    ports:
+      - "9002:9002"
     security_opt:
       - seccomp:unconfined
     cap_add:
