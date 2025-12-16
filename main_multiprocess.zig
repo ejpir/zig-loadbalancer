@@ -1,7 +1,7 @@
 /// Multi-Process Load Balancer (nginx-style architecture)
 ///
 /// Each worker is a separate process with its own:
-/// - Event loop (Tardy runtime) - single-threaded, no locks!
+/// - Event loop (std.Io) - single-threaded, no locks!
 /// - Connection pool - no atomics needed
 /// - Health state - independent circuit breaker per worker
 ///
@@ -14,11 +14,12 @@ const posix = std.posix;
 const log = std.log.scoped(.lb_mp);
 
 const zzz = @import("zzz");
-const tardy = zzz.tardy;
 const http = zzz.HTTP;
-const Tardy = tardy.Tardy(.auto);
-const Runtime = tardy.Runtime;
-const Socket = tardy.Socket;
+
+const Io = std.Io;
+const Server = http.Server;
+const Router = http.Router;
+const Route = http.Route;
 
 const types = @import("src/core/types.zig");
 const simple_pool = @import("src/memory/simple_connection_pool.zig");
@@ -26,7 +27,7 @@ const metrics = @import("src/utils/metrics.zig");
 const mp = @import("src/multiprocess/mod.zig");
 
 pub const std_options: std.Options = .{
-    .log_level = .info, // .debug for verbose, .warn for health changes, .err for benchmarks
+    .log_level = .info,
 };
 
 // ============================================================================
@@ -89,7 +90,6 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--backend") or std.mem.eql(u8, args[i], "-b")) {
             if (i + 1 < args.len) {
                 const backend_str = args[i + 1];
-                // Parse "host:port" format
                 if (std.mem.lastIndexOf(u8, backend_str, ":")) |colon| {
                     const backend_host = backend_str[0..colon];
                     const backend_port = try std.fmt.parseInt(u16, backend_str[colon + 1 ..], 10);
@@ -180,6 +180,12 @@ pub fn main() !void {
 // Worker Process
 // ============================================================================
 
+var server: Server = undefined;
+
+fn shutdown(_: std.c.SIG) callconv(.c) void {
+    server.stop();
+}
+
 fn workerMain(config: WorkerConfig) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
     const allocator = gpa.allocator();
@@ -204,14 +210,17 @@ fn workerMain(config: WorkerConfig) !void {
 
     log.info("Worker {d}: Starting with {d} backends", .{ config.worker_id, backends.items.len });
 
-    // Tardy runtime (single-threaded!)
-    var t = try Tardy.init(allocator, .{
-        .threading = .single,
-        .pooling = .grow,
-        .size_tasks_initial = 4096,
-        .size_aio_reap_max = 4096,
-    });
-    defer t.deinit();
+    // Signal handling
+    posix.sigaction(posix.SIG.TERM, &.{
+        .handler = .{ .handler = shutdown },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+
+    // std.Io runtime
+    var threaded: Io.Threaded = .init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
 
     // Router
     var router = switch (config.strategy) {
@@ -219,57 +228,28 @@ fn workerMain(config: WorkerConfig) !void {
     };
     defer router.deinit(allocator);
 
-    // Socket (SO_REUSEPORT)
-    var socket = try Socket.init(.{ .tcp = .{ .host = config.host, .port = config.port } });
-    defer socket.close_blocking();
-    try socket.bind();
-    try socket.listen(4096);
+    // Socket (SO_REUSEPORT for multi-process load balancing)
+    const addr = try Io.net.IpAddress.parse(config.host, config.port);
+    var socket = try addr.listen(io, .{ .kernel_backlog = 4096, .reuse_address = true });
+    defer socket.deinit(io);
 
     log.info("Worker {d}: Listening on {s}:{d}", .{ config.worker_id, config.host, config.port });
 
-    // Start
-    try t.entry(
-        WorkerContext{ .router = &router, .socket = socket, .worker_id = config.worker_id, .worker_state = &worker_state, .allocator = allocator },
-        workerEntry,
-    );
-}
-
-const WorkerContext = struct {
-    router: *const http.Router,
-    socket: Socket,
-    worker_id: usize,
-    worker_state: *mp.WorkerState,
-    allocator: std.mem.Allocator,
-};
-
-fn workerEntry(rt: *Runtime, ctx: WorkerContext) !void {
-    // Spawn health probe task
-    rt.spawn(.{mp.HealthProbeContext{
-        .state = ctx.worker_state,
-        .allocator = ctx.allocator,
-        .worker_id = ctx.worker_id,
-        .runtime = rt,
-    }}, mp.healthProbeTask, 1024 * 64) catch |err| {
-        log.warn("Worker {d}: Failed to spawn health probe: {s}", .{ ctx.worker_id, @errorName(err) });
-    };
-
-    // HTTP server
-    var server = http.Server.init(.{
-        .stack_size = 1024 * 1024 * 4,
+    // Server
+    server = try Server.init(allocator, .{
         .socket_buffer_bytes = 1024 * 32,
         .keepalive_count_max = 1000,
         .connection_count_max = 10000,
     });
+    defer server.deinit();
 
-    server.serve(rt, ctx.router, .{ .normal = ctx.socket }) catch |err| {
-        log.err("Worker {d}: Server error: {s}", .{ ctx.worker_id, @errorName(err) });
-    };
+    try server.serve(io, &router, &socket);
 }
 
-fn createRouter(allocator: std.mem.Allocator, state: *mp.WorkerState, comptime strategy: types.LoadBalancerStrategy) !http.Router {
-    return try http.Router.init(allocator, &.{
-        http.Route.init("/metrics").get({}, metrics.metricsHandler).layer(),
-        http.Route.init("/").all(state, mp.generateHandler(strategy)).layer(),
+fn createRouter(allocator: std.mem.Allocator, state: *mp.WorkerState, comptime strategy: types.LoadBalancerStrategy) !Router {
+    return try Router.init(allocator, &.{
+        Route.init("/metrics").get({}, metrics.metricsHandler).layer(),
+        Route.init("/").all(state, mp.generateHandler(strategy)).layer(),
     }, .{});
 }
 

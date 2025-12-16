@@ -72,7 +72,7 @@ fn proxyWithFailover(ctx: *const http.Context, primary_idx: usize, state: *Worke
 
 /// Streaming proxy implementation
 fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer, backend_idx: usize, state: *WorkerState) ProxyError!http.Respond {
-    const start_time = std.time.milliTimestamp();
+    const start_instant = std.time.Instant.now() catch null;
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -82,17 +82,17 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     // Get or create connection
     var sock = state.connection_pool.getConnection(backend_idx) orelse blk: {
         var ultra_sock = UltraSock.fromBackendServer(alloc, backend) catch return ProxyError.ConnectionFailed;
-        ultra_sock.connect(ctx.runtime) catch {
+        ultra_sock.connect(ctx.io) catch {
             ultra_sock.close_blocking();
             return ProxyError.BackendUnavailable;
         };
         break :blk ultra_sock;
     };
 
-    if (sock.socket == null or !sock.connected) {
+    if (sock.stream == null or !sock.connected) {
         return_to_pool = false;
         sock = UltraSock.fromBackendServer(alloc, backend) catch return ProxyError.ConnectionFailed;
-        sock.connect(ctx.runtime) catch {
+        sock.connect(ctx.io) catch {
             sock.close_blocking();
             return ProxyError.BackendUnavailable;
         };
@@ -112,7 +112,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         ctx.request.body orelse "",
     }) catch return ProxyError.ConnectionFailed;
 
-    _ = sock.send_all(ctx.runtime, request_data) catch {
+    _ = sock.send_all(ctx.io, request_data) catch {
         return_to_pool = false;
         return ProxyError.SendFailed;
     };
@@ -120,15 +120,18 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     // Read headers
     var header_buffer = std.ArrayList(u8).initCapacity(alloc, 4096) catch return ProxyError.ConnectionFailed;
     var recv_buffer: [32768]u8 = undefined;
-    const start_recv = std.time.milliTimestamp();
+    var recv_timer = std.time.Timer.start() catch null;
     var header_end: usize = 0;
 
     while (header_end == 0) {
-        if (std.time.milliTimestamp() - start_recv > 3000) {
-            return_to_pool = false;
-            return ProxyError.Timeout;
+        // 3 second timeout
+        if (recv_timer) |*t| {
+            if (t.read() > 3_000_000_000) { // 3s in nanoseconds
+                return_to_pool = false;
+                return ProxyError.Timeout;
+            }
         }
-        const n = sock.recv(ctx.runtime, &recv_buffer) catch {
+        const n = sock.recv(ctx.io, &recv_buffer) catch {
             return_to_pool = false;
             return ProxyError.ReadFailed;
         };
@@ -152,9 +155,11 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
 
     // Build response
     var resp = std.ArrayList(u8).initCapacity(alloc, 512) catch return ProxyError.ConnectionFailed;
-    var w = resp.writer(alloc);
     const status: http.Status = @enumFromInt(status_code);
-    w.print("HTTP/1.1 {d} {s}\r\nServer: zzz-lb-mp\r\nConnection: keep-alive\r\n", .{ status_code, @tagName(status) }) catch return ProxyError.ConnectionFailed;
+
+    // Status line
+    const status_line = std.fmt.allocPrint(alloc, "HTTP/1.1 {d} {s}\r\nServer: zzz-lb-mp\r\nConnection: keep-alive\r\n", .{ status_code, @tagName(status) }) catch return ProxyError.ConnectionFailed;
+    resp.appendSlice(alloc, status_line) catch return ProxyError.ConnectionFailed;
 
     // Forward headers (skip hop-by-hop)
     const skip = std.StaticStringMap(void).initComptime(.{
@@ -172,16 +177,29 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
             var lb: [64]u8 = undefined;
             const len = @min(line[0..c].len, 64);
             for (line[0..len], 0..) |ch, i| lb[i] = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
-            if (skip.get(lb[0..len]) == null) w.print("{s}\r\n", .{line}) catch {};
+            if (skip.get(lb[0..len]) == null) {
+                resp.appendSlice(alloc, line) catch {};
+                resp.appendSlice(alloc, "\r\n") catch {};
+            }
         }
         pos = end + 2;
     }
 
-    if (msg_len.type == .content_length) w.print("Content-Length: {d}\r\n", .{msg_len.length}) catch {};
-    w.writeAll("\r\n") catch {};
+    if (msg_len.type == .content_length) {
+        const cl_header = std.fmt.allocPrint(alloc, "Content-Length: {d}\r\n", .{msg_len.length}) catch return ProxyError.ConnectionFailed;
+        resp.appendSlice(alloc, cl_header) catch {};
+    }
+    resp.appendSlice(alloc, "\r\n") catch {};
     if (header_buffer.items.len > header_end) resp.appendSlice(alloc, header_buffer.items[header_end..]) catch {};
 
-    _ = ctx.socket.send_all(ctx.runtime, resp.items) catch return ProxyError.SendFailed;
+    // Create client writer for response
+    var client_write_buf: [8192]u8 = undefined;
+    var client_writer = ctx.stream.writer(ctx.io, &client_write_buf);
+
+    // Send response headers
+    client_writer.interface.writeAll(resp.items) catch return ProxyError.SendFailed;
+    client_writer.interface.flush() catch return ProxyError.SendFailed;
+
     var bytes_received = header_buffer.items.len - header_end;
     var body_had_error = false;
     var chunked_complete = false;
@@ -189,7 +207,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     // Stream body
     if (msg_len.type == .content_length) {
         while (bytes_received < msg_len.length) {
-            const n = sock.recv(ctx.runtime, &recv_buffer) catch {
+            const n = sock.recv(ctx.io, &recv_buffer) catch {
                 body_had_error = true;
                 break;
             };
@@ -197,12 +215,13 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
                 body_had_error = true;
                 break;
             }
-            _ = ctx.socket.send(ctx.runtime, recv_buffer[0..n]) catch break;
+            client_writer.interface.writeAll(recv_buffer[0..n]) catch break;
+            client_writer.interface.flush() catch break;
             bytes_received += n;
         }
     } else if (msg_len.type == .chunked or msg_len.type == .close_delimited) {
         while (true) {
-            const n = sock.recv(ctx.runtime, &recv_buffer) catch {
+            const n = sock.recv(ctx.io, &recv_buffer) catch {
                 body_had_error = true;
                 break;
             };
@@ -210,7 +229,8 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
                 body_had_error = true;
                 break;
             }
-            _ = ctx.socket.send(ctx.runtime, recv_buffer[0..n]) catch break;
+            client_writer.interface.writeAll(recv_buffer[0..n]) catch break;
+            client_writer.interface.flush() catch break;
             bytes_received += n;
             if (msg_len.type == .chunked and simd_parse.findChunkEnd(recv_buffer[0..n]) != null) {
                 chunked_complete = true;
@@ -225,6 +245,11 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         return_to_pool = false;
     }
 
-    metrics.global_metrics.recordRequest(std.time.milliTimestamp() - start_time, status_code);
+    // Record metrics using elapsed time from start
+    const elapsed_ms: i64 = if (start_instant) |start| blk: {
+        const now = std.time.Instant.now() catch break :blk 0;
+        break :blk @intCast(now.since(start) / 1_000_000);
+    } else 0;
+    metrics.global_metrics.recordRequest(elapsed_ms, status_code);
     return .responded;
 }
