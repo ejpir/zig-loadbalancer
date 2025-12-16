@@ -28,7 +28,7 @@ const mp = @import("src/multiprocess/mod.zig");
 const health = @import("src/multiprocess/health.zig");
 
 pub const std_options: std.Options = .{
-    .log_level = .info,
+    .log_level = .warn,
 };
 
 // ============================================================================
@@ -209,6 +209,7 @@ fn workerMain(config: WorkerConfig) !void {
 
     // Worker state (health state, circuit breaker, backend selector)
     var worker_state = mp.WorkerState.init(&backends, &connection_pool, .{});
+    worker_state.setWorkerId(config.worker_id);
 
     log.info("Worker {d}: Starting with {d} backends", .{ config.worker_id, backends.items.len });
 

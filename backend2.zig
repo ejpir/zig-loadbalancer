@@ -55,7 +55,7 @@ pub fn main() !void {
     defer router.deinit(allocator);
 
     const addr = try Io.net.IpAddress.parse(host, port);
-    var socket = try addr.listen(io, .{ .kernel_backlog = 4096 });
+    var socket = try addr.listen(io, .{ .kernel_backlog = 4096, .reuse_address = true });
     defer socket.deinit(io);
 
     log.info("Backend 2 listening on {s}:{d}", .{ host, port });

@@ -1,8 +1,8 @@
 # Zig Load Balancer
 
-A high-performance HTTP load balancer implemented in Zig using the zzz framework. Features nginx-style multi-process architecture, SIMD-accelerated parsing, and lock-free data structures.
+A high-performance HTTP load balancer implemented in Zig using zzz.io (Zig 0.16's native async I/O). Features nginx-style multi-process architecture, SIMD-accelerated parsing, and lock-free data structures.
 
-**Requirements:** Zig 0.15.2+
+**Requirements:** Zig 0.16.0+
 
 ## Quick Start
 
@@ -47,7 +47,7 @@ curl http://localhost:8080
         │       WORKER 0           │  │       WORKER 1           │  │       WORKER N           │
         │                          │  │                          │  │                          │
         │  ┌────────────────────┐  │  │  ┌────────────────────┐  │  │  ┌────────────────────┐  │
-        │  │   Tardy Runtime    │  │  │  │   Tardy Runtime    │  │  │  │   Tardy Runtime    │  │
+        │  │   std.Io Runtime   │  │  │  │   std.Io Runtime   │  │  │  │   std.Io Runtime   │  │
         │  │  (single-threaded) │  │  │  │  (single-threaded) │  │  │  │  (single-threaded) │  │
         │  └────────────────────┘  │  │  └────────────────────┘  │  │  └────────────────────┘  │
         │                          │  │                          │  │                          │
@@ -125,11 +125,11 @@ curl http://localhost:8080
     │          │
     │◄─────────┤  Response (streamed back)
     │          │
-    │          │  Meanwhile, async health probe runs:
+    │          │  Meanwhile, health probe thread runs:
     │          │  ┌─────────────────────────────────────┐
-    │          │  │  Timer.delay(5s) ──► Probe backends │
+    │          │  │  sleep(5s) ──► Probe backends       │
     │          │  │  Update health bitmap               │
-    │          │  │  (non-blocking, same event loop)    │
+    │          │  │  (blocking I/O, separate thread)    │
     │          │  └─────────────────────────────────────┘
     │          │
 └───┴──────────┘
@@ -149,16 +149,15 @@ main() ────────────────────────�
     │       │     │
     │       │     ├─► [CHILD] setCpuAffinity(worker_id)
     │       │     │           workerMain(config)
-    │       │     │             ├─► Create GPA (thread_safe=false)
+    │       │     │             ├─► Create GPA (thread_safe=true for health thread)
     │       │     │             ├─► Create ConnectionPool
     │       │     │             ├─► Create BackendsList
-    │       │     │             ├─► Create Tardy runtime (single-threaded)
+    │       │     │             ├─► Create WorkerState (circuit breaker, health)
+    │       │     │             ├─► Start health probe background thread
+    │       │     │             ├─► Create std.Io runtime (single-threaded)
     │       │     │             ├─► Create Router with proxy handler
-    │       │     │             ├─► Socket.init() with SO_REUSEPORT
-    │       │     │             ├─► socket.bind(), socket.listen()
-    │       │     │             └─► tardy.entry():
-    │       │     │                   ├─► Spawn health probe task
-    │       │     │                   └─► HTTP server.serve()
+    │       │     │             ├─► Socket.listen() with SO_REUSEPORT
+    │       │     │             └─► HTTP server.serve()
     │       │     │
     │       │     └─► [PARENT] worker_pids[worker_id] = pid
     │
@@ -166,26 +165,21 @@ main() ────────────────────────�
             waitpid(-1) ──► Worker died? ──► Fork replacement
 ```
 
-### Multi-Process vs Multi-Threaded
+### Multi-Process Architecture
 
 ```bash
-# Multi-process (recommended)
+# Start with 4 worker processes
 ./zig-out/bin/load_balancer_mp --workers 4 --port 8080
 ```
 
-| Aspect | Multi-Process | Multi-Threaded |
-|--------|--------------|----------------|
-| Isolation | Full process isolation | Shared memory |
-| Locks | None (nothing shared) | Atomics for health bitmap |
-| Crash handling | Master restarts worker | Whole process dies |
-| Memory | Separate heaps per worker | Shared heap |
-| Connection pool | SimpleConnectionPool | Lock-free pool |
-| Performance | ~17,770 req/s | ~17,148 req/s |
-
-```bash
-# Multi-threaded
-./zig-out/bin/load_balancer --port 8080
-```
+| Aspect | Benefit |
+|--------|---------|
+| Isolation | Full process isolation - one worker crash doesn't affect others |
+| Locks | None (nothing shared between workers) |
+| Crash handling | Master process monitors and restarts crashed workers |
+| Memory | Separate heaps per worker - no contention |
+| Connection pool | SimpleConnectionPool - no atomics needed |
+| Health probes | Background thread per worker - independent health state |
 
 ## Health Checking & Failover
 
@@ -199,11 +193,11 @@ Learns from actual request failures:
 - Instant failover to healthy backend on failure
 
 ### Health Probes (Active)
-Async probes run in the event loop without blocking requests:
+Background thread probes run independently of request handling:
 - Probes each backend every 5 seconds
 - Sends `GET /` and expects HTTP 200
 - Updates health state based on probe results
-- Non-blocking: uses tardy's async I/O
+- Uses blocking I/O in dedicated thread (no event loop interference)
 
 ### Automatic Failover
 ```
@@ -214,9 +208,9 @@ Request → Backend 1 (fails) → Backend 2 (success) → Response
 ```
 
 ### Configuration
-Health settings in `src/multiprocess/config.zig`:
+Health settings in `src/multiprocess/worker_state.zig`:
 ```zig
-pub const HealthConfig = struct {
+pub const Config = struct {
     unhealthy_threshold: u32 = 3,      // Failures before unhealthy
     healthy_threshold: u32 = 2,        // Successes before healthy
     probe_interval_ms: u64 = 5000,     // Probe every 5s
@@ -313,47 +307,43 @@ Failover happens in ~1-3 seconds when primary dies.
 
 ### Command Line
 ```
---workers, -w N    Worker processes (default: CPU count)
---port, -p N       Listen port (default: 8080)
---host, -h IP      Listen address (default: 0.0.0.0)
+--workers, -w N      Worker processes (default: CPU count)
+--port, -p N         Listen port (default: 8080)
+--host, -h IP        Listen address (default: 0.0.0.0)
+--backend, -b H:P    Add backend server (can specify multiple)
 ```
 
-### YAML Config (multi-threaded only)
-```yaml
-backends:
-  - host: "127.0.0.1"
-    port: 9001
-    weight: 2
-  - host: "127.0.0.1"
-    port: 9002
-    weight: 1
+### Dynamic Backend Configuration
+```bash
+# Configure backends via command line
+./zig-out/bin/load_balancer_mp -b 192.168.1.10:8080 -b 192.168.1.11:8080
 ```
 
 ## Project Structure
 
 ```
-├── main.zig                    # Multi-threaded entry point
 ├── main_multiprocess.zig       # Multi-process entry point
+├── backend1.zig                # Test backend server 1
+├── backend2.zig                # Test backend server 2
 ├── src/
 │   ├── multiprocess/           # Multi-process module
 │   │   ├── mod.zig             # Re-exports
-│   │   ├── config.zig          # Config, health state, circuit breaker
+│   │   ├── worker_state.zig    # WorkerState (circuit breaker, backend selection)
+│   │   ├── health_state.zig    # Health bitmap (u64-based)
+│   │   ├── circuit_breaker.zig # Circuit breaker pattern
+│   │   ├── backend_selector.zig# Backend selection strategies
 │   │   ├── proxy.zig           # Streaming proxy, failover
-│   │   └── health.zig          # Async health probes
-│   ├── core/                   # Proxy logic, load balancing
-│   ├── memory/                 # Connection pools, arena allocators
-│   ├── internal/               # SIMD parsing, optimizations
+│   │   ├── health.zig          # Background health probe thread
+│   │   └── integration_test.zig# Integration tests
+│   ├── core/                   # Core types
+│   ├── memory/                 # Connection pools
+│   ├── internal/               # SIMD parsing
 │   └── http/                   # HTTP utilities
-└── vendor/                     # Vendored dependencies
 ```
 
 ## Dependencies
 
-All dependencies are vendored in `vendor/` and patched for Zig 0.15.2:
-- **zzz** - HTTP framework
-- **tardy** - Async runtime (io_uring on Linux, kqueue on macOS)
-- **secsock** - TLS support
-- **zig-clap** - CLI parsing
+- **zzz.io** - HTTP framework using Zig 0.16's native `std.Io` async runtime (io_uring on Linux, kqueue on macOS)
 
 ## Building
 

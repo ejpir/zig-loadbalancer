@@ -2,64 +2,59 @@
 
 ## Overview
 
-This high-performance load balancer implements several cutting-edge optimizations and algorithms to achieve maximum throughput, minimal latency, and excellent scalability. The codebase demonstrates advanced systems programming techniques in Zig, including lock-free data structures, comptime optimizations, SIMD vectorization, and hazard pointer memory management.
+This high-performance load balancer implements several optimizations to achieve maximum throughput, minimal latency, and excellent scalability. Built on zzz.io (Zig 0.16's native `std.Io` async runtime), it uses nginx-style multi-process architecture with per-worker health probes, circuit breakers, and connection pools.
 
 ## Core Innovations
 
-### 1. Lock-Free Connection Pooling (`connection_pool.zig`)
+### 1. Simple Connection Pooling (`simple_connection_pool.zig`)
 
-**Problem**: Traditional mutex-based connection pools create bottlenecks under high concurrency.
+**Problem**: Atomic-based connection pools add overhead in single-threaded contexts.
 
-**Solution**: Atomic compare-and-swap (CAS) based stack that provides:
-- ~100x faster operations (10-50ns vs 1-10μs)
-- True concurrency - multiple threads can access simultaneously
-- No thread blocking or kernel involvement
-- Linear scalability with thread count
+**Solution**: Per-worker connection pools with no synchronization:
+- Zero atomic operations (single-threaded workers)
+- Direct array access with stack-based LIFO
+- No memory barriers or CAS retry loops
+- Cache-friendly linear access
 
 **Algorithm**:
 ```zig
-// Push Operation (O(1) average):
-1. Create new node with socket
-2. Load current head pointer (acquire ordering)
-3. Set new node's next = current head
-4. CAS head from current_head to new_node
-5. If CAS fails: retry (another thread modified head)
+// Push Operation (O(1)):
+if (top >= MAX_IDLE_CONNS) return false;
+sockets[top] = socket;
+top += 1;
+return true;
 
-// Pop Operation (O(1) average):
-1. Load current head pointer (acquire ordering)
-2. If head is null: return null (empty pool)
-3. Load head->next pointer
-4. CAS head from current_head to head->next
-5. If CAS succeeds: return socket, free old head
+// Pop Operation (O(1)):
+if (top == 0) return null;
+top -= 1;
+return sockets[top];
 ```
 
-### 2. Hazard Pointer Memory Management (`health_check.zig`)
+### 2. Circuit Breaker Pattern (`circuit_breaker.zig`)
 
-**Problem**: How do you safely update backend lists while multiple threads are health-checking?
+**Problem**: How do you prevent cascading failures when backends become unhealthy?
 
-**Solution**: Lock-free memory reclamation using hazard pointers:
+**Solution**: Per-backend circuit breaker with configurable thresholds:
 
 ```zig
-// Reader Thread:
-1. Load backend list pointer atomically
-2. Protect with hazard pointer (announces usage)
-3. Verify pointer hasn't changed (ABA protection)
-4. Use backends safely (guaranteed valid)
-5. Clear hazard pointer when done
+// Record failure:
+1. Increment consecutive failure counter
+2. Reset success counter
+3. If failures >= threshold: mark backend UNHEALTHY
 
-// Writer Thread (config update):
-1. Create new backend list
-2. Atomically swap old list with new list
-3. Scan hazard pointers for old list usage
-4. Wait until no threads use old list
-5. Safely deallocate old list
+// Record success:
+1. If backend is HEALTHY: reset both counters
+2. If backend is UNHEALTHY:
+   a. Increment consecutive success counter
+   b. Reset failure counter
+   c. If successes >= threshold: mark backend HEALTHY
 ```
 
 **Benefits**:
-- Health checks never block on config updates
-- Eliminates use-after-free bugs completely
-- No contention between health checking threads
-- Bounded memory overhead (32 hazard pointers max)
+- Instant failover when backend becomes unhealthy
+- Gradual recovery requires consecutive successes
+- Per-worker state (no cross-worker interference)
+- U64 bitmap for fast health lookups (popcount, ctz intrinsics)
 
 ### 3. Comptime Strategy Specialization (`load_balancer/strategy.zig`)
 
@@ -206,12 +201,13 @@ Full compliance with HTTP/1.1 message framing:
 - **Connection close delimited**: Read until connection closes
 - **Proper Via header injection**: HTTP transparency
 
-### TLS/HTTPS Support (`ultra_sock.zig`)
+### Socket Abstraction (`ultra_sock.zig`)
 
-Universal socket abstraction supporting both HTTP and HTTPS:
-- Unified interface regardless of protocol
-- Automatic TLS handshake handling
-- Connection pooling works for both protocols
+Universal socket abstraction for HTTP:
+- Unified interface for backend connections
+- Uses `std.Io.net.Stream` for async I/O
+- Connection pooling for backend reuse
+- HTTPS support planned (currently falls back to HTTP)
 
 ## Performance Characteristics
 
@@ -226,8 +222,8 @@ Universal socket abstraction supporting both HTTP and HTTPS:
 - **60% reduction** in cache misses
 
 ### Scalability
-- **Lock-free everywhere**: No blocking between threads
-- **NUMA-aware**: Thread-local optimizations
+- **Multi-process**: Each worker isolated, no shared state
+- **SO_REUSEPORT**: Kernel-level load balancing across workers
 - **Cache-optimized**: Hot paths stay in instruction cache
 
 ## Monitoring and Observability
@@ -238,10 +234,10 @@ Universal socket abstraction supporting both HTTP and HTTPS:
 - **Real-time visibility**: Request rates, error rates, latency percentiles
 
 ### Health Monitoring
-- **Parallel health checks**: 10x faster than sequential
+- **Background thread probes**: Each worker has dedicated health probe thread
 - **Configurable thresholds**: Healthy/unhealthy transition points
 - **Circuit breaker pattern**: Automatic failover to healthy backends
-- **Connection caching**: 30-50% faster health checks through reuse
+- **Blocking I/O**: Health probes use blocking posix calls (no event loop interference)
 
 ## Configuration Management
 
@@ -293,16 +289,23 @@ The architecture prioritizes:
 This codebase serves as both a production-ready load balancer and an educational resource for advanced systems programming techniques in Zig.
 
   src/
-  ├── core/                   # Core load balancer logic
-  │   ├── load_balancer.zig  # Main API
-  │   ├── proxy.zig          # Request proxying
-  │   ├── server.zig         # HTTP server
-  │   └── types.zig          # Core types
-  ├── strategies/             # Load balancing strategies
-  ├── health/                 # Health checking system
-  ├── http/                   # HTTP processing
-  ├── memory/                 # Memory management
-  ├── config/                 # Configuration management
-  ├── utils/                  # Utilities (CLI, logging, metrics)
-  ├── internal/               # Internal optimizations
-  └── tests/                  # Tests
+  ├── core/                    # Core types
+  │   └── types.zig            # BackendServer, LoadBalancerStrategy
+  ├── multiprocess/            # Multi-process module
+  │   ├── mod.zig              # Re-exports
+  │   ├── worker_state.zig     # WorkerState composite
+  │   ├── health_state.zig     # U64 bitmap for health
+  │   ├── circuit_breaker.zig  # Circuit breaker pattern
+  │   ├── backend_selector.zig # Backend selection strategies
+  │   ├── proxy.zig            # Streaming proxy, failover
+  │   ├── health.zig           # Background health probe thread
+  │   └── integration_test.zig # Integration tests
+  ├── memory/                  # Connection pools
+  │   └── simple_connection_pool.zig
+  ├── http/                    # HTTP utilities
+  │   ├── http_utils.zig       # RFC 7230 message framing
+  │   └── ultra_sock.zig       # Socket abstraction
+  ├── internal/                # Internal optimizations
+  │   └── simd_parse.zig       # SIMD header parsing
+  └── utils/                   # Utilities
+      └── metrics.zig          # Prometheus metrics

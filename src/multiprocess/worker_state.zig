@@ -43,6 +43,7 @@ pub const WorkerState = struct {
     connection_pool: *simple_pool.SimpleConnectionPool,
     circuit_breaker: CircuitBreaker,
     config: Config,
+    worker_id: usize = 0,
 
     // Round-robin state (not a counter - tracks next backend to try)
     rr_state: usize = 0,
@@ -72,6 +73,11 @@ pub const WorkerState = struct {
         state.circuit_breaker.initBackends(backends.items.len);
 
         return state;
+    }
+
+    /// Set worker ID (called from main after init)
+    pub fn setWorkerId(self: *WorkerState, id: usize) void {
+        self.worker_id = id;
     }
 
     /// Select a backend using the specified strategy
