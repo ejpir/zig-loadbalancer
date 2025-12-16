@@ -30,7 +30,7 @@ fn handler(ctx: *const Context, _: void) !Respond {
 }
 
 pub fn main() !void {
-    const host: []const u8 = "127.0.0.1";
+    const host: []const u8 = "0.0.0.0";
     const port: u16 = 9001;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
