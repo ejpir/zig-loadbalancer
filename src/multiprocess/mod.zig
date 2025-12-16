@@ -8,11 +8,11 @@
 /// - Failover: automatically tries healthy backend on failure
 /// - Async health probes: non-blocking checks via tardy event loop
 
-pub const config = @import("mp/config.zig");
-pub const proxy = @import("mp/proxy.zig");
-pub const health = @import("mp/health.zig");
+pub const config = @import("config.zig");
+pub const proxy = @import("proxy.zig");
+pub const health = @import("health.zig");
 
-// Re-exports for convenience
+// Re-exports
 pub const Config = config.Config;
 pub const HealthConfig = config.HealthConfig;
 pub const MAX_BACKENDS = config.MAX_BACKENDS;
