@@ -1,0 +1,28 @@
+services:
+  backend1:
+    build: .
+    command: ["./zig-out/bin/backend1"]
+
+  backend2:
+    build: .
+    command: ["./zig-out/bin/backend2"]
+
+  loadbalancer:
+    build: .
+    command: [
+      "./zig-out/bin/load_balancer_mp",
+      "--workers", "2",
+      "--port", "8080",
+      "--backend", "backend1:9001",
+      "--backend", "backend2:9002"
+    ]
+    ports:
+      - "8080:8080"
+    depends_on:
+      - backend1
+      - backend2
+    # io_uring requires elevated privileges
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - SYS_RESOURCE
