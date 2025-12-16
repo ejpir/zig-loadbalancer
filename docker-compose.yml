@@ -2,10 +2,18 @@ services:
   backend1:
     build: .
     command: ["./zig-out/bin/backend1"]
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - SYS_RESOURCE
 
   backend2:
     build: .
     command: ["./zig-out/bin/backend2"]
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - SYS_RESOURCE
 
   loadbalancer:
     build: .
