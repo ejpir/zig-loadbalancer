@@ -5,8 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zzz = .{
-            .url = "git+https://github.com/philipmv/zzz.io#05081e2d0601668c6104d3e1eab41b95ea6497c6",
-            .hash = "zzz-0.0.1-YfaUFztqAgAGfNB_teyaSzxEJjtyBmcVewomdA_YSATs",
+            .path = "vendor/zzz.io",
         },
     },
 

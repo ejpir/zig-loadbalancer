@@ -46,64 +46,54 @@ pub const UltraSock = struct {
         self.connected = true;
     }
 
-    /// Send all data over the socket using Writer
-    pub fn send_all(self: *UltraSock, _: anytype, data: []const u8) !usize {
+    /// Send all data over the socket - uses passed io context
+    pub fn send_all(self: *UltraSock, io: Io, data: []const u8) !usize {
         if (!self.connected) return error.NotConnected;
+        const stream = self.stream orelse return error.SocketNotInitialized;
 
-        if (self.stream) |stream| {
-            if (self.io) |io| {
-                var write_buf: [4096]u8 = undefined;
-                var writer = stream.writer(io, &write_buf);
-                writer.interface.writeAll(data) catch {
-                    self.connected = false;
-                    return error.BrokenPipe;
-                };
-                writer.interface.flush() catch {
-                    self.connected = false;
-                    return error.BrokenPipe;
-                };
-                return data.len;
-            }
-        }
-        return error.SocketNotInitialized;
+        var write_buf: [4096]u8 = undefined;
+        var writer = stream.writer(io, &write_buf);
+        writer.interface.writeAll(data) catch {
+            self.connected = false;
+            return error.BrokenPipe;
+        };
+        writer.interface.flush() catch {
+            self.connected = false;
+            return error.BrokenPipe;
+        };
+        return data.len;
     }
 
     /// Send data (single call)
-    pub fn send(self: *UltraSock, io: anytype, data: []const u8) !usize {
+    pub fn send(self: *UltraSock, io: Io, data: []const u8) !usize {
         return self.send_all(io, data);
     }
 
-    /// Receive data from the socket using Reader
-    /// Returns immediately with available data (non-blocking read)
-    pub fn recv(self: *UltraSock, _: anytype, buffer: []u8) !usize {
+    /// Receive data from the socket - uses passed io context
+    pub fn recv(self: *UltraSock, io: Io, buffer: []u8) !usize {
         if (!self.connected) return error.NotConnected;
+        const stream = self.stream orelse return error.SocketNotInitialized;
 
-        if (self.stream) |stream| {
-            if (self.io) |io| {
-                var read_buf: [4096]u8 = undefined;
-                var reader = stream.reader(io, &read_buf);
-                // Use readVec for single non-blocking read (returns immediately with available data)
-                var bufs: [1][]u8 = .{buffer};
-                const n = reader.interface.readVec(&bufs) catch |err| {
-                    self.connected = false;
-                    if (err == error.EndOfStream) return 0;
-                    return error.ReadFailed;
-                };
-                if (n == 0) {
-                    self.connected = false;
-                }
-                return n;
-            }
+        var read_buf: [4096]u8 = undefined;
+        var reader = stream.reader(io, &read_buf);
+        var bufs: [1][]u8 = .{buffer};
+        const n = reader.interface.readVec(&bufs) catch |err| {
+            self.connected = false;
+            if (err == error.EndOfStream) return 0;
+            return error.ReadFailed;
+        };
+        if (n == 0) {
+            self.connected = false;
         }
-        return error.SocketNotInitialized;
+        return n;
     }
 
-    /// Close the socket
+    /// Close the socket directly via posix (safe for pooled connections)
     pub fn close_blocking(self: *UltraSock) void {
         if (self.stream) |stream| {
-            if (self.io) |io| {
-                stream.close(io);
-            }
+            // Use direct posix.close() instead of stream.close(io)
+            // This avoids issues with stale io context from pooled connections
+            std.posix.close(stream.socket.handle);
             self.stream = null;
         }
         self.io = null;
