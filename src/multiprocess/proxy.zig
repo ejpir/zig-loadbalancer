@@ -116,7 +116,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     if (ENABLE_BACKEND_POOLING) {
         if (state.connection_pool.getConnection(backend_idx)) |pooled_sock| {
             sock = pooled_sock;
-            log.warn("[REQ {d}] POOL GET backend={d}", .{ req_id, backend_idx });
+            log.debug("[REQ {d}] POOL GET backend={d}", .{ req_id, backend_idx });
 
             // Check for stale data before reusing connection
             if (sock.hasStaleData()) {
@@ -162,9 +162,17 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     }
 
     // Set socket timeouts to prevent hanging on slow/dead backends
-    const BACKEND_TIMEOUT_MS: u32 = 5000; // 5 seconds
-    sock.setReadTimeout(BACKEND_TIMEOUT_MS) catch {};
-    sock.setWriteTimeout(BACKEND_TIMEOUT_MS) catch {};
+    const BACKEND_TIMEOUT_MS: u32 = 100; // 100ms - fail fast, retry will handle it
+    sock.setReadTimeout(BACKEND_TIMEOUT_MS) catch {
+        log.warn("[REQ {d}] Bad socket fd during timeout setup", .{req_id});
+        sock.close_blocking();
+        return ProxyError.ConnectionFailed;
+    };
+    sock.setWriteTimeout(BACKEND_TIMEOUT_MS) catch {
+        sock.close_blocking();
+        return ProxyError.ConnectionFailed;
+    };
+    sock.enableKeepalive() catch {};
 
     // Final validation before using connection
     if (sock.stream == null) {
@@ -201,7 +209,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     var backend_reader = stream.reader(ctx.io, &backend_read_buf);
 
     // Try to send request to backend
-    log.warn("[REQ {d}] SENDING TO BACKEND: {s}", .{ req_id, request_data[0..@min(request_data.len, 60)] });
+    log.debug("[REQ {d}] SENDING TO BACKEND: {s}", .{ req_id, request_data[0..@min(request_data.len, 60)] });
     var send_ok = true;
     sock.posixWriteAll(request_data) catch {
         send_ok = false;
@@ -309,6 +317,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     });
 
     var content_type_value: ?[]const u8 = null;
+    var backend_wants_close = false;
     var pos: usize = line_end + 2;
     while (pos < header_end - 2) {
         const end = std.mem.indexOfPos(u8, headers, pos, "\r\n") orelse break;
@@ -324,9 +333,20 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
                 response.headers.put(name, value) catch {};
             } else if (std.mem.eql(u8, lb[0..name_len], "content-type")) {
                 content_type_value = std.mem.trim(u8, line[c + 1 ..], " ");
+            } else if (std.mem.eql(u8, lb[0..name_len], "connection")) {
+                // Check if backend wants to close the connection
+                const value = std.mem.trim(u8, line[c + 1 ..], " ");
+                if (std.ascii.eqlIgnoreCase(value, "close")) {
+                    backend_wants_close = true;
+                }
             }
         }
         pos = end + 2;
+    }
+
+    // Don't pool if backend sent Connection: close
+    if (backend_wants_close) {
+        can_return_to_pool = false;
     }
 
     // Set mime based on content-type from backend
@@ -504,7 +524,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     // Either return connection to pool or close it
     if (can_return_to_pool and !body_had_error and sock.connected) {
         state.connection_pool.returnConnection(backend_idx, sock);
-        log.warn("[REQ {d}] POOL RETURN backend={d}", .{ req_id, backend_idx });
+        log.debug("[REQ {d}] POOL RETURN backend={d}", .{ req_id, backend_idx });
     } else {
         sock.close_blocking();
         log.debug("[REQ {d}] CONN CLOSE (pool={} err={} conn={})", .{
