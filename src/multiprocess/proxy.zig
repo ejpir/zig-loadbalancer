@@ -142,7 +142,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
                     log.err("[REQ {d}] Fresh connection after stale has no stream!", .{req_id});
                     return ProxyError.ConnectionFailed;
                 }
-                from_pool = false; // Explicit
+                from_pool = false; // Timeouts set below unconditionally
             } else {
                 from_pool = true;
                 debug_pool_hits += 1;
@@ -161,7 +161,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         };
     }
 
-    // Set socket timeouts to prevent hanging on slow/dead backends
+    // Set socket timeouts on EVERY request - essential for fail-fast on dead/hung connections
     const BACKEND_TIMEOUT_MS: u32 = 100; // 100ms - fail fast, retry will handle it
     sock.setReadTimeout(BACKEND_TIMEOUT_MS) catch {
         log.warn("[REQ {d}] Bad socket fd during timeout setup", .{req_id});
@@ -200,20 +200,27 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         return ProxyError.ConnectionFailed;
     };
 
-    // Create backend reader/writer using std.Io
+    // Create backend reader/writer using std.Io (async I/O for concurrency)
     const stream = sock.stream orelse {
         sock.close_blocking();
         return ProxyError.ConnectionFailed;
     };
     var backend_read_buf: [8192]u8 = undefined;
     var backend_reader = stream.reader(ctx.io, &backend_read_buf);
+    var backend_write_buf: [8192]u8 = undefined;
+    var backend_writer = stream.writer(ctx.io, &backend_write_buf);
 
-    // Try to send request to backend
+    // Try to send request to backend using async I/O
     log.debug("[REQ {d}] SENDING TO BACKEND: {s}", .{ req_id, request_data[0..@min(request_data.len, 60)] });
     var send_ok = true;
-    sock.posixWriteAll(request_data) catch {
+    backend_writer.interface.writeAll(request_data) catch {
         send_ok = false;
     };
+    if (send_ok) {
+        backend_writer.interface.flush() catch {
+            send_ok = false;
+        };
+    }
 
     // If send failed on pooled connection, retry with fresh connection
     if (!send_ok and from_pool) {
