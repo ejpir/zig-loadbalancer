@@ -440,10 +440,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
                 client_write_error = true;
                 break;
             };
-            client_writer.flush() catch {
-                client_write_error = true;
-                break;
-            };
+            // Don't flush here - let buffer accumulate, final flush at end
             bytes_received += n;
             total_body_written += n;
         }
@@ -466,10 +463,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
                 client_write_error = true;
                 break;
             };
-            client_writer.flush() catch {
-                client_write_error = true;
-                break;
-            };
+            // Don't flush here - let buffer accumulate, final flush at end
             bytes_received += n;
             if (msg_len.type == .chunked and simd_parse.findChunkEnd(body_buf[0..n]) != null) {
                 chunked_complete = true;
