@@ -1141,3 +1141,9 @@ To go faster, you'd need to either:
 1. Skip keepalive (saves 1 syscall) - sock.enableKeepalive() catch {}; can be removed
 2. Use larger timeouts and rely more on the stale connection detection
 3. Use zero-copy forwarding (splice() on Linux)
+
+
+---
+1. Event loop blocking - Our proxy code blocks the main loop
+2. Connection pool contention - One stuck connection blocks pool access
+- Fully async I/O without any blocking calls
