@@ -15,7 +15,6 @@ const http_utils = @import("../http/http_utils.zig");
 const simd_parse = @import("../internal/simd_parse.zig");
 const metrics = @import("../utils/metrics.zig");
 const WorkerState = @import("worker_state.zig").WorkerState;
-const connection_reuse = @import("connection_reuse.zig");
 
 pub const ProxyError = error{
     ConnectionFailed,
@@ -46,7 +45,7 @@ pub fn generateHandler(comptime strategy: types.LoadBalancerStrategy) fn (*const
 }
 
 /// Proxy with automatic failover
-fn proxyWithFailover(ctx: *const http.Context, primary_idx: usize, state: *WorkerState) !http.Respond {
+inline fn proxyWithFailover(ctx: *const http.Context, primary_idx: usize, state: *WorkerState) !http.Respond {
     const backends = state.backends;
 
     if (streamingProxy(ctx, &backends.items[primary_idx], primary_idx, state)) |response| {
@@ -72,7 +71,8 @@ fn proxyWithFailover(ctx: *const http.Context, primary_idx: usize, state: *Worke
     }
 }
 
-// Debug counters (per-worker, no atomics needed)
+// Debug counters (per-worker, no atomics needed) - only in debug builds
+const enable_debug_counters = @import("builtin").mode == .Debug;
 var debug_pool_hits: usize = 0;
 var debug_pool_misses: usize = 0;
 var debug_stale_connections: usize = 0;
@@ -80,12 +80,27 @@ var debug_send_failures: usize = 0;
 var debug_read_failures: usize = 0;
 var debug_request_count: usize = 0;
 
-/// Streaming proxy implementation
-fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer, backend_idx: usize, state: *WorkerState) ProxyError!http.Respond {
-    const start_instant = std.time.Instant.now() catch null;
+inline fn incrementCounter(counter: *usize) void {
+    if (enable_debug_counters) counter.* += 1;
+}
 
-    debug_request_count += 1;
-    const req_id = debug_request_count;
+inline fn getRequestId() usize {
+    if (enable_debug_counters) {
+        debug_request_count += 1;
+        return debug_request_count;
+    }
+    return 0;
+}
+
+/// Streaming proxy implementation
+inline fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer, backend_idx: usize, state: *WorkerState) ProxyError!http.Respond {
+    // Only track timing in debug builds
+    const start_instant = if (enable_debug_counters)
+        std.time.Instant.now() catch null
+    else
+        null;
+
+    const req_id = getRequestId();
 
     log.debug("[REQ {d}] START uri={s} method={s}", .{
         req_id,
@@ -93,8 +108,8 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         @tagName(ctx.request.method orelse .GET),
     });
 
-    // Log stats every 1000 requests
-    if (debug_request_count % 1000 == 0) {
+    // Log stats periodically (only in debug builds)
+    if (enable_debug_counters and debug_request_count % 10000 == 0) {
         log.warn("Worker {d}: reqs={d} pool_hits={d} pool_misses={d} stale={d} send_fail={d} read_fail={d}", .{
             state.worker_id,
             debug_request_count,
@@ -116,54 +131,26 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     if (ENABLE_BACKEND_POOLING) {
         if (state.connection_pool.getConnection(backend_idx)) |pooled_sock| {
             sock = pooled_sock;
-            log.debug("[REQ {d}] POOL GET backend={d}", .{ req_id, backend_idx });
-
-            // Check for stale data before reusing connection
-            if (sock.hasStaleData()) {
-                // Peek at what data is there to understand why it's stale
-                var peek_buf: [256]u8 = undefined;
-                const peek_n = sock.posixRead(&peek_buf) catch 0;
-                if (peek_n > 0) {
-                    log.warn("[REQ {d}] STALE POOLED CONN: unexpected data ({d} bytes): {s}", .{ req_id, peek_n, peek_buf[0..@min(peek_n, 100)] });
-                } else {
-                    log.warn("[REQ {d}] STALE POOLED CONN: connection closed by peer", .{req_id});
-                }
-                sock.close_blocking();
-                debug_stale_connections += 1;
-
-                // Create fresh connection immediately (don't rely on fall-through)
-                sock = UltraSock.fromBackendServer(ctx.allocator, backend) catch return ProxyError.ConnectionFailed;
-                sock.connect(ctx.io) catch {
-                    sock.close_blocking();
-                    return ProxyError.BackendUnavailable;
-                };
-                // Verify new connection is good
-                if (sock.stream == null or !sock.connected) {
-                    log.err("[REQ {d}] Fresh connection after stale has no stream!", .{req_id});
-                    return ProxyError.ConnectionFailed;
-                }
-                from_pool = false; // Timeouts set below unconditionally
-            } else {
-                from_pool = true;
-                debug_pool_hits += 1;
-                log.debug("[REQ {d}] POOL HIT backend={d}", .{ req_id, backend_idx });
-            }
+            from_pool = true;
+            incrementCounter(&debug_pool_hits);
+            log.debug("[REQ {d}] POOL HIT backend={d}", .{ req_id, backend_idx });
+            // NOTE: Removed hasStaleData() poll syscall here.
+            // Stale connections are detected on write failure and retried.
         }
     }
 
     if (!from_pool) {
-        debug_pool_misses += 1;
+        incrementCounter(&debug_pool_misses);
         log.debug("[REQ {d}] POOL MISS backend={d}", .{ req_id, backend_idx });
         sock = UltraSock.fromBackendServer(ctx.allocator, backend) catch return ProxyError.ConnectionFailed;
         sock.connect(ctx.io) catch {
             sock.close_blocking();
             return ProxyError.BackendUnavailable;
         };
-        // Keepalive helps detect dead connections during idle periods
-        sock.enableKeepalive() catch {};
+        // Skip keepalive - stale detection handles dead connections
     }
 
-    // Final validation before using connection
+    // Validate connection
     if (sock.stream == null) {
         log.err("[REQ {d}] No stream after connection setup!", .{req_id});
         return ProxyError.ConnectionFailed;
@@ -171,11 +158,6 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
 
     // Track whether we should return to pool (will be set to false on errors)
     var can_return_to_pool = true;
-
-    if (sock.stream == null) {
-        sock.close_blocking();
-        return ProxyError.ConnectionFailed;
-    }
 
     // Format request using stack buffer
     var request_buf: [1024]u8 = undefined;
@@ -213,7 +195,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
 
     // If send failed on pooled connection, retry with fresh connection
     if (!send_ok and from_pool) {
-        debug_stale_connections += 1;
+        incrementCounter(&debug_stale_connections);
         log.debug("[REQ {d}] Pooled conn stale on write, retrying with fresh", .{req_id});
         sock.close_blocking();
 
@@ -235,17 +217,17 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
 
         // Retry send on fresh connection using async I/O
         backend_writer.interface.writeAll(request_data) catch {
-            debug_send_failures += 1;
+            incrementCounter(&debug_send_failures);
             sock.close_blocking();
             return ProxyError.SendFailed;
         };
         backend_writer.interface.flush() catch {
-            debug_send_failures += 1;
+            incrementCounter(&debug_send_failures);
             sock.close_blocking();
             return ProxyError.SendFailed;
         };
     } else if (!send_ok) {
-        debug_send_failures += 1;
+        incrementCounter(&debug_send_failures);
         sock.close_blocking();
         return ProxyError.SendFailed;
     }
@@ -262,14 +244,14 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         }
         var bufs: [1][]u8 = .{header_buffer[header_len..]};
         const n = backend_reader.interface.readVec(&bufs) catch {
-            debug_read_failures += 1;
-            if (from_pool) debug_stale_connections += 1;
+            incrementCounter(&debug_read_failures);
+            if (from_pool) incrementCounter(&debug_stale_connections);
             sock.close_blocking();
             return ProxyError.ReadFailed;
         };
         if (n == 0) {
-            debug_read_failures += 1;
-            if (from_pool) debug_stale_connections += 1;
+            incrementCounter(&debug_read_failures);
+            if (from_pool) incrementCounter(&debug_stale_connections);
             sock.close_blocking();
             return ProxyError.EmptyResponse;
         }
@@ -481,7 +463,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         body_had_error,
     });
 
-    // Record metrics using elapsed time from start
+    // Record metrics (always enabled - atomics are fast enough)
     const elapsed_ms: i64 = if (start_instant) |start| blk: {
         const now = std.time.Instant.now() catch break :blk 0;
         break :blk @intCast(now.since(start) / 1_000_000);
@@ -497,25 +479,13 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         can_return_to_pool = false;
     }
 
-    // Also check socket directly for any pending data (belt and suspenders)
-    if (can_return_to_pool and sock.hasStaleData()) {
-        log.warn("[REQ {d}] SOCKET HAS PENDING DATA after response - NOT pooling", .{req_id});
-        can_return_to_pool = false;
-    }
-
-    // Additional safety check using connection_reuse module
-    if (can_return_to_pool and !body_had_error) {
-        const reuse_ok = connection_reuse.shouldReturnToPool(
-            headers,
-            msg_len.type,
-            msg_len.length,
-            bytes_received,
-            body_had_error,
-        );
-        if (!reuse_ok) {
-            can_return_to_pool = false;
-        }
-    }
+    // NOTE: Removed redundant hasStaleData() poll syscall here.
+    // We already: (1) limit reads to Content-Length, (2) check buffered_remaining,
+    // (3) check backend_wants_close. If stale data exists, it will be caught
+    // on next pool get via hasStaleData() check there.
+    //
+    // Also removed connection_reuse.shouldReturnToPool() call - it duplicates
+    // our header parsing (Connection: close is already tracked in backend_wants_close).
 
     // Either return connection to pool or close it
     if (can_return_to_pool and !body_had_error and sock.connected) {

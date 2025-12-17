@@ -28,7 +28,7 @@ pub const SimpleConnectionStack = struct {
 
     /// Push a connection onto the stack
     /// Returns false if stack is full
-    pub fn push(self: *SimpleConnectionStack, socket: UltraSock) bool {
+    pub inline fn push(self: *SimpleConnectionStack, socket: UltraSock) bool {
         if (self.top >= MAX_IDLE_CONNS) {
             return false; // Stack full
         }
@@ -39,7 +39,7 @@ pub const SimpleConnectionStack = struct {
 
     /// Pop a connection from the stack
     /// Returns null if stack is empty
-    pub fn pop(self: *SimpleConnectionStack) ?UltraSock {
+    pub inline fn pop(self: *SimpleConnectionStack) ?UltraSock {
         if (self.top == 0) {
             return null; // Stack empty
         }
@@ -66,7 +66,7 @@ pub const SimpleConnectionStack = struct {
     }
 };
 
-/// Simple connection pool - now thread-safe with mutex
+/// Simple connection pool - thread-safe with mutex
 pub const SimpleConnectionPool = struct {
     /// Per-backend connection stacks
     pools: [MAX_BACKENDS]SimpleConnectionStack = undefined,
@@ -74,7 +74,7 @@ pub const SimpleConnectionPool = struct {
     backend_count: usize = 0,
     /// Initialized flag
     initialized: bool = false,
-    /// Mutex for thread safety
+    /// Single mutex (simpler, better cache locality)
     mutex: std.Thread.Mutex = .{},
 
     /// Initialize the pool
@@ -104,7 +104,7 @@ pub const SimpleConnectionPool = struct {
 
     /// Get a connection for a backend (returns null if pool empty)
     /// Thread-safe with mutex
-    pub fn getConnection(self: *SimpleConnectionPool, backend_idx: usize) ?UltraSock {
+    pub inline fn getConnection(self: *SimpleConnectionPool, backend_idx: usize) ?UltraSock {
         if (backend_idx >= self.backend_count) return null;
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -113,7 +113,7 @@ pub const SimpleConnectionPool = struct {
 
     /// Return a connection to the pool
     /// Thread-safe with mutex
-    pub fn returnConnection(self: *SimpleConnectionPool, backend_idx: usize, socket: UltraSock) void {
+    pub inline fn returnConnection(self: *SimpleConnectionPool, backend_idx: usize, socket: UltraSock) void {
         if (backend_idx >= self.backend_count) {
             // Invalid backend, just close
             var sock = socket;

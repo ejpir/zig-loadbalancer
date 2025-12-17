@@ -27,7 +27,7 @@ const mp = @import("src/multiprocess/mod.zig");
 const health = @import("src/multiprocess/health.zig");
 
 pub const std_options: std.Options = .{
-    .log_level = .err,
+    .log_level = .warn,
 };
 
 // ============================================================================
