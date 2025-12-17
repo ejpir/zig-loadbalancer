@@ -78,6 +78,9 @@ pub const UltraSock = struct {
     // TLS I/O state (kept alive for duration of connection)
     tls_read_buf: ?[]u8 = null,
     tls_write_buf: ?[]u8 = null,
+    // Stream reader/writer must persist for TLS client lifetime
+    tls_stream_reader: ?Io.net.Stream.Reader = null,
+    tls_stream_writer: ?Io.net.Stream.Writer = null,
 
     /// Initialize a new UltraSock with default TLS options (production)
     pub fn init(allocator: std.mem.Allocator, protocol: Protocol, host: []const u8, port: u16) !UltraSock {
@@ -108,9 +111,14 @@ pub const UltraSock = struct {
     pub fn connect(self: *UltraSock, io: Io) !void {
         if (self.connected) return;
 
-        // Parse IP address and connect using std.Io
-        const addr = Io.net.IpAddress.parse(self.host, self.port) catch {
-            return error.InvalidAddress;
+        // Resolve address - first try as IP, then DNS resolution
+        const addr = Io.net.IpAddress.parse(self.host, self.port) catch blk: {
+            // Not a raw IP, try DNS resolution using getaddrinfo
+            const resolved = resolveDns(self.host, self.port) catch {
+                log.err("Failed to resolve hostname: {s}", .{self.host});
+                return error.InvalidAddress;
+            };
+            break :blk resolved;
         };
 
         // Connect using std.Io
@@ -127,6 +135,68 @@ pub const UltraSock = struct {
         }
 
         self.connected = true;
+    }
+
+    /// Resolve hostname using getaddrinfo (blocking)
+    fn resolveDns(host: []const u8, port: u16) !Io.net.IpAddress {
+        // Create null-terminated strings for getaddrinfo
+        var host_buf: [256]u8 = undefined;
+        if (host.len >= host_buf.len) return error.HostNameTooLong;
+        @memcpy(host_buf[0..host.len], host);
+        host_buf[host.len] = 0;
+        const host_z: [*:0]const u8 = host_buf[0..host.len :0];
+
+        var port_buf: [8]u8 = undefined;
+        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return error.InvalidPort;
+        var port_z_buf: [8]u8 = undefined;
+        @memcpy(port_z_buf[0..port_str.len], port_str);
+        port_z_buf[port_str.len] = 0;
+        const port_z: [*:0]const u8 = port_z_buf[0..port_str.len :0];
+
+        const hints: std.posix.addrinfo = .{
+            .flags = .{},
+            .family = std.posix.AF.UNSPEC,
+            .socktype = std.posix.SOCK.STREAM,
+            .protocol = std.posix.IPPROTO.TCP,
+            .addrlen = 0,
+            .addr = null,
+            .canonname = null,
+            .next = null,
+        };
+
+        var res: ?*std.posix.addrinfo = null;
+        const rc = std.posix.system.getaddrinfo(host_z, port_z, &hints, &res);
+        if (rc != @as(std.posix.system.EAI, @enumFromInt(0))) {
+            log.err("getaddrinfo failed for {s}", .{host});
+            return error.DnsResolutionFailed;
+        }
+        defer if (res) |r| std.posix.system.freeaddrinfo(r);
+
+        // Get first result
+        const info = res orelse return error.NoAddressFound;
+        const sockaddr = info.addr orelse return error.NoAddressFound;
+
+        // Convert to Io.net.IpAddress
+        if (sockaddr.family == std.posix.AF.INET) {
+            const addr4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(sockaddr));
+            return Io.net.IpAddress{
+                .ip4 = .{
+                    .bytes = @bitCast(addr4.addr),
+                    .port = port,
+                },
+            };
+        } else if (sockaddr.family == std.posix.AF.INET6) {
+            const addr6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(sockaddr));
+            return Io.net.IpAddress{
+                .ip6 = .{
+                    .bytes = addr6.addr,
+                    .port = port,
+                    .flow = addr6.flowinfo,
+                },
+            };
+        }
+
+        return error.UnsupportedAddressFamily;
     }
 
     /// Perform TLS handshake
@@ -164,9 +234,9 @@ pub const UltraSock = struct {
             log.debug("Loaded {} certificates from system trust store", .{self.ca_bundle.?.map.count()});
         }
 
-        // Set up TCP stream readers/writers for TLS
-        var input = stream.reader(io, self.tls_read_buf.?);
-        var output = stream.writer(io, self.tls_write_buf.?);
+        // Set up TCP stream readers/writers for TLS - must persist for TLS client lifetime
+        self.tls_stream_reader = stream.reader(io, self.tls_read_buf.?);
+        self.tls_stream_writer = stream.writer(io, self.tls_write_buf.?);
 
         // Generate entropy for handshake
         var entropy: [176]u8 = undefined;
@@ -199,7 +269,11 @@ pub const UltraSock = struct {
             .realtime_now_seconds = now_sec,
         };
 
-        self.tls_client = tls.Client.init(&input.interface, &output.interface, options) catch |err| {
+        self.tls_client = tls.Client.init(
+            &self.tls_stream_reader.?.interface,
+            &self.tls_stream_writer.?.interface,
+            options,
+        ) catch |err| {
             log.err("TLS handshake failed: {}", .{err});
             return error.TlsHandshakeFailed;
         };
@@ -292,6 +366,8 @@ pub const UltraSock = struct {
     /// Free TLS resources
     fn freeTlsResources(self: *UltraSock) void {
         self.tls_client = null;
+        self.tls_stream_reader = null;
+        self.tls_stream_writer = null;
 
         if (self.ca_bundle) |*bundle| {
             bundle.deinit(self.allocator);
@@ -474,6 +550,31 @@ pub const UltraSock = struct {
     /// Check if this is a TLS connection
     pub fn isTls(self: *const UltraSock) bool {
         return self.tls_client != null;
+    }
+
+    /// Get mutable pointer to TLS client (for direct reader/writer access)
+    /// Returns null for plain HTTP connections
+    pub fn getTlsClient(self: *UltraSock) ?*tls.Client {
+        if (self.tls_client != null) {
+            return &self.tls_client.?;
+        }
+        return null;
+    }
+
+    /// Get the underlying stream reader error (for debugging TLS read failures)
+    pub fn getStreamReaderError(self: *UltraSock) ?Io.net.Stream.Reader.Error {
+        if (self.tls_stream_reader) |*reader| {
+            return reader.err;
+        }
+        return null;
+    }
+
+    /// Get the underlying stream writer error (for debugging TLS write failures)
+    pub fn getStreamWriterError(self: *UltraSock) ?Io.net.Stream.Writer.Error {
+        if (self.tls_stream_writer) |*writer| {
+            return writer.err;
+        }
+        return null;
     }
 
     /// Create from backend config
