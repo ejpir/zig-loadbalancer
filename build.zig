@@ -55,6 +55,20 @@ pub fn build(b: *std.Build) void {
     const build_load_balancer_mp = b.addInstallArtifact(load_balancer_mp, .{});
     const run_load_balancer_mp_cmd = b.addRunArtifact(load_balancer_mp);
 
+    // Load balancer single-process (uses std.Io thread pool)
+    const load_balancer_sp_mod = b.createModule(.{
+        .root_source_file = b.path("main_singleprocess.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    load_balancer_sp_mod.addImport("zzz", zzz_module);
+    const load_balancer_sp = b.addExecutable(.{
+        .name = "load_balancer_sp",
+        .root_module = load_balancer_sp_mod,
+    });
+    const build_load_balancer_sp = b.addInstallArtifact(load_balancer_sp, .{});
+    const run_load_balancer_sp_cmd = b.addRunArtifact(load_balancer_sp);
+
     // Unit tests
     const unit_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/test_load_balancer.zig"),
@@ -73,12 +87,16 @@ pub fn build(b: *std.Build) void {
     build_all.dependOn(&build_backend1.step);
     build_all.dependOn(&build_backend2.step);
     build_all.dependOn(&build_load_balancer_mp.step);
+    build_all.dependOn(&build_load_balancer_sp.step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
     const run_lb_mp_step = b.step("run-lb-mp", "Run load balancer (multi-process, nginx-style)");
     run_lb_mp_step.dependOn(&run_load_balancer_mp_cmd.step);
+
+    const run_lb_sp_step = b.step("run-lb-sp", "Run load balancer (single-process, threaded)");
+    run_lb_sp_step.dependOn(&run_load_balancer_sp_cmd.step);
 
     const run_backend1_step = b.step("run-backend1", "Run backend server 1");
     run_backend1_step.dependOn(&run_backend1.step);
