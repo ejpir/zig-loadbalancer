@@ -10,11 +10,13 @@ const zzz = @import("zzz");
 const http = zzz.HTTP;
 
 const types = @import("../core/types.zig");
-const UltraSock = @import("../http/ultra_sock.zig").UltraSock;
+const ultra_sock_mod = @import("../http/ultra_sock.zig");
+const UltraSock = ultra_sock_mod.UltraSock;
 const http_utils = @import("../http/http_utils.zig");
 const simd_parse = @import("../internal/simd_parse.zig");
 const metrics = @import("../utils/metrics.zig");
 const WorkerState = @import("worker_state.zig").WorkerState;
+const tls = std.crypto.tls;
 
 pub const ProxyError = error{
     ConnectionFailed,
@@ -30,15 +32,22 @@ pub const ProxyError = error{
 pub fn generateHandler(comptime strategy: types.LoadBalancerStrategy) fn (*const http.Context, *WorkerState) anyerror!http.Respond {
     return struct {
         pub fn handle(ctx: *const http.Context, state: *WorkerState) !http.Respond {
+            log.debug("Handler called: backends={d} healthy={d}", .{
+                state.backends.items.len,
+                state.circuit_breaker.countHealthy(),
+            });
+
             if (state.backends.items.len == 0) {
                 return ctx.response.apply(.{ .status = .@"Service Unavailable", .mime = http.Mime.TEXT, .body = "No backends configured" });
             }
 
             // Note: selectBackend manages its own counter for round-robin
             const backend_idx = state.selectBackend(strategy) orelse {
+                log.warn("selectBackend returned null", .{});
                 return ctx.response.apply(.{ .status = .@"Service Unavailable", .mime = http.Mime.TEXT, .body = "No backends available" });
             };
 
+            log.debug("Selected backend {d}", .{backend_idx});
             return proxyWithFailover(ctx, backend_idx, state);
         }
     }.handle;
@@ -171,26 +180,57 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
         return ProxyError.ConnectionFailed;
     };
 
-    // Create backend reader/writer using std.Io (async I/O for concurrency)
+    // Validate we have a stream
     const stream = sock.stream orelse {
         sock.close_blocking();
         return ProxyError.ConnectionFailed;
     };
-    var backend_read_buf: [8192]u8 = undefined;
-    var backend_reader = stream.reader(ctx.io, &backend_read_buf);
-    var backend_write_buf: [8192]u8 = undefined;
-    var backend_writer = stream.writer(ctx.io, &backend_write_buf);
 
-    // Try to send request to backend using async I/O
-    log.debug("[REQ {d}] SENDING TO BACKEND: {s}", .{ req_id, request_data[0..@min(request_data.len, 60)] });
+    // Check if this is a TLS connection
+    const is_tls = sock.isTls();
+    var tls_client_ptr = sock.getTlsClient();
+
+    // For plain TCP, create buffered reader/writer
+    var backend_read_buf: [8192]u8 = undefined;
+    var backend_write_buf: [8192]u8 = undefined;
+    var plain_reader = stream.reader(ctx.io, &backend_read_buf);
+    var plain_writer = stream.writer(ctx.io, &backend_write_buf);
+
+    // Try to send request to backend
+    log.debug("[REQ {d}] SENDING TO BACKEND ({s}): {s}", .{ req_id, if (is_tls) "TLS" else "plain", request_data[0..@min(request_data.len, 60)] });
     var send_ok = true;
-    backend_writer.interface.writeAll(request_data) catch {
-        send_ok = false;
-    };
-    if (send_ok) {
-        backend_writer.interface.flush() catch {
+    if (is_tls) {
+        if (tls_client_ptr) |tls_c| {
+            tls_c.writer.writeAll(request_data) catch |err| {
+                log.debug("[REQ {d}] TLS write failed: {}", .{ req_id, err });
+                send_ok = false;
+            };
+            if (send_ok) {
+                tls_c.writer.flush() catch |err| {
+                    log.debug("[REQ {d}] TLS flush failed: {}", .{ req_id, err });
+                    send_ok = false;
+                };
+            }
+            // CRITICAL: TLS writer.flush() only prepares ciphertext in buffer,
+            // we must also flush the underlying output to send to network
+            if (send_ok) {
+                tls_c.output.flush() catch |err| {
+                    log.debug("[REQ {d}] TLS output flush failed: {}", .{ req_id, err });
+                    send_ok = false;
+                };
+            }
+        } else {
+            send_ok = false;
+        }
+    } else {
+        plain_writer.interface.writeAll(request_data) catch {
             send_ok = false;
         };
+        if (send_ok) {
+            plain_writer.interface.flush() catch {
+                send_ok = false;
+            };
+        }
     }
 
     // If send failed on pooled connection, retry with fresh connection
@@ -207,32 +247,63 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
         };
         from_pool = false;
 
-        // Re-create reader/writer for fresh connection
-        const fresh_stream = sock.stream orelse {
-            sock.close_blocking();
-            return ProxyError.ConnectionFailed;
-        };
-        backend_reader = fresh_stream.reader(ctx.io, &backend_read_buf);
-        backend_writer = fresh_stream.writer(ctx.io, &backend_write_buf);
+        // Update TLS state for fresh connection
+        tls_client_ptr = sock.getTlsClient();
+        const fresh_is_tls = sock.isTls();
 
-        // Retry send on fresh connection using async I/O
-        backend_writer.interface.writeAll(request_data) catch {
-            incrementCounter(&debug_send_failures);
-            sock.close_blocking();
-            return ProxyError.SendFailed;
-        };
-        backend_writer.interface.flush() catch {
-            incrementCounter(&debug_send_failures);
-            sock.close_blocking();
-            return ProxyError.SendFailed;
-        };
+        // Re-create reader/writer for fresh connection (only used for plain TCP)
+        if (!fresh_is_tls) {
+            const fresh_stream = sock.stream orelse {
+                sock.close_blocking();
+                return ProxyError.ConnectionFailed;
+            };
+            plain_reader = fresh_stream.reader(ctx.io, &backend_read_buf);
+            plain_writer = fresh_stream.writer(ctx.io, &backend_write_buf);
+        }
+
+        // Retry send on fresh connection
+        if (fresh_is_tls) {
+            if (tls_client_ptr) |tls_c| {
+                tls_c.writer.writeAll(request_data) catch {
+                    incrementCounter(&debug_send_failures);
+                    sock.close_blocking();
+                    return ProxyError.SendFailed;
+                };
+                tls_c.writer.flush() catch {
+                    incrementCounter(&debug_send_failures);
+                    sock.close_blocking();
+                    return ProxyError.SendFailed;
+                };
+                // Flush underlying output to network
+                tls_c.output.flush() catch {
+                    incrementCounter(&debug_send_failures);
+                    sock.close_blocking();
+                    return ProxyError.SendFailed;
+                };
+            } else {
+                incrementCounter(&debug_send_failures);
+                sock.close_blocking();
+                return ProxyError.SendFailed;
+            }
+        } else {
+            plain_writer.interface.writeAll(request_data) catch {
+                incrementCounter(&debug_send_failures);
+                sock.close_blocking();
+                return ProxyError.SendFailed;
+            };
+            plain_writer.interface.flush() catch {
+                incrementCounter(&debug_send_failures);
+                sock.close_blocking();
+                return ProxyError.SendFailed;
+            };
+        }
     } else if (!send_ok) {
         incrementCounter(&debug_send_failures);
         sock.close_blocking();
         return ProxyError.SendFailed;
     }
 
-    // Read headers using std.Io (now returns errors instead of panicking)
+    // Read headers - use TLS reader or plain reader
     var header_buffer: [8192]u8 = undefined;
     var header_len: usize = 0;
     var header_end: usize = 0;
@@ -243,17 +314,45 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
             return ProxyError.InvalidResponse;
         }
         var bufs: [1][]u8 = .{header_buffer[header_len..]};
-        const n = backend_reader.interface.readVec(&bufs) catch {
-            incrementCounter(&debug_read_failures);
-            if (from_pool) incrementCounter(&debug_stale_connections);
-            sock.close_blocking();
-            return ProxyError.ReadFailed;
-        };
+        var n: usize = 0;
+        if (is_tls) {
+            if (tls_client_ptr) |tls_c| {
+                n = tls_c.reader.readVec(&bufs) catch |err| {
+                    log.debug("[REQ {d}] TLS read error: {}", .{ req_id, err });
+                    incrementCounter(&debug_read_failures);
+                    if (from_pool) incrementCounter(&debug_stale_connections);
+                    sock.close_blocking();
+                    return ProxyError.ReadFailed;
+                };
+            } else {
+                sock.close_blocking();
+                return ProxyError.ReadFailed;
+            }
+        } else {
+            n = plain_reader.interface.readVec(&bufs) catch {
+                incrementCounter(&debug_read_failures);
+                if (from_pool) incrementCounter(&debug_stale_connections);
+                sock.close_blocking();
+                return ProxyError.ReadFailed;
+            };
+        }
         if (n == 0) {
-            incrementCounter(&debug_read_failures);
-            if (from_pool) incrementCounter(&debug_stale_connections);
-            sock.close_blocking();
-            return ProxyError.EmptyResponse;
+            // For TLS, 0 bytes might mean partial record - wait for more data
+            if (is_tls and tls_client_ptr != null) {
+                const max_retries: usize = 100; // Up to ~1 second total
+                var retry_count: usize = 0;
+                while (n == 0 and retry_count < max_retries) {
+                    std.posix.nanosleep(0, 10_000_000); // 10ms
+                    n = tls_client_ptr.?.reader.readVec(&bufs) catch break;
+                    retry_count += 1;
+                }
+            }
+            if (n == 0) {
+                incrementCounter(&debug_read_failures);
+                if (from_pool) incrementCounter(&debug_stale_connections);
+                sock.close_blocking();
+                return ProxyError.EmptyResponse;
+            }
         }
         header_len += n;
         if (simd_parse.findHeaderEnd(header_buffer[0..header_len])) |pos| header_end = pos + 4;
@@ -394,7 +493,7 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
     var chunked_complete = false;
     var body_buf: [8192]u8 = undefined;
 
-    // Stream body using the same backend_reader
+    // Stream body - use TLS reader or plain reader
     var total_body_written: usize = 0;
     if (msg_len.type == .content_length) {
         while (bytes_received < msg_len.length) {
@@ -403,12 +502,27 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
             const remaining = msg_len.length - bytes_received;
             const read_size = @min(remaining, body_buf.len);
             var bufs: [1][]u8 = .{body_buf[0..read_size]};
-            const n = backend_reader.interface.readVec(&bufs) catch {
-                body_had_error = true;
-                sock.connected = false;
-                can_return_to_pool = false;
-                break;
-            };
+            var n: usize = 0;
+            if (is_tls) {
+                if (tls_client_ptr) |tls_c| {
+                    n = tls_c.reader.readVec(&bufs) catch {
+                        body_had_error = true;
+                        sock.connected = false;
+                        can_return_to_pool = false;
+                        break;
+                    };
+                } else {
+                    body_had_error = true;
+                    break;
+                }
+            } else {
+                n = plain_reader.interface.readVec(&bufs) catch {
+                    body_had_error = true;
+                    sock.connected = false;
+                    can_return_to_pool = false;
+                    break;
+                };
+            }
             if (n == 0) {
                 body_had_error = true;
                 sock.connected = false;
@@ -428,11 +542,25 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
         can_return_to_pool = false;
         while (true) {
             var bufs: [1][]u8 = .{&body_buf};
-            const n = backend_reader.interface.readVec(&bufs) catch {
-                body_had_error = true;
-                sock.connected = false;
-                break;
-            };
+            var n: usize = 0;
+            if (is_tls) {
+                if (tls_client_ptr) |tls_c| {
+                    n = tls_c.reader.readVec(&bufs) catch {
+                        body_had_error = true;
+                        sock.connected = false;
+                        break;
+                    };
+                } else {
+                    body_had_error = true;
+                    break;
+                }
+            } else {
+                n = plain_reader.interface.readVec(&bufs) catch {
+                    body_had_error = true;
+                    sock.connected = false;
+                    break;
+                };
+            }
             if (n == 0) {
                 body_had_error = true;
                 sock.connected = false;
@@ -473,10 +601,16 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
     // Determine if connection can be returned to pool
     // Critical check: ensure buffered reader has no leftover data
     // This prevents protocol misalignment on reused connections
-    const buffered_remaining = backend_reader.interface.bufferedLen();
-    if (buffered_remaining > 0) {
-        log.warn("[REQ {d}] BUFFERED DATA REMAINING: {d} bytes - NOT pooling", .{ req_id, buffered_remaining });
+    if (is_tls) {
+        // For TLS connections, don't pool for now - TLS state is complex
+        // TODO: Implement TLS connection pooling with proper state management
         can_return_to_pool = false;
+    } else {
+        const buffered_remaining = plain_reader.interface.bufferedLen();
+        if (buffered_remaining > 0) {
+            log.warn("[REQ {d}] BUFFERED DATA REMAINING: {d} bytes - NOT pooling", .{ req_id, buffered_remaining });
+            can_return_to_pool = false;
+        }
     }
 
     // NOTE: Removed redundant hasStaleData() poll syscall here.
