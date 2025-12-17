@@ -66,7 +66,7 @@ pub const SimpleConnectionStack = struct {
     }
 };
 
-/// Simple connection pool for single-threaded workers
+/// Simple connection pool - now thread-safe with mutex
 pub const SimpleConnectionPool = struct {
     /// Per-backend connection stacks
     pools: [MAX_BACKENDS]SimpleConnectionStack = undefined,
@@ -74,6 +74,8 @@ pub const SimpleConnectionPool = struct {
     backend_count: usize = 0,
     /// Initialized flag
     initialized: bool = false,
+    /// Mutex for thread safety
+    mutex: std.Thread.Mutex = .{},
 
     /// Initialize the pool
     pub fn init(self: *SimpleConnectionPool) void {
@@ -82,6 +84,7 @@ pub const SimpleConnectionPool = struct {
         }
         self.backend_count = 0;
         self.initialized = true;
+        self.mutex = .{};
     }
 
     /// Deinitialize and close all connections
@@ -100,12 +103,16 @@ pub const SimpleConnectionPool = struct {
     }
 
     /// Get a connection for a backend (returns null if pool empty)
+    /// Thread-safe with mutex
     pub fn getConnection(self: *SimpleConnectionPool, backend_idx: usize) ?UltraSock {
         if (backend_idx >= self.backend_count) return null;
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.pools[backend_idx].pop();
     }
 
     /// Return a connection to the pool
+    /// Thread-safe with mutex
     pub fn returnConnection(self: *SimpleConnectionPool, backend_idx: usize, socket: UltraSock) void {
         if (backend_idx >= self.backend_count) {
             // Invalid backend, just close
@@ -114,7 +121,11 @@ pub const SimpleConnectionPool = struct {
             return;
         }
 
-        if (!self.pools[backend_idx].push(socket)) {
+        self.mutex.lock();
+        const pushed = self.pools[backend_idx].push(socket);
+        self.mutex.unlock();
+
+        if (!pushed) {
             // Pool full, close the connection
             var sock = socket;
             sock.close_blocking();

@@ -159,10 +159,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
             sock.close_blocking();
             return ProxyError.BackendUnavailable;
         };
-        // Set timeouts and keepalive on new connections
-        const BACKEND_TIMEOUT_MS: u32 = 100;
-        sock.setReadTimeout(BACKEND_TIMEOUT_MS) catch {};
-        sock.setWriteTimeout(BACKEND_TIMEOUT_MS) catch {};
+        // Keepalive helps detect dead connections during idle periods
         sock.enableKeepalive() catch {};
     }
 
