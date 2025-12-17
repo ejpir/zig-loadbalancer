@@ -135,7 +135,8 @@ pub fn main() !void {
             // Child: run worker
             var worker_config = config;
             worker_config.worker_id = worker_id;
-            setCpuAffinity(worker_id) catch {};
+            // NOTE: CPU affinity is set INSIDE workerMain, AFTER Io.Threaded.init
+            // to avoid affecting getCpuCount() which determines async_limit
             workerMain(worker_config) catch |err| {
                 log.err("Worker {d} fatal: {s}", .{ worker_id, @errorName(err) });
                 posix.exit(1);
@@ -161,7 +162,7 @@ pub fn main() !void {
                     if (new_pid == 0) {
                         var worker_config = config;
                         worker_config.worker_id = worker_id;
-                        setCpuAffinity(worker_id) catch {};
+                        // NOTE: CPU affinity is set INSIDE workerMain
                         workerMain(worker_config) catch |err| {
                             log.err("Worker {d} fatal: {s}", .{ worker_id, @errorName(err) });
                             posix.exit(1);
@@ -228,9 +229,15 @@ fn workerMain(config: WorkerConfig) !void {
     }, null);
 
     // std.Io runtime
+    // IMPORTANT: Io.Threaded.init must happen BEFORE setCpuAffinity
+    // because getCpuCount() is used to set async_limit, and if affinity
+    // is already set to 1 CPU, async_limit becomes 0 (all ops run sync)
     var threaded: Io.Threaded = .init(allocator);
     defer threaded.deinit();
     const io = threaded.io();
+
+    // Now safe to set CPU affinity (after Io.Threaded has captured cpu count)
+    setCpuAffinity(config.worker_id) catch {};
 
     // Router
     var router = switch (config.strategy) {
