@@ -36,12 +36,20 @@ pub const UltraSock = struct {
         };
     }
 
-    /// Connect to the backend server
+    /// Connect to the backend server using std.Io (async, properly handles errors)
     pub fn connect(self: *UltraSock, io: Io) !void {
         if (self.connected) return;
 
-        const addr = try Io.net.IpAddress.parse(self.host, self.port);
-        self.stream = try addr.connect(io, .{ .mode = .stream });
+        // Parse IP address and connect using std.Io
+        const addr = Io.net.IpAddress.parse(self.host, self.port) catch {
+            return error.InvalidAddress;
+        };
+
+        // Connect using std.Io (patched to return errors instead of panicking)
+        self.stream = addr.connect(io, .{ .mode = .stream }) catch {
+            return error.ConnectionFailed;
+        };
+
         self.io = io;
         self.connected = true;
     }
@@ -103,6 +111,122 @@ pub const UltraSock = struct {
     /// Deinit (alias for close_blocking)
     pub fn deinit(self: *UltraSock) void {
         self.close_blocking();
+    }
+
+    /// Get the raw file descriptor (for POSIX operations)
+    pub fn getFd(self: *const UltraSock) ?std.posix.fd_t {
+        const stream = self.stream orelse return null;
+        return stream.socket.handle;
+    }
+
+    /// Set read timeout on socket (in milliseconds)
+    pub fn setReadTimeout(self: *UltraSock, timeout_ms: u32) !void {
+        const fd = self.getFd() orelse return error.NotConnected;
+        const seconds = timeout_ms / 1000;
+        const microseconds = (timeout_ms % 1000) * 1000;
+        const timeout = std.posix.timeval{
+            .sec = @intCast(seconds),
+            .usec = @intCast(microseconds),
+        };
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {
+            return error.SetTimeoutFailed;
+        };
+    }
+
+    /// Set write timeout on socket (in milliseconds)
+    pub fn setWriteTimeout(self: *UltraSock, timeout_ms: u32) !void {
+        const fd = self.getFd() orelse return error.NotConnected;
+        const seconds = timeout_ms / 1000;
+        const microseconds = (timeout_ms % 1000) * 1000;
+        const timeout = std.posix.timeval{
+            .sec = @intCast(seconds),
+            .usec = @intCast(microseconds),
+        };
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {
+            return error.SetTimeoutFailed;
+        };
+    }
+
+    /// Write all data using POSIX (returns error instead of panicking)
+    pub fn posixWriteAll(self: *UltraSock, data: []const u8) !void {
+        const fd = self.getFd() orelse return error.NotConnected;
+        var total_written: usize = 0;
+
+        while (total_written < data.len) {
+            const written = std.posix.write(fd, data[total_written..]) catch |err| {
+                self.connected = false;
+                return switch (err) {
+                    error.BrokenPipe => error.BrokenPipe,
+                    error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                    error.NotOpenForWriting => error.NotConnected,
+                    else => error.WriteFailed,
+                };
+            };
+            if (written == 0) {
+                self.connected = false;
+                return error.ConnectionClosed;
+            }
+            total_written += written;
+        }
+    }
+
+    /// Read data using POSIX (returns error instead of panicking)
+    pub fn posixRead(self: *UltraSock, buffer: []u8) !usize {
+        const fd = self.getFd() orelse return error.NotConnected;
+
+        const n = std.posix.read(fd, buffer) catch |err| {
+            self.connected = false;
+            return switch (err) {
+                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                error.NotOpenForReading => error.NotConnected,
+                else => error.ReadFailed,
+            };
+        };
+
+        if (n == 0) {
+            self.connected = false;
+        }
+        return n;
+    }
+
+    /// Check if socket has pending data or is in bad state
+    /// Returns true if connection should NOT be reused
+    /// Uses poll() with zero timeout for non-blocking check
+    pub fn hasStaleData(self: *UltraSock) bool {
+        const stream = self.stream orelse return true; // No stream = stale
+        const fd = stream.socket.handle;
+
+        // Check for invalid fd
+        if (fd < 0) return true;
+
+        var poll_fds = [_]std.posix.pollfd{
+            .{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+
+        // Poll with 0 timeout = non-blocking check
+        const result = std.posix.poll(&poll_fds, 0) catch {
+            return true; // On error, assume stale
+        };
+
+        const revents = poll_fds[0].revents;
+
+        // Check for any problematic conditions:
+        // - POLLIN: Data waiting (stale response data)
+        // - POLLHUP: Connection closed by peer
+        // - POLLERR: Socket error
+        // - POLLNVAL: Invalid fd
+        if (result > 0) {
+            if ((revents & std.posix.POLL.IN) != 0) return true;
+            if ((revents & std.posix.POLL.HUP) != 0) return true;
+            if ((revents & std.posix.POLL.ERR) != 0) return true;
+            if ((revents & std.posix.POLL.NVAL) != 0) return true;
+        }
+
+        return false;
     }
 
     /// Create from backend config
