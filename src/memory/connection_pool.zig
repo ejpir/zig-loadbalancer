@@ -751,8 +751,8 @@ pub const LockFreeConnectionPool = struct {
     inline fn isValidSocket(self: *LockFreeConnectionPool, socket: UltraSock) bool {
         _ = self;
         if (!socket.connected) return false;
-        return (socket.protocol == .http and socket.socket != null) or
-               (socket.protocol == .https and (socket.secure_socket != null or socket.socket != null));
+        // Check that we have a valid stream - UltraSock uses stream field, not socket
+        return socket.stream != null;
     }
 
     /// Safely close a socket with error handling for union state conflicts
