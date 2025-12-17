@@ -236,15 +236,21 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         };
         from_pool = false;
 
-        // Re-create reader for fresh connection
+        // Re-create reader/writer for fresh connection
         const fresh_stream = sock.stream orelse {
             sock.close_blocking();
             return ProxyError.ConnectionFailed;
         };
         backend_reader = fresh_stream.reader(ctx.io, &backend_read_buf);
+        backend_writer = fresh_stream.writer(ctx.io, &backend_write_buf);
 
-        // Retry send on fresh connection
-        sock.posixWriteAll(request_data) catch {
+        // Retry send on fresh connection using async I/O
+        backend_writer.interface.writeAll(request_data) catch {
+            debug_send_failures += 1;
+            sock.close_blocking();
+            return ProxyError.SendFailed;
+        };
+        backend_writer.interface.flush() catch {
             debug_send_failures += 1;
             sock.close_blocking();
             return ProxyError.SendFailed;
