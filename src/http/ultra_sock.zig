@@ -147,6 +147,27 @@ pub const UltraSock = struct {
         };
     }
 
+    /// Enable TCP keepalive to detect dead connections
+    pub fn enableKeepalive(self: *UltraSock) !void {
+        const fd = self.getFd() orelse return error.NotConnected;
+
+        // Enable keepalive
+        const enable: u32 = 1;
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&enable)) catch {
+            return error.SetOptionFailed;
+        };
+
+        // Set keepalive parameters (macOS uses TCP_KEEPALIVE for idle time)
+        const idle_secs: u32 = 5; // Start probes after 5 seconds idle
+        if (@hasDecl(std.posix.TCP, "KEEPALIVE")) {
+            // macOS
+            std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPALIVE, std.mem.asBytes(&idle_secs)) catch {};
+        } else if (@hasDecl(std.posix.TCP, "KEEPIDLE")) {
+            // Linux
+            std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPIDLE, std.mem.asBytes(&idle_secs)) catch {};
+        }
+    }
+
     /// Write all data using POSIX (returns error instead of panicking)
     pub fn posixWriteAll(self: *UltraSock, data: []const u8) !void {
         const fd = self.getFd() orelse return error.NotConnected;
