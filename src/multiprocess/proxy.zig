@@ -110,12 +110,48 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     var sock: UltraSock = undefined;
     var from_pool = false;
 
-    if (state.connection_pool.getConnection(backend_idx)) |pooled_sock| {
-        sock = pooled_sock;
-        from_pool = true;
-        debug_pool_hits += 1;
-        log.debug("[REQ {d}] POOL HIT backend={d}", .{ req_id, backend_idx });
-    } else {
+    // Backend connection pooling - now safe with POSIX read/write
+    const ENABLE_BACKEND_POOLING = true;
+
+    if (ENABLE_BACKEND_POOLING) {
+        if (state.connection_pool.getConnection(backend_idx)) |pooled_sock| {
+            sock = pooled_sock;
+            log.warn("[REQ {d}] POOL GET backend={d}", .{ req_id, backend_idx });
+
+            // Check for stale data before reusing connection
+            if (sock.hasStaleData()) {
+                // Peek at what data is there to understand why it's stale
+                var peek_buf: [256]u8 = undefined;
+                const peek_n = sock.posixRead(&peek_buf) catch 0;
+                if (peek_n > 0) {
+                    log.warn("[REQ {d}] STALE POOLED CONN: unexpected data ({d} bytes): {s}", .{ req_id, peek_n, peek_buf[0..@min(peek_n, 100)] });
+                } else {
+                    log.warn("[REQ {d}] STALE POOLED CONN: connection closed by peer", .{req_id});
+                }
+                sock.close_blocking();
+                debug_stale_connections += 1;
+
+                // Create fresh connection immediately (don't rely on fall-through)
+                sock = UltraSock.fromBackendServer(ctx.allocator, backend) catch return ProxyError.ConnectionFailed;
+                sock.connect(ctx.io) catch {
+                    sock.close_blocking();
+                    return ProxyError.BackendUnavailable;
+                };
+                // Verify new connection is good
+                if (sock.stream == null or !sock.connected) {
+                    log.err("[REQ {d}] Fresh connection after stale has no stream!", .{req_id});
+                    return ProxyError.ConnectionFailed;
+                }
+                from_pool = false; // Explicit
+            } else {
+                from_pool = true;
+                debug_pool_hits += 1;
+                log.debug("[REQ {d}] POOL HIT backend={d}", .{ req_id, backend_idx });
+            }
+        }
+    }
+
+    if (!from_pool) {
         debug_pool_misses += 1;
         log.debug("[REQ {d}] POOL MISS backend={d}", .{ req_id, backend_idx });
         sock = UltraSock.fromBackendServer(ctx.allocator, backend) catch return ProxyError.ConnectionFailed;
@@ -125,18 +161,26 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         };
     }
 
+    // Set socket timeouts to prevent hanging on slow/dead backends
+    const BACKEND_TIMEOUT_MS: u32 = 5000; // 5 seconds
+    sock.setReadTimeout(BACKEND_TIMEOUT_MS) catch {};
+    sock.setWriteTimeout(BACKEND_TIMEOUT_MS) catch {};
+
+    // Final validation before using connection
+    if (sock.stream == null) {
+        log.err("[REQ {d}] No stream after connection setup!", .{req_id});
+        return ProxyError.ConnectionFailed;
+    }
+
     // Track whether we should return to pool (will be set to false on errors)
     var can_return_to_pool = true;
 
-    var stream = sock.stream orelse {
+    if (sock.stream == null) {
         sock.close_blocking();
         return ProxyError.ConnectionFailed;
-    };
+    }
 
-    // Send request using stack buffer (no heap allocation)
-    var write_buf: [2048]u8 = undefined;
-    var backend_writer = stream.writer(ctx.io, &write_buf);
-
+    // Format request using stack buffer
     var request_buf: [1024]u8 = undefined;
     const request_data = std.fmt.bufPrint(&request_buf, "{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: keep-alive\r\n\r\n", .{
         @tagName(ctx.request.method orelse .GET),
@@ -148,21 +192,25 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         return ProxyError.ConnectionFailed;
     };
 
-    // Try to send - if pooled connection is stale, retry with fresh connection
+    // Create backend reader/writer using std.Io
+    const stream = sock.stream orelse {
+        sock.close_blocking();
+        return ProxyError.ConnectionFailed;
+    };
+    var backend_read_buf: [8192]u8 = undefined;
+    var backend_reader = stream.reader(ctx.io, &backend_read_buf);
+
+    // Try to send request to backend
+    log.warn("[REQ {d}] SENDING TO BACKEND: {s}", .{ req_id, request_data[0..@min(request_data.len, 60)] });
     var send_ok = true;
-    backend_writer.interface.writeAll(request_data) catch {
+    sock.posixWriteAll(request_data) catch {
         send_ok = false;
     };
-    if (send_ok) {
-        backend_writer.interface.flush() catch {
-            send_ok = false;
-        };
-    }
 
     // If send failed on pooled connection, retry with fresh connection
     if (!send_ok and from_pool) {
         debug_stale_connections += 1;
-        log.debug("[REQ {d}] Pooled conn stale, retrying with fresh", .{req_id});
+        log.debug("[REQ {d}] Pooled conn stale on write, retrying with fresh", .{req_id});
         sock.close_blocking();
 
         // Create fresh connection
@@ -173,20 +221,15 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         };
         from_pool = false;
 
-        stream = sock.stream orelse {
+        // Re-create reader for fresh connection
+        const fresh_stream = sock.stream orelse {
             sock.close_blocking();
             return ProxyError.ConnectionFailed;
         };
+        backend_reader = fresh_stream.reader(ctx.io, &backend_read_buf);
 
-        // Recreate writer with fresh stream
-        backend_writer = stream.writer(ctx.io, &write_buf);
-
-        backend_writer.interface.writeAll(request_data) catch {
-            debug_send_failures += 1;
-            sock.close_blocking();
-            return ProxyError.SendFailed;
-        };
-        backend_writer.interface.flush() catch {
+        // Retry send on fresh connection
+        sock.posixWriteAll(request_data) catch {
             debug_send_failures += 1;
             sock.close_blocking();
             return ProxyError.SendFailed;
@@ -197,11 +240,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         return ProxyError.SendFailed;
     }
 
-    // Create a single reader for all backend reads (smaller buffer)
-    var read_buf: [4096]u8 = undefined;
-    var backend_reader = stream.reader(ctx.io, &read_buf);
-
-    // Read headers using stack buffer
+    // Read headers using std.Io (now returns errors instead of panicking)
     var header_buffer: [8192]u8 = undefined;
     var header_len: usize = 0;
     var header_end: usize = 0;
@@ -214,14 +253,12 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         var bufs: [1][]u8 = .{header_buffer[header_len..]};
         const n = backend_reader.interface.readVec(&bufs) catch {
             debug_read_failures += 1;
-            sock.connected = false;
             if (from_pool) debug_stale_connections += 1;
             sock.close_blocking();
             return ProxyError.ReadFailed;
         };
         if (n == 0) {
             debug_read_failures += 1;
-            sock.connected = false;
             if (from_pool) debug_stale_connections += 1;
             sock.close_blocking();
             return ProxyError.EmptyResponse;
@@ -318,9 +355,24 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     log.debug("[REQ {d}] HDR WRITE {d} bytes, buf_end={d}", .{ req_id, header_bytes_written, client_writer.end });
 
     // Send any body data already read with headers
+    // CRITICAL: Only send up to Content-Length bytes, not everything in the buffer!
+    // The buffered reader may have read ahead and captured the next response.
     var client_write_error = false;
-    if (header_len > header_end) {
-        client_writer.writeAll(header_buffer[header_end..header_len]) catch {
+    const body_to_write = if (msg_len.type == .content_length)
+        @min(body_already_read, msg_len.length)
+    else
+        body_already_read;
+
+    // If we read MORE than Content-Length, we have pipelined responses - can't pool
+    if (msg_len.type == .content_length and body_already_read > msg_len.length) {
+        log.warn("[REQ {d}] READ AHEAD detected: got {d} body bytes, expected {d} - NOT pooling", .{
+            req_id, body_already_read, msg_len.length,
+        });
+        can_return_to_pool = false;
+    }
+
+    if (body_to_write > 0) {
+        client_writer.writeAll(header_buffer[header_end..][0..body_to_write]) catch {
             client_write_error = true;
         };
     }
@@ -333,7 +385,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
         return ProxyError.SendFailed;
     };
 
-    var bytes_received = header_len - header_end;
+    var bytes_received = body_to_write;
     var body_had_error = false;
     var chunked_complete = false;
     var body_buf: [8192]u8 = undefined;
@@ -425,6 +477,13 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     // This prevents protocol misalignment on reused connections
     const buffered_remaining = backend_reader.interface.bufferedLen();
     if (buffered_remaining > 0) {
+        log.warn("[REQ {d}] BUFFERED DATA REMAINING: {d} bytes - NOT pooling", .{ req_id, buffered_remaining });
+        can_return_to_pool = false;
+    }
+
+    // Also check socket directly for any pending data (belt and suspenders)
+    if (can_return_to_pool and sock.hasStaleData()) {
+        log.warn("[REQ {d}] SOCKET HAS PENDING DATA after response - NOT pooling", .{req_id});
         can_return_to_pool = false;
     }
 
@@ -445,7 +504,7 @@ fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer,
     // Either return connection to pool or close it
     if (can_return_to_pool and !body_had_error and sock.connected) {
         state.connection_pool.returnConnection(backend_idx, sock);
-        log.debug("[REQ {d}] POOL RETURN", .{req_id});
+        log.warn("[REQ {d}] POOL RETURN backend={d}", .{ req_id, backend_idx });
     } else {
         sock.close_blocking();
         log.debug("[REQ {d}] CONN CLOSE (pool={} err={} conn={})", .{
