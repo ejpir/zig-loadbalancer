@@ -299,3 +299,30 @@ Eliminates vtable overhead for hot path.
 - `@ctz(bitmap)` — Find first healthy in 1 instruction
 - 64 backends max is sufficient for most deployments
 - Cache-friendly: entire health state in one cache line
+
+### Single-process threading model
+
+Single-process mode (`main_singleprocess.zig`) uses `std.Io.Threaded`:
+
+```zig
+var threaded: Io.Threaded = .init(allocator);
+```
+
+This is Zig's async I/O runtime which may use internal threads for I/O operations. Key implications:
+
+1. **GPA must be thread-safe** — Health probe thread runs concurrently
+   ```zig
+   var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+   ```
+
+2. **Shared state** — Unlike multi-process, connection pool and worker state are shared
+   - `SimpleConnectionPool` — Designed for single-threaded access
+   - `WorkerState` — Circuit breaker updates from health thread
+
+3. **When to use**:
+   - macOS (SO_REUSEPORT doesn't provide kernel load balancing)
+   - Development/testing
+   - Lower memory footprint needed
+   - Simpler deployment
+
+For production on Linux, prefer multi-process mode for full isolation.
