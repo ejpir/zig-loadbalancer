@@ -272,20 +272,18 @@ fn workerMain(config: WorkerConfig) !void {
         worker_state.circuit_breaker.countHealthy(),
     });
 
-    // Start health probe thread
-    // TODO: Re-enable after fixing DNS/TLS support
-    // const health_thread = health.startHealthProbes(
-    //     &worker_state,
-    //     config.worker_id,
-    // ) catch |err| {
-    //     log.err("Worker {d}: Failed to start health probes: {s}", .{
-    //         config.worker_id,
-    //         @errorName(err),
-    //     });
-    //     return err;
-    // };
-    // defer health_thread.detach();
-    _ = &worker_state; // silence unused warning
+    // Start health probe thread (runs blocking I/O in separate thread)
+    const health_thread = health.startHealthProbes(
+        &worker_state,
+        config.worker_id,
+    ) catch |err| {
+        log.err("Worker {d}: Failed to start health probes: {s}", .{
+            config.worker_id,
+            @errorName(err),
+        });
+        return err;
+    };
+    defer health_thread.detach();
 
     // Signal handling
     posix.sigaction(posix.SIG.TERM, &.{

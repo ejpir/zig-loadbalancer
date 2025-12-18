@@ -110,6 +110,14 @@ curl http://localhost:8080
     │                                                     │
     │                                                     ▼
     │                                              ┌─────────────┐
+    │                                              │  UltraSock  │
+    │                                              │ (TCP/TLS)   │
+    │                                              └──────┬──────┘
+    │                                                     │
+    │                                        Port 443? ───┼───► TLS handshake
+    │                                                     │     (ianic/tls.zig)
+    │                                                     ▼
+    │                                              ┌─────────────┐
     │                                              │  Backend 1  │──► Success: record success
     │                                              │  (primary)  │    Update circuit breaker
     │                                              └──────┬──────┘
