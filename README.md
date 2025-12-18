@@ -155,14 +155,14 @@ main() ────────────────────────�
     │       │
     │       ├─► fork()
     │       │     │
-    │       │     ├─► [CHILD] setCpuAffinity(worker_id)
-    │       │     │           workerMain(config)
+    │       │     ├─► [CHILD] workerMain(config)
     │       │     │             ├─► Create GPA (thread_safe=true for health thread)
     │       │     │             ├─► Create ConnectionPool
     │       │     │             ├─► Create BackendsList
     │       │     │             ├─► Create WorkerState (circuit breaker, health)
     │       │     │             ├─► Start health probe background thread
-    │       │     │             ├─► Create std.Io runtime (single-threaded)
+    │       │     │             ├─► Create std.Io runtime (captures CPU count)
+    │       │     │             ├─► setCpuAffinity(worker_id)  // AFTER Io.init!
     │       │     │             ├─► Create Router with proxy handler
     │       │     │             ├─► Socket.listen() with SO_REUSEPORT
     │       │     │             └─► HTTP server.serve()
