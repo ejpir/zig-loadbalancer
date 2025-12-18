@@ -25,7 +25,7 @@ pub const connection_reuse = @import("connection_reuse.zig");
 
 // Primary exports
 pub const WorkerState = worker_state.WorkerState;
-pub const Config = worker_state.Config;
+pub const WorkerConfig = worker_state.Config; // Health check config subset
 pub const HealthState = health_state.HealthState;
 pub const CircuitBreaker = circuit_breaker.CircuitBreaker;
 pub const BackendSelector = backend_selector.BackendSelector;

@@ -22,6 +22,7 @@ const Router = http.Router;
 const Route = http.Route;
 
 const types = @import("src/core/types.zig");
+const config_mod = @import("src/core/config.zig");
 const simple_pool = @import("src/memory/simple_connection_pool.zig");
 const metrics = @import("src/utils/metrics.zig");
 const mp = @import("src/multiprocess/mod.zig");
@@ -35,39 +36,21 @@ pub const std_options: std.Options = .{
 // Configuration
 // ============================================================================
 
-const BackendDef = struct {
-    host: []const u8,
-    port: u16,
-    weight: u16 = 1,
-};
-
-const WorkerConfig = struct {
-    host: []const u8,
-    port: u16,
-    backends: []BackendDef,
-    strategy: types.LoadBalancerStrategy,
-    worker_id: usize,
-    worker_count: usize,
-};
-
-const CliConfig = struct {
-    worker_count: usize,
-    port: u16,
-    host: []const u8,
-    backends: []BackendDef,
-};
+const LoadBalancerConfig = config_mod.LoadBalancerConfig;
+const BackendDef = config_mod.BackendDef;
 
 // ============================================================================
 // CLI Parsing
 // ============================================================================
 
-fn parseArgs(allocator: std.mem.Allocator) !CliConfig {
+fn parseArgs(allocator: std.mem.Allocator) !LoadBalancerConfig {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    var worker_count: usize = try std.Thread.getCpuCount();
+    var worker_count: usize = 0; // 0 = auto-detect
     var port: u16 = 8080;
     var host: []const u8 = "0.0.0.0";
+    var strategy: types.LoadBalancerStrategy = .round_robin;
 
     var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
     errdefer backend_list.deinit(allocator);
@@ -113,6 +96,16 @@ fn parseArgs(allocator: std.mem.Allocator) !CliConfig {
                 }
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "--strategy") or
+                   std.mem.eql(u8, arg, "-s")) {
+            if (i + 1 < args.len) {
+                if (std.mem.eql(u8, args[i + 1], "random")) {
+                    strategy = .random;
+                } else if (std.mem.eql(u8, args[i + 1], "weighted")) {
+                    strategy = .weighted_round_robin;
+                }
+                i += 1;
+            }
         }
     }
 
@@ -133,6 +126,7 @@ fn parseArgs(allocator: std.mem.Allocator) !CliConfig {
         .port = port,
         .host = host,
         .backends = try backend_list.toOwnedSlice(allocator),
+        .strategy = strategy,
     };
 }
 
@@ -145,26 +139,25 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    const cli = try parseArgs(allocator);
-    defer allocator.free(cli.backends);
+    var config = try parseArgs(allocator);
+    defer allocator.free(config.backends);
 
-    const config = WorkerConfig{
-        .host = cli.host,
-        .port = cli.port,
-        .backends = cli.backends,
-        .strategy = .round_robin,
-        .worker_id = 0,
-        .worker_count = cli.worker_count,
-    };
+    // Auto-detect worker count if not specified
+    if (config.worker_count == 0) {
+        config.worker_count = try std.Thread.getCpuCount();
+    }
+
+    // Validate configuration
+    try config.validate();
 
     log.info("=== Multi-Process Load Balancer ===", .{});
     log.info("Workers: {d}, Listen: {s}:{d}, Backends: {d}", .{
-        cli.worker_count,
-        cli.host,
-        cli.port,
-        cli.backends.len,
+        config.worker_count,
+        config.host,
+        config.port,
+        config.backends.len,
     });
-    for (cli.backends, 0..) |b, idx| {
+    for (config.backends, 0..) |b, idx| {
         log.info("  Backend {d}: {s}:{d}", .{ idx + 1, b.host, b.port });
     }
 
@@ -172,12 +165,12 @@ pub fn main() !void {
 }
 
 // Spawn worker processes and monitor for crashes
-fn spawnWorkers(allocator: std.mem.Allocator, config: WorkerConfig) !void {
+fn spawnWorkers(allocator: std.mem.Allocator, config: LoadBalancerConfig) !void {
     var worker_pids = try allocator.alloc(posix.pid_t, config.worker_count);
     defer allocator.free(worker_pids);
 
     for (0..config.worker_count) |worker_id| {
-        worker_pids[worker_id] = try forkWorker(config, worker_id);
+        worker_pids[worker_id] = try forkWorker(&config, worker_id);
         log.info("Spawned worker {d} (PID: {d})", .{
             worker_id,
             worker_pids[worker_id],
@@ -190,19 +183,17 @@ fn spawnWorkers(allocator: std.mem.Allocator, config: WorkerConfig) !void {
     while (true) {
         const result = posix.waitpid(-1, 0);
         if (result.pid > 0) {
-            try restartWorker(config, worker_pids, result.pid);
+            try restartWorker(&config, worker_pids, result.pid);
         }
     }
 }
 
 // Fork a single worker process
-fn forkWorker(config: WorkerConfig, worker_id: usize) !posix.pid_t {
+fn forkWorker(config: *const LoadBalancerConfig, worker_id: usize) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
-        var worker_config = config;
-        worker_config.worker_id = worker_id;
         // CPU affinity is set INSIDE workerMain, AFTER Io.Threaded.init
-        workerMain(worker_config) catch |err| {
+        workerMain(config, worker_id) catch |err| {
             log.err("Worker {d} fatal: {s}", .{
                 worker_id,
                 @errorName(err),
@@ -216,7 +207,7 @@ fn forkWorker(config: WorkerConfig, worker_id: usize) !posix.pid_t {
 
 // Restart a crashed worker by finding it in the PID list
 fn restartWorker(
-    config: WorkerConfig,
+    config: *const LoadBalancerConfig,
     worker_pids: []posix.pid_t,
     crashed_pid: posix.pid_t,
 ) !void {
@@ -239,7 +230,7 @@ fn shutdown(_: std.c.SIG) callconv(.c) void {
     server.stop();
 }
 
-fn workerMain(config: WorkerConfig) !void {
+fn workerMain(config: *const LoadBalancerConfig, worker_id: usize) !void {
     // Thread-safe allocator since health probes run in separate thread
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
@@ -259,25 +250,32 @@ fn workerMain(config: WorkerConfig) !void {
     connection_pool.addBackends(backends.items.len);
 
     // Worker state (health state, circuit breaker, backend selector)
-    var worker_state = mp.WorkerState.init(&backends, &connection_pool, .{});
-    worker_state.setWorkerId(config.worker_id);
+    // Pass health check configuration from unified config
+    var worker_state = mp.WorkerState.init(&backends, &connection_pool, .{
+        .unhealthy_threshold = config.unhealthy_threshold,
+        .healthy_threshold = config.healthy_threshold,
+        .probe_interval_ms = config.probe_interval_ms,
+        .probe_timeout_ms = config.probe_timeout_ms,
+        .health_path = config.health_path,
+    });
+    worker_state.setWorkerId(worker_id);
 
     log.info("Worker {d}: Starting with {d} backends", .{
-        config.worker_id,
+        worker_id,
         backends.items.len,
     });
     log.debug("Worker {d}: Healthy count = {d}", .{
-        config.worker_id,
+        worker_id,
         worker_state.circuit_breaker.countHealthy(),
     });
 
     // Start health probe thread (runs blocking I/O in separate thread)
     const health_thread = health.startHealthProbes(
         &worker_state,
-        config.worker_id,
+        worker_id,
     ) catch |err| {
         log.err("Worker {d}: Failed to start health probes: {s}", .{
-            config.worker_id,
+            worker_id,
             @errorName(err),
         });
         return err;
@@ -300,7 +298,7 @@ fn workerMain(config: WorkerConfig) !void {
     const io = threaded.io();
 
     // Now safe to set CPU affinity (after Io.Threaded has captured cpu count)
-    setCpuAffinity(config.worker_id) catch {};
+    setCpuAffinity(worker_id) catch {};
 
     // Router
     var router = switch (config.strategy) {
@@ -317,7 +315,7 @@ fn workerMain(config: WorkerConfig) !void {
     defer socket.deinit(io);
 
     log.info("Worker {d}: Listening on {s}:{d}", .{
-        config.worker_id,
+        worker_id,
         config.host,
         config.port,
     });
