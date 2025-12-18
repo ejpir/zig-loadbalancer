@@ -1,69 +1,61 @@
 /// Lock-Free Metrics Collection and Prometheus Export
-/// 
+///
 /// Thread-safe metrics collection using atomic counters for high-performance monitoring.
-/// Provides real-time visibility into load balancer performance and health status.
 const std = @import("std");
 const log = std.log.scoped(.metrics);
 const zzz = @import("zzz");
 const http = zzz.HTTP;
 const Context = http.Context;
 const Respond = http.Respond;
-const arena_memory = @import("../memory/arena_memory_manager.zig");
 
 /// Simple global metrics collector with atomic counters
 pub const MetricsCollector = struct {
     /// Total requests processed
     requests_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    
+
     /// Total request duration in milliseconds
     request_duration_total_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    
+
     /// Total successful requests (2xx status)
     requests_success_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    
+
     /// Total failed requests (4xx/5xx status)
     requests_error_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    
+
     /// Total backend health checks
     health_checks_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    
+
     /// Total healthy backends (current count)
     backends_healthy: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    
+
     /// Total unhealthy backends (current count)
     backends_unhealthy: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    
+
     /// Record a request with duration and status
     pub fn recordRequest(self: *MetricsCollector, duration_ms: i64, status_code: u16) void {
         _ = self.requests_total.fetchAdd(1, .monotonic);
         _ = self.request_duration_total_ms.fetchAdd(@intCast(duration_ms), .monotonic);
-        
+
         if (status_code >= 200 and status_code < 300) {
             _ = self.requests_success_total.fetchAdd(1, .monotonic);
         } else if (status_code >= 400) {
             _ = self.requests_error_total.fetchAdd(1, .monotonic);
         }
     }
-    
+
     /// Record a health check
     pub fn recordHealthCheck(self: *MetricsCollector) void {
         _ = self.health_checks_total.fetchAdd(1, .monotonic);
     }
-    
+
     /// Update healthy and unhealthy backend counts
     pub fn updateHealthyBackends(self: *MetricsCollector, healthy_count: u64, unhealthy_count: u64) void {
         self.backends_healthy.store(healthy_count, .release);
         self.backends_unhealthy.store(unhealthy_count, .release);
     }
-    
-    /// Generate Prometheus format metrics using arena allocation
-    pub fn toPrometheusFormat(self: *MetricsCollector, base_allocator: std.mem.Allocator) ![]u8 {
-        // Use arena allocation for metrics formatting (FIXED: thread-safe implementation)
-        var metrics_arena = arena_memory.MetricsArena.init(base_allocator);
-        defer metrics_arena.deinit(); // Bulk deallocation - super fast!
-        
-        const allocator = metrics_arena.allocator();
-        
+
+    /// Generate Prometheus format metrics
+    pub fn toPrometheusFormat(self: *MetricsCollector, allocator: std.mem.Allocator) ![]u8 {
         const requests_total = self.requests_total.load(.acquire);
         const duration_total = self.request_duration_total_ms.load(.acquire);
         const requests_success = self.requests_success_total.load(.acquire);
@@ -71,15 +63,14 @@ pub const MetricsCollector = struct {
         const health_checks = self.health_checks_total.load(.acquire);
         const healthy_backends = self.backends_healthy.load(.acquire);
         const unhealthy_backends = self.backends_unhealthy.load(.acquire);
-        
+
         // Calculate average response time
-        const avg_response_time = if (requests_total > 0) 
+        const avg_response_time = if (requests_total > 0)
             @as(f64, @floatFromInt(duration_total)) / @as(f64, @floatFromInt(requests_total)) / 1000.0
-        else 
+        else
             0.0;
-        
-        // Format metrics using arena (no individual allocation/deallocation overhead!)
-        const metrics_output = try std.fmt.allocPrint(allocator,
+
+        return std.fmt.allocPrint(allocator,
             \\# HELP zzz_lb_requests_total Total number of requests processed
             \\# TYPE zzz_lb_requests_total counter
             \\zzz_lb_requests_total {d}
@@ -109,9 +100,6 @@ pub const MetricsCollector = struct {
             \\zzz_lb_backends_unhealthy {d}
             \\
         , .{ requests_total, requests_success, requests_error, avg_response_time, health_checks, healthy_backends, unhealthy_backends });
-        
-        // Copy the result to base allocator since arena will be reset
-        return base_allocator.dupe(u8, metrics_output);
     }
 };
 
@@ -129,7 +117,7 @@ pub fn metricsHandler(ctx: *const Context, data: void) !Respond {
             .body = "Failed to generate metrics",
         });
     };
-    
+
     return ctx.response.apply(.{
         .status = .@"OK",
         .mime = http.Mime.TEXT,

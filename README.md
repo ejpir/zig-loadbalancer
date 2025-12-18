@@ -1,6 +1,6 @@
 # Zig Load Balancer
 
-A high-performance HTTP load balancer implemented in Zig using zzz.io (Zig 0.16's native async I/O). Features nginx-style multi-process architecture, SIMD-accelerated parsing, and lock-free data structures.
+A high-performance HTTP/HTTPS load balancer implemented in Zig using zzz.io (Zig 0.16's native async I/O). Features nginx-style multi-process architecture, TLS termination to HTTPS backends, SIMD-accelerated parsing, and lock-free data structures.
 
 **Requirements:** Zig 0.16.0+
 
@@ -319,31 +319,86 @@ Failover happens in ~1-3 seconds when primary dies.
 ./zig-out/bin/load_balancer_mp -b 192.168.1.10:8080 -b 192.168.1.11:8080
 ```
 
+## TLS/HTTPS Support
+
+The load balancer supports both HTTP and HTTPS backends automatically.
+
+### HTTPS Backends
+Backends on port 443 are automatically connected via TLS:
+```bash
+# Proxy to HTTPS backend (e.g., httpbin.org)
+./zig-out/bin/load_balancer_mp -b httpbin.org:443 -p 8080
+
+# Test it
+curl http://localhost:8080/ip
+```
+
+### Mixed Backends
+You can mix HTTP and HTTPS backends:
+```bash
+# Mix local HTTP and remote HTTPS backends
+./zig-out/bin/load_balancer_mp \
+  -b localhost:9001 \
+  -b httpbin.org:443 \
+  -p 8080
+```
+
+### TLS Implementation
+- Uses [ianic/tls.zig](https://github.com/ianic/tls.zig) for TLS 1.2/1.3
+- System CA trust store for certificate verification
+- Async I/O via `std.Io` (io_uring/kqueue)
+- Automatic protocol detection based on port (443 = HTTPS)
+
+### Architecture
+```
+Client ──► Load Balancer ──► Backend (HTTP or HTTPS)
+           (HTTP)              │
+                               ├── Port 80/8080: Plain TCP
+                               └── Port 443: TLS encrypted
+```
+
+The load balancer accepts plain HTTP from clients and can proxy to either HTTP or HTTPS backends. TLS connections to backends use the system CA bundle for certificate verification.
+
 ## Project Structure
 
 ```
-├── main_multiprocess.zig       # Multi-process entry point
+├── main_multiprocess.zig       # Multi-process entry point (recommended)
+├── main_singleprocess.zig      # Single-process threaded entry point
 ├── backend1.zig                # Test backend server 1
 ├── backend2.zig                # Test backend server 2
 ├── src/
-│   ├── multiprocess/           # Multi-process module
-│   │   ├── mod.zig             # Re-exports
-│   │   ├── worker_state.zig    # WorkerState (circuit breaker, backend selection)
-│   │   ├── health_state.zig    # Health bitmap (u64-based)
+│   ├── core/
+│   │   └── types.zig           # BackendServer, LoadBalancerStrategy
+│   ├── http/
+│   │   ├── ultra_sock.zig      # HTTP/HTTPS socket with TLS support
+│   │   └── http_utils.zig      # RFC 7230 message length detection
+│   ├── internal/
+│   │   └── simd_parse.zig      # SIMD header/chunk boundary detection
+│   ├── memory/
+│   │   └── simple_connection_pool.zig  # Lock-free connection pooling
+│   ├── multiprocess/
+│   │   ├── mod.zig             # Module re-exports
+│   │   ├── proxy.zig           # Streaming proxy with failover
+│   │   ├── worker_state.zig    # Per-worker state management
 │   │   ├── circuit_breaker.zig # Circuit breaker pattern
-│   │   ├── backend_selector.zig# Backend selection strategies
-│   │   ├── proxy.zig           # Streaming proxy, failover
-│   │   ├── health.zig          # Background health probe thread
-│   │   └── integration_test.zig# Integration tests
-│   ├── core/                   # Core types
-│   ├── memory/                 # Connection pools
-│   ├── internal/               # SIMD parsing
-│   └── http/                   # HTTP utilities
+│   │   ├── backend_selector.zig# Load balancing strategies
+│   │   ├── health_state.zig    # Health bitmap (u64-based)
+│   │   ├── health.zig          # Background health probes
+│   │   └── connection_reuse.zig# Keep-alive detection
+│   ├── utils/
+│   │   └── metrics.zig         # Prometheus metrics endpoint
+│   └── test_load_balancer.zig  # Unit test runner
+├── vendor/
+│   ├── zzz.io/                 # HTTP framework (vendored)
+│   └── tls/                    # TLS 1.2/1.3 library (vendored)
 ```
 
 ## Dependencies
 
+All dependencies are vendored (no network fetch required):
+
 - **zzz.io** - HTTP framework using Zig 0.16's native `std.Io` async runtime (io_uring on Linux, kqueue on macOS)
+- **ianic/tls.zig** - TLS 1.2/1.3 implementation with system CA support
 
 ## Building
 
