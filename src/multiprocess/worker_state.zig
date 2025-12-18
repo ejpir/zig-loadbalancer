@@ -244,7 +244,6 @@ test "WorkerState: initialization marks all backends healthy" {
     try backends.append(allocator, types.BackendServer.init(host, 8003, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     const state = WorkerState.init(&backends, &pool, .{});
@@ -265,7 +264,6 @@ test "WorkerState: selectBackend round-robin" {
     try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -285,7 +283,6 @@ test "WorkerState: round-robin counter increments correctly" {
     try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -322,7 +319,6 @@ test "WorkerState: selectBackend skips unhealthy" {
     try backends.append(allocator, types.BackendServer.init(host, 8003, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -345,7 +341,6 @@ test "WorkerState: recordFailure trips circuit breaker" {
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{ .unhealthy_threshold = 2 });
@@ -368,7 +363,6 @@ test "WorkerState: recordSuccess recovers backend" {
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{ .healthy_threshold = 2 });
@@ -394,7 +388,6 @@ test "WorkerState: findHealthyBackend for failover" {
     try backends.append(allocator, types.BackendServer.init(host, 8003, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -419,7 +412,6 @@ test "WorkerState: getBackend bounds check" {
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     const state = WorkerState.init(&backends, &pool, .{});
@@ -435,7 +427,6 @@ test "WorkerState: empty backends" {
     defer backends.deinit(allocator);
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -453,7 +444,6 @@ test "WorkerState: random_state initialized on init" {
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     const state = WorkerState.init(&backends, &pool, .{});
@@ -473,7 +463,6 @@ test "WorkerState: random_state persists across selections" {
     try backends.append(allocator, types.BackendServer.init(host, 8003, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -507,7 +496,6 @@ test "WorkerState: random selection produces varied results" {
     }
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -536,7 +524,6 @@ test "WorkerState: different worker_ids produce different random sequences" {
     }
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     // Create two workers with same initial seed but different IDs

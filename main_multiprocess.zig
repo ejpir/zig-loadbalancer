@@ -247,7 +247,6 @@ fn workerMain(config: WorkerConfig) !void {
 
     // Connection pool
     var connection_pool = simple_pool.SimpleConnectionPool{};
-    connection_pool.init();
     defer connection_pool.deinit();
 
     // Backends

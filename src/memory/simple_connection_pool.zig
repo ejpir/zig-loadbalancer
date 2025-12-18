@@ -76,29 +76,14 @@ pub const SimpleConnectionPool = struct {
     pools: [MAX_BACKENDS]SimpleConnectionStack = [_]SimpleConnectionStack{.{}} ** MAX_BACKENDS,
     /// Number of active backends
     backend_count: usize = 0,
-    /// Initialized flag
-    initialized: bool = false,
     /// Single mutex (simpler, better cache locality)
     mutex: std.Thread.Mutex = .{},
 
-    /// Initialize the pool
-    pub fn init(self: *SimpleConnectionPool) void {
-        for (&self.pools) |*pool| {
-            pool.* = SimpleConnectionStack{};
-        }
-        self.backend_count = 0;
-        self.initialized = true;
-        self.mutex = .{};
-    }
-
     /// Deinitialize and close all connections
     pub fn deinit(self: *SimpleConnectionPool) void {
-        if (!self.initialized) return;
-
         for (0..self.backend_count) |i| {
             self.pools[i].closeAll();
         }
-        self.initialized = false;
     }
 
     /// Add backends to the pool
@@ -254,18 +239,16 @@ test "SimpleConnectionStack: push after pop" {
     try std.testing.expectEqual(@as(usize, 2), stack.size());
 }
 
-test "SimpleConnectionPool: init sets up correctly" {
+test "SimpleConnectionPool: default initialization" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
-    try std.testing.expect(pool.initialized);
     try std.testing.expectEqual(@as(usize, 0), pool.backend_count);
+    try std.testing.expectEqual(@as(usize, 0), pool.pools[0].size());
 }
 
 test "SimpleConnectionPool: addBackends sets count" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     pool.addBackends(5);
@@ -274,7 +257,6 @@ test "SimpleConnectionPool: addBackends sets count" {
 
 test "SimpleConnectionPool: addBackends caps at MAX_BACKENDS" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     pool.addBackends(100);
@@ -283,7 +265,6 @@ test "SimpleConnectionPool: addBackends caps at MAX_BACKENDS" {
 
 test "SimpleConnectionPool: getConnection returns null for empty pool" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
     pool.addBackends(2);
 
@@ -293,7 +274,6 @@ test "SimpleConnectionPool: getConnection returns null for empty pool" {
 
 test "SimpleConnectionPool: getConnection returns null for invalid backend" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
     pool.addBackends(2);
 
@@ -303,7 +283,6 @@ test "SimpleConnectionPool: getConnection returns null for invalid backend" {
 
 test "SimpleConnectionPool: returnConnection and getConnection round-trip" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
     pool.addBackends(2);
 
@@ -322,7 +301,6 @@ test "SimpleConnectionPool: returnConnection and getConnection round-trip" {
 
 test "SimpleConnectionPool: connections are per-backend" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
     pool.addBackends(3);
 
@@ -345,7 +323,6 @@ test "SimpleConnectionPool: connections are per-backend" {
 
 test "SimpleConnectionPool: returnConnection to invalid backend is handled" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
     pool.addBackends(1);
 
@@ -358,7 +335,6 @@ test "SimpleConnectionPool: returnConnection to invalid backend is handled" {
 
 test "SimpleConnectionPool: getStats tracks pool sizes" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
     pool.addBackends(3);
 
@@ -378,7 +354,6 @@ test "SimpleConnectionPool: getStats tracks pool sizes" {
 
 test "SimpleConnectionPool: getStats on empty pool" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
     pool.addBackends(2);
 
@@ -390,7 +365,6 @@ test "SimpleConnectionPool: getStats on empty pool" {
 
 test "SimpleConnectionPool: multiple connections per backend" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
     pool.addBackends(1);
 
@@ -410,24 +384,14 @@ test "SimpleConnectionPool: multiple connections per backend" {
     try std.testing.expect(pool.getConnection(0) == null);
 }
 
-test "SimpleConnectionPool: deinit without init is safe" {
+test "SimpleConnectionPool: deinit on empty pool is safe" {
     var pool = SimpleConnectionPool{};
     // Should not crash
     pool.deinit();
 }
 
-test "SimpleConnectionPool: double init is safe" {
-    var pool = SimpleConnectionPool{};
-    pool.init();
-    pool.init(); // Should reinitialize
-    defer pool.deinit();
-
-    try std.testing.expect(pool.initialized);
-}
-
 test "SimpleConnectionPool: TLS sockets can be pooled" {
     var pool = SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
     pool.addBackends(1);
 
