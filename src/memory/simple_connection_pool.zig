@@ -424,3 +424,47 @@ test "SimpleConnectionPool: double init is safe" {
 
     try std.testing.expect(pool.initialized);
 }
+
+test "SimpleConnectionPool: TLS sockets can be pooled" {
+    var pool = SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+    pool.addBackends(1);
+
+    // Create a mock TLS socket using UltraSock.init
+    const tls_sock = UltraSock.init(.https, "secure.example.com", 443);
+
+    // Pool the TLS socket
+    pool.returnConnection(0, tls_sock);
+
+    // Retrieve it
+    const retrieved = pool.getConnection(0);
+    try std.testing.expect(retrieved != null);
+    try std.testing.expectEqualStrings("secure.example.com", retrieved.?.host);
+    try std.testing.expectEqual(@as(u16, 443), retrieved.?.port);
+}
+
+test "SimpleConnectionStack: multiple TLS connections" {
+    var stack = SimpleConnectionStack{};
+
+    // Create multiple TLS sockets using UltraSock.init
+    const sock1 = UltraSock.init(.https, "api1.example.com", 443);
+    const sock2 = UltraSock.init(.https, "api2.example.com", 443);
+
+    // Push both TLS sockets
+    _ = stack.push(sock1);
+    _ = stack.push(sock2);
+
+    try std.testing.expectEqual(@as(usize, 2), stack.size());
+
+    // Pop in LIFO order
+    const popped2 = stack.pop();
+    try std.testing.expect(popped2 != null);
+    try std.testing.expectEqualStrings("api2.example.com", popped2.?.host);
+
+    const popped1 = stack.pop();
+    try std.testing.expect(popped1 != null);
+    try std.testing.expectEqualStrings("api1.example.com", popped1.?.host);
+
+    try std.testing.expectEqual(@as(usize, 0), stack.size());
+}

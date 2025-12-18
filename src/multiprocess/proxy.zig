@@ -32,8 +32,8 @@ const tls = @import("tls");
 
 /// Maximum backends supported (must match health_state.MAX_BACKENDS).
 const MAX_BACKENDS: u32 = 64;
-/// Maximum request buffer size in bytes.
-const MAX_REQUEST_BYTES: u32 = 1024;
+/// Maximum request header buffer size in bytes (excludes body).
+const MAX_REQUEST_HEADER_BYTES: u32 = 8192;
 /// Maximum header buffer size in bytes.
 const MAX_HEADER_BYTES: u32 = 8192;
 /// Maximum body chunk buffer size in bytes.
@@ -46,6 +46,8 @@ const MAX_BODY_READ_ITERATIONS: u32 = 1_000_000;
 const MAX_HEADER_LINES: u32 = 256;
 /// Nanoseconds per millisecond for time conversion.
 const NS_PER_MS: u64 = 1_000_000;
+/// Maximum number of hop-by-hop headers.
+const MAX_HOP_BY_HOP_HEADERS: u32 = 8;
 
 // ============================================================================
 // Error Types
@@ -324,6 +326,7 @@ fn streamingProxy_acquireConnection(
         var pooled_sock = pooled_sock_const;
 
         metrics.global_metrics.recordPoolHit();
+        metrics.global_metrics.recordPoolHitForBackend(backend_idx);
         log.debug("[REQ {d}] POOL HIT backend={d}", .{ req_id, backend_idx });
 
         // TigerStyle: validate pooled connection.
@@ -349,6 +352,7 @@ fn streamingProxy_acquireConnection(
 
     // No pooled connection - create fresh.
     metrics.global_metrics.recordPoolMiss();
+    metrics.global_metrics.recordPoolMissForBackend(backend_idx);
     log.debug("[REQ {d}] POOL MISS backend={d}", .{ req_id, backend_idx });
 
     var sock = UltraSock.fromBackendServer(backend);
@@ -385,6 +389,104 @@ fn streamingProxy_acquireConnection(
 // Phase 2: Send Request (<70 lines)
 // ============================================================================
 
+/// Build HTTP request headers with client headers and body support.
+/// Filters out hop-by-hop headers and adds necessary headers for proxying.
+/// Exported for testing purposes.
+pub fn streamingProxy_buildRequestHeaders(
+    ctx: *const http.Context,
+    backend: *const types.BackendServer,
+    buffer: *[MAX_REQUEST_HEADER_BYTES]u8,
+) ![]const u8 {
+    // TigerStyle: explicit bounds checking.
+    var pos: u32 = 0;
+
+    // Write request line: METHOD URI HTTP/1.1\r\n
+    const method_str = @tagName(ctx.request.method orelse .GET);
+    const uri_str = ctx.request.uri orelse "/";
+    const request_line = try std.fmt.bufPrint(
+        buffer[pos..],
+        "{s} {s} HTTP/1.1\r\n",
+        .{ method_str, uri_str },
+    );
+    pos += @intCast(request_line.len);
+
+    // Write Host header
+    const host_header = try std.fmt.bufPrint(
+        buffer[pos..],
+        "Host: {s}:{d}\r\n",
+        .{ backend.getFullHost(), backend.port },
+    );
+    pos += @intCast(host_header.len);
+
+    // Hop-by-hop headers to skip (RFC 2616 Section 13.5.1)
+    const hop_by_hop = std.StaticStringMap(void).initComptime(.{
+        .{ "connection", {} },
+        .{ "keep-alive", {} },
+        .{ "transfer-encoding", {} },
+        .{ "te", {} },
+        .{ "trailer", {} },
+        .{ "upgrade", {} },
+        .{ "proxy-authorization", {} },
+        .{ "proxy-connection", {} },
+    });
+
+    // Forward client headers (except hop-by-hop)
+    var header_iter = ctx.request.headers.iterator();
+    var header_count: u32 = 0;
+    while (header_iter.next()) |entry| {
+        if (header_count >= MAX_HEADER_LINES) break;
+
+        const name = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+
+        // Convert to lowercase for comparison
+        var name_lower: [64]u8 = undefined;
+        const name_len: u32 = @min(@as(u32, @intCast(name.len)), 64);
+        for (name[0..name_len], 0..) |ch, i| {
+            name_lower[i] = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+        }
+
+        // Skip hop-by-hop headers and Host (already added)
+        if (hop_by_hop.get(name_lower[0..name_len]) != null) continue;
+        if (std.mem.eql(u8, name_lower[0..name_len], "host")) continue;
+
+        // Write header
+        const header = try std.fmt.bufPrint(
+            buffer[pos..],
+            "{s}: {s}\r\n",
+            .{ name, value },
+        );
+        pos += @intCast(header.len);
+        header_count += 1;
+    }
+
+    // Add Content-Length if body exists
+    if (ctx.request.body) |body| {
+        const content_len_header = try std.fmt.bufPrint(
+            buffer[pos..],
+            "Content-Length: {d}\r\n",
+            .{body.len},
+        );
+        pos += @intCast(content_len_header.len);
+    }
+
+    // Write Connection: keep-alive
+    const conn_header = "Connection: keep-alive\r\n";
+    @memcpy(buffer[pos..][0..conn_header.len], conn_header);
+    pos += conn_header.len;
+
+    // End headers with \r\n
+    buffer[pos] = '\r';
+    buffer[pos + 1] = '\n';
+    pos += 2;
+
+    // TigerStyle: pair assertion on output.
+    std.debug.assert(pos > 0);
+    std.debug.assert(pos <= MAX_REQUEST_HEADER_BYTES);
+
+    return buffer[0..pos];
+}
+
 fn streamingProxy_sendRequest(
     ctx: *const http.Context,
     backend: *const types.BackendServer,
@@ -397,21 +499,18 @@ fn streamingProxy_sendRequest(
 
     // Prevent data leaks if error occurs mid-formatting, deterministic debugging.
     // Safe undefined: buffer fully written by bufPrint before send.
-    var request_buf: [MAX_REQUEST_BYTES]u8 = undefined;
-    const fmt_str = "{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\n" ++
-        "Connection: keep-alive\r\n\r\n";
-    const request_data = std.fmt.bufPrint(&request_buf, fmt_str, .{
-        @tagName(ctx.request.method orelse .GET),
-        ctx.request.uri orelse "/",
-        backend.getFullHost(),
-        backend.port,
-    }) catch {
+    var request_buf: [MAX_REQUEST_HEADER_BYTES]u8 = undefined;
+    const request_data = streamingProxy_buildRequestHeaders(
+        ctx,
+        backend,
+        &request_buf,
+    ) catch {
         return ProxyError.ConnectionFailed;
     };
 
     // TigerStyle: pair assertion on output.
     std.debug.assert(request_data.len > 0);
-    std.debug.assert(request_data.len <= MAX_REQUEST_BYTES);
+    std.debug.assert(request_data.len <= MAX_REQUEST_HEADER_BYTES);
 
     log.debug("[REQ {d}] SENDING TO BACKEND ({s}): {s}", .{
         req_id,
@@ -422,9 +521,9 @@ fn streamingProxy_sendRequest(
     // TigerStyle: smallest scope - only create writer when needed.
     var send_ok = false;
     if (proxy_state.is_tls) {
-        send_ok = streamingProxy_sendRequest_tls(proxy_state, request_data, req_id);
+        send_ok = streamingProxy_sendRequest_tls(proxy_state, request_data, ctx.request.body, req_id);
     } else {
-        send_ok = streamingProxy_sendRequest_plain(ctx, proxy_state, request_data);
+        send_ok = streamingProxy_sendRequest_plain(ctx, proxy_state, request_data, ctx.request.body);
     }
 
     // Retry on stale pooled connection.
@@ -449,17 +548,32 @@ fn streamingProxy_sendRequest(
 fn streamingProxy_sendRequest_tls(
     proxy_state: *ProxyState,
     request_data: []const u8,
+    body: ?[]const u8,
     req_id: u32,
 ) bool {
     if (proxy_state.tls_conn_ptr) |tls_conn| {
-        log.debug("[REQ {d}] TLS writeAll {d} bytes...", .{
+        const total_len = request_data.len + if (body) |b| b.len else 0;
+        log.debug("[REQ {d}] TLS writeAll {d} bytes (hdr={d} body={d})...", .{
             req_id,
+            total_len,
             request_data.len,
+            if (body) |b| b.len else 0,
         });
+
+        // Send headers
         tls_conn.writeAll(request_data) catch |err| {
-            log.debug("[REQ {d}] TLS write failed: {}", .{ req_id, err });
+            log.debug("[REQ {d}] TLS header write failed: {}", .{ req_id, err });
             return false;
         };
+
+        // Send body if exists
+        if (body) |body_data| {
+            tls_conn.writeAll(body_data) catch |err| {
+                log.debug("[REQ {d}] TLS body write failed: {}", .{ req_id, err });
+                return false;
+            };
+        }
+
         log.debug("[REQ {d}] TLS send complete", .{req_id});
         return true;
     }
@@ -470,13 +584,22 @@ fn streamingProxy_sendRequest_plain(
     ctx: *const http.Context,
     proxy_state: *ProxyState,
     request_data: []const u8,
+    body: ?[]const u8,
 ) bool {
     const stream = proxy_state.sock.stream orelse return false;
     // Prevent data leaks if error occurs mid-write, deterministic debugging.
     // Safe undefined: buffer fully written by I/O before use.
     var write_buf: [MAX_BODY_CHUNK_BYTES]u8 = undefined;
     var writer = stream.writer(ctx.io, &write_buf);
+
+    // Send headers
     writer.interface.writeAll(request_data) catch return false;
+
+    // Send body if exists
+    if (body) |body_data| {
+        writer.interface.writeAll(body_data) catch return false;
+    }
+
     writer.interface.flush() catch return false;
     return true;
 }
@@ -502,10 +625,13 @@ fn streamingProxy_sendRequest_retry(
     proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
     proxy_state.is_tls = proxy_state.sock.isTls();
 
+    // Get body from ctx for retry
+    const body = ctx.request.body;
+
     if (proxy_state.is_tls) {
-        return streamingProxy_sendRequest_tls(proxy_state, request_data, req_id);
+        return streamingProxy_sendRequest_tls(proxy_state, request_data, body, req_id);
     } else {
-        return streamingProxy_sendRequest_plain(ctx, proxy_state, request_data);
+        return streamingProxy_sendRequest_plain(ctx, proxy_state, request_data, body);
     }
 }
 
@@ -986,10 +1112,34 @@ fn streamingProxy_finalize(
     metrics.global_metrics.recordRequest(elapsed_ms, proxy_state.status_code);
     metrics.global_metrics.recordBytes(proxy_state.bytes_from_backend, proxy_state.bytes_to_client);
 
+    // Record per-backend metrics
+    metrics.global_metrics.recordRequestForBackend(
+        backend_idx,
+        elapsed_ms,
+        proxy_state.status_code,
+    );
+    metrics.global_metrics.recordBytesForBackend(
+        backend_idx,
+        proxy_state.bytes_to_client, // bytes sent to backend
+        proxy_state.bytes_from_backend, // bytes received from backend
+    );
+
     // Next request's data would corrupt pool - must close connection.
+    // Check for buffered data in both TLS and plain HTTP connections.
     if (proxy_state.is_tls) {
-        proxy_state.can_return_to_pool = false;
+        // For TLS, check if there's buffered cleartext data in the TLS connection.
+        if (proxy_state.tls_conn_ptr) |tls_conn| {
+            const buffered_remaining = tls_conn.cleartext_buf.len;
+            if (buffered_remaining > 0) {
+                log.warn(
+                    "[REQ {d}] TLS BUFFERED DATA REMAINING: {d} bytes - NOT pooling",
+                    .{ req_id, buffered_remaining },
+                );
+                proxy_state.can_return_to_pool = false;
+            }
+        }
     } else if (proxy_state.sock.stream) |stream| {
+        // For plain HTTP, check the stream reader's buffer.
         // Safe undefined: buffer fully written by read before use.
         var read_buf: [MAX_BODY_CHUNK_BYTES]u8 = undefined;
         var reader = stream.reader(ctx.io, &read_buf);

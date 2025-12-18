@@ -52,6 +52,8 @@ pub const WorkerState = struct {
     // Actual request count for metrics
     total_requests: usize = 0,
     last_check_time: [MAX_BACKENDS]i64 = [_]i64{0} ** MAX_BACKENDS,
+    // Random state for load balancing (seeded once at init)
+    random_state: u64 = 0,
 
     /// Initialize worker state with backends
     pub fn init(
@@ -59,6 +61,17 @@ pub const WorkerState = struct {
         pool: *simple_pool.SimpleConnectionPool,
         config: Config,
     ) WorkerState {
+        // Seed random state from monotonic clock
+        const seed = blk: {
+            if (posix.clock_gettime(.MONOTONIC)) |ts| {
+                const nsec = @as(u64, @intCast(ts.nsec));
+                const sec = @as(u64, @intCast(ts.sec));
+                break :blk nsec ^ sec;
+            } else |_| {
+                break :blk 12345; // Fallback seed
+            }
+        };
+
         var state = WorkerState{
             .backends = backends,
             .connection_pool = pool,
@@ -69,6 +82,7 @@ pub const WorkerState = struct {
                 },
             },
             .config = config,
+            .random_state = if (seed == 0) 1 else seed,
         };
 
         // Mark all backends healthy initially
@@ -82,8 +96,14 @@ pub const WorkerState = struct {
     }
 
     /// Set worker ID (called from main after init)
+    /// Also mixes worker_id into random_state for unique sequences per worker
     pub fn setWorkerId(self: *WorkerState, id: usize) void {
         self.worker_id = id;
+        // Mix worker_id into the high bits to ensure different workers get different sequences
+        const id_bits: u64 = @intCast(id);
+        self.random_state ^= (id_bits << 32);
+        // Ensure non-zero
+        if (self.random_state == 0) self.random_state = 1;
     }
 
     /// Select a backend using the specified strategy
@@ -99,12 +119,21 @@ pub const WorkerState = struct {
             .health = &self.circuit_breaker.health,
             .backend_count = self.backends.items.len,
             .rr_counter = self.rr_state,
+            .random_state = self.random_state,
         };
+
+        // Copy backend weights for weighted round-robin
+        if (strategy == .weighted_round_robin) {
+            for (self.backends.items, 0..) |backend, i| {
+                selector.weights[i] = backend.weight;
+            }
+        }
 
         const selected = selector.select(strategy);
 
-        // Update round-robin state and request count
+        // Update state (round-robin counter, random state) and request count
         self.rr_state = selector.rr_counter;
+        self.random_state = selector.random_state;
         self.total_requests +%= 1;
 
         return selected;
@@ -413,4 +442,129 @@ test "WorkerState: empty backends" {
 
     try std.testing.expect(state.selectBackend(.round_robin) == null);
     try std.testing.expectEqual(@as(usize, 0), state.countHealthy());
+}
+
+test "WorkerState: random_state initialized on init" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    const state = WorkerState.init(&backends, &pool, .{});
+
+    // Random state should be non-zero after init
+    try std.testing.expect(state.random_state != 0);
+}
+
+test "WorkerState: random_state persists across selections" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+    try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
+    try backends.append(allocator, types.BackendServer.init(host, 8003, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    var state = WorkerState.init(&backends, &pool, .{});
+    const initial_state = state.random_state;
+
+    // Make a random selection
+    _ = state.selectBackend(.random);
+
+    // Random state should have changed (xorshift updated it)
+    try std.testing.expect(state.random_state != initial_state);
+    try std.testing.expect(state.random_state != 0);
+
+    const second_state = state.random_state;
+
+    // Make another selection
+    _ = state.selectBackend(.random);
+
+    // State should change again
+    try std.testing.expect(state.random_state != second_state);
+    try std.testing.expect(state.random_state != 0);
+}
+
+test "WorkerState: random selection produces varied results" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    for (0..10) |port| {
+        try backends.append(allocator, types.BackendServer.init(host, 8000 + @as(u16, @intCast(port)), 1));
+    }
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    var state = WorkerState.init(&backends, &pool, .{});
+
+    // Run many selections and verify distribution
+    var counts = [_]usize{0} ** 10;
+    for (0..1000) |_| {
+        const selected = state.selectBackend(.random) orelse unreachable;
+        counts[selected] += 1;
+    }
+
+    // Each backend should be selected at least once (statistical certainty)
+    for (counts) |count| {
+        try std.testing.expect(count > 0);
+    }
+}
+
+test "WorkerState: different worker_ids produce different random sequences" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    for (0..5) |port| {
+        try backends.append(allocator, types.BackendServer.init(host, 8000 + @as(u16, @intCast(port)), 1));
+    }
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    // Create two workers with same initial seed but different IDs
+    var state1 = WorkerState.init(&backends, &pool, .{});
+    var state2 = WorkerState.init(&backends, &pool, .{});
+
+    // Set different worker IDs
+    state1.setWorkerId(1);
+    state2.setWorkerId(2);
+
+    // Their random states should be different after setWorkerId
+    try std.testing.expect(state1.random_state != state2.random_state);
+
+    // Generate sequences from both
+    var seq1: [20]usize = undefined;
+    var seq2: [20]usize = undefined;
+
+    for (0..20) |i| {
+        seq1[i] = state1.selectBackend(.random) orelse unreachable;
+        seq2[i] = state2.selectBackend(.random) orelse unreachable;
+    }
+
+    // Sequences should differ (extremely unlikely to be identical)
+    var differences: usize = 0;
+    for (seq1, seq2) |s1, s2| {
+        if (s1 != s2) differences += 1;
+    }
+
+    // Expect at least some differences
+    try std.testing.expect(differences > 0);
 }

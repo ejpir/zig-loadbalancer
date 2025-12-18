@@ -2,6 +2,17 @@
 ///
 /// Periodic health probes check backend availability in background thread.
 /// Uses blocking I/O since probes run independently of request handling.
+///
+/// UNIFIED HEALTH MODEL:
+/// Health probes feed INTO the circuit breaker - they don't manipulate state directly.
+/// All health transitions go through circuit breaker thresholds:
+///   - Probe success → recordSuccess() → may recover backend after threshold
+///   - Probe failure → recordFailure() → may trip circuit breaker after threshold
+///   - Request success → recordSuccess() → same path as probe success
+///   - Request failure → recordFailure() → same path as probe failure
+///
+/// This ensures a single source of truth for backend health with no disagreement
+/// between probe state and circuit breaker state.
 const std = @import("std");
 const log = std.log.scoped(.health);
 const posix = std.posix;
@@ -30,31 +41,14 @@ fn healthProbeLoop(state: *WorkerState, worker_id: usize) void {
 
     while (true) {
         for (backends.items, 0..) |*backend, idx| {
-            const is_healthy = probeBackend(backend, config);
+            const probe_result = probeBackend(backend, config);
 
-            if (is_healthy) {
-                if (!state.isHealthy(idx)) {
-                    state.recordSuccess(idx);
-                    if (state.isHealthy(idx)) {
-                        log.warn(
-                            "Worker {d}: Backend {d} ({s}:{d}) now HEALTHY",
-                            .{ worker_id, idx + 1, backend.getFullHost(), backend.port },
-                        );
-                    }
-                } else {
-                    // Already healthy, reset failure count
-                    state.circuit_breaker.resetCounters(idx);
-                }
+            // Feed probe results into circuit breaker
+            // Circuit breaker handles all state transitions and logging
+            if (probe_result) {
+                state.recordSuccess(idx);
             } else {
-                if (state.isHealthy(idx)) {
-                    state.recordFailure(idx);
-                    if (!state.isHealthy(idx)) {
-                        log.warn(
-                            "Worker {d}: Backend {d} ({s}:{d}) now UNHEALTHY",
-                            .{ worker_id, idx + 1, backend.getFullHost(), backend.port },
-                        );
-                    }
-                }
+                state.recordFailure(idx);
             }
 
             state.updateProbeTime(idx);

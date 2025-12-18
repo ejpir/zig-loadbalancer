@@ -1,8 +1,13 @@
-/// Circuit Breaker
+/// Circuit Breaker - Single Source of Truth for Backend Health
 ///
 /// Threshold-based health state transitions.
 /// Backends transition to unhealthy after consecutive failures,
 /// and recover after consecutive successes.
+///
+/// This is the ONLY component that changes backend health state.
+/// Both health probes and request handlers feed results into the circuit breaker
+/// using recordSuccess() and recordFailure(). This ensures unified health tracking
+/// with no disagreement between different systems.
 const std = @import("std");
 const log = std.log.scoped(.circuit_breaker);
 
@@ -25,10 +30,10 @@ pub const CircuitBreaker = struct {
     consecutive_failures: [MAX_BACKENDS]u32 = [_]u32{0} ** MAX_BACKENDS,
     consecutive_successes: [MAX_BACKENDS]u32 = [_]u32{0} ** MAX_BACKENDS,
 
-    /// Record a successful request to a backend
+    /// Record a successful request or health probe to a backend
     /// Resets failure count. If backend was unhealthy, increments success count
-    /// and may transition to healthy state.
-    /// Hot path - called on every successful request
+    /// and may transition to healthy state after reaching threshold.
+    /// Hot path - called on every successful request/probe
     pub inline fn recordSuccess(self: *CircuitBreaker, idx: usize) void {
         if (idx >= MAX_BACKENDS) return;
 
@@ -49,10 +54,10 @@ pub const CircuitBreaker = struct {
         }
     }
 
-    /// Record a failed request to a backend
+    /// Record a failed request or health probe to a backend
     /// Resets success count. If backend was healthy, increments failure count
-    /// and may transition to unhealthy state.
-    /// Hot path - called on every failed request
+    /// and may transition to unhealthy state after reaching threshold.
+    /// Hot path - called on every failed request/probe
     pub inline fn recordFailure(self: *CircuitBreaker, idx: usize) void {
         if (idx >= MAX_BACKENDS) return;
 
