@@ -1,0 +1,20 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.0, pytest-9.0.2, pluggy-1.6.0 -- /Users/nick/repos/zzz/examples/load_balancer/tests/venv/bin/python3.14
+cachedir: .pytest_cache
+rootdir: /Users/nick/repos/zzz/examples/load_balancer/tests
+plugins: timeout-2.4.0
+collecting ... collected 18 items
+
+test_basic.py::test_get_request_forwarded PASSED                         [  5%]
+test_basic.py::test_post_request_with_body PASSED                        [ 11%]
+test_basic.py::test_put_request_with_body PASSED                         [ 16%]
+test_basic.py::test_patch_request_with_body PASSED                       [ 22%]
+test_basic.py::test_response_contains_request_info PASSED                [ 27%]
+test_body_forwarding.py::test_empty_body_post PASSED                     [ 33%]
+test_body_forwarding.py::test_large_body PASSED                          [ 38%]
+test_body_forwarding.py::test_json_body_preserved PASSED                 [ 44%]
+test_body_forwarding.py::test_binary_body PASSED                         [ 50%]
+test_body_forwarding.py::test_content_length_set_correctly PASSED        [ 55%]
+test_body_forwarding.py::test_multiple_sequential_posts PASSED           [ 61%]
+test_headers.py::test_content_type_forwarded PASSED                      [ 66%]
+test_headers.py::test_custom_header_forwarded 
