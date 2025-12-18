@@ -204,7 +204,7 @@ For simpler deployments or macOS (where SO_REUSEPORT doesn't provide kernel load
 │                                                             │
 │  ┌─────────────────┐    ┌─────────────────┐                │
 │  │  std.Io.Threaded │    │  Health Probe   │                │
-│  │   (thread pool)  │    │    Thread       │                │
+│  │  (async runtime) │    │    Thread       │                │
 │  └────────┬────────┘    └────────┬────────┘                │
 │           │                      │                          │
 │           ▼                      ▼                          │
@@ -254,11 +254,11 @@ main() ────────────────────────�
 
 | Aspect | Multi-Process | Single-Process |
 |--------|---------------|----------------|
-| **Concurrency** | fork() per worker | std.Io thread pool |
+| **Concurrency** | fork() per worker | std.Io.Threaded async runtime |
 | **Isolation** | Full process isolation | Shared memory |
 | **macOS support** | Limited (SO_REUSEPORT) | Full support |
 | **Memory** | Higher (process duplication) | Lower footprint |
-| **Connection pool** | Per-worker (no atomics) | Shared (thread-safe GPA) |
+| **Connection pool** | Per-worker (no locks) | Shared (GPA thread-safe) |
 | **Crash handling** | Master restarts workers | Process dies |
 | **Best for** | Linux production | macOS, simple deployments |
 
