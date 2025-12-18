@@ -32,7 +32,6 @@ test "integration: round-robin distributes requests evenly" {
     try backends.append(allocator, types.BackendServer.init(host, 8003, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -65,7 +64,6 @@ test "integration: failover redirects to healthy backend" {
     try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{ .unhealthy_threshold = 2 });
@@ -96,7 +94,6 @@ test "integration: recovery after consecutive successes" {
     try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{
@@ -129,7 +126,6 @@ test "integration: request count tracks actual requests" {
     try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -154,7 +150,6 @@ test "integration: all backends unhealthy returns null" {
     try backends.append(allocator, types.BackendServer.init(host, 8003, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{ .unhealthy_threshold = 1 });
@@ -183,7 +178,6 @@ test "integration: failure during recovery resets success counter" {
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{
@@ -222,7 +216,6 @@ test "integration: single backend down and recovery" {
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{
@@ -260,7 +253,6 @@ test "integration: mixed success/failure pattern" {
     try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{
@@ -308,7 +300,6 @@ test "integration: findHealthyBackend for failover excludes current" {
     try backends.append(allocator, types.BackendServer.init(host, 8003, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -347,7 +338,6 @@ test "integration: unified health - probe success recovers circuit-breaker-tripp
     try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{
@@ -387,7 +377,6 @@ test "integration: unified health - probe failure trips circuit breaker" {
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{
@@ -425,7 +414,6 @@ test "integration: unified health - no state disagreement" {
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{
@@ -461,7 +449,6 @@ test "integration: unified health - probe and request failures both count toward
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{
@@ -491,7 +478,6 @@ test "integration: unified health - probe success during healthy doesn't affect 
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{});
@@ -518,7 +504,6 @@ test "integration: unified health - probe failure resets success progress" {
     try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{
@@ -560,7 +545,6 @@ test "integration: unified health - mixed probe and request recovery" {
     try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
 
     var pool = simple_pool.SimpleConnectionPool{};
-    pool.init();
     defer pool.deinit();
 
     var state = WorkerState.init(&backends, &pool, .{

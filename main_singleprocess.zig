@@ -152,7 +152,6 @@ pub fn main() !void {
 
     // Connection pool (shared across all requests)
     var connection_pool = simple_pool.SimpleConnectionPool{};
-    connection_pool.init();
     defer connection_pool.deinit();
 
     // Backends
