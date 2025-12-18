@@ -28,7 +28,7 @@ const mp = @import("src/multiprocess/mod.zig");
 const health = @import("src/multiprocess/health.zig");
 
 pub const std_options: std.Options = .{
-    .log_level = .err,
+    .log_level = .debug,
 };
 
 // ============================================================================
@@ -213,13 +213,16 @@ fn workerMain(config: WorkerConfig) !void {
     worker_state.setWorkerId(config.worker_id);
 
     log.info("Worker {d}: Starting with {d} backends", .{ config.worker_id, backends.items.len });
+    log.debug("Worker {d}: Healthy count = {d}", .{ config.worker_id, worker_state.circuit_breaker.countHealthy() });
 
     // Start health probe thread
-    const health_thread = health.startHealthProbes(&worker_state, config.worker_id) catch |err| {
-        log.err("Worker {d}: Failed to start health probes: {s}", .{ config.worker_id, @errorName(err) });
-        return err;
-    };
-    defer health_thread.detach();
+    // TODO: Re-enable after fixing DNS/TLS support in health probes
+    // const health_thread = health.startHealthProbes(&worker_state, config.worker_id) catch |err| {
+    //     log.err("Worker {d}: Failed to start health probes: {s}", .{ config.worker_id, @errorName(err) });
+    //     return err;
+    // };
+    // defer health_thread.detach();
+    _ = &worker_state; // silence unused warning
 
     // Signal handling
     posix.sigaction(posix.SIG.TERM, &.{
@@ -267,6 +270,7 @@ fn createRouter(allocator: std.mem.Allocator, state: *mp.WorkerState, comptime s
     return try Router.init(allocator, &.{
         Route.init("/metrics").get({}, metrics.metricsHandler).layer(),
         Route.init("/").all(state, mp.generateHandler(strategy)).layer(),
+        Route.init("/%r").all(state, mp.generateHandler(strategy)).layer(), // Catch-all for proxy
     }, .{});
 }
 
