@@ -21,6 +21,7 @@ const Router = http.Router;
 const Route = http.Route;
 
 const types = @import("src/core/types.zig");
+const config_mod = @import("src/core/config.zig");
 const simple_pool = @import("src/memory/simple_connection_pool.zig");
 const metrics = @import("src/utils/metrics.zig");
 const mp = @import("src/multiprocess/mod.zig");
@@ -34,24 +35,14 @@ pub const std_options: std.Options = .{
 // Configuration
 // ============================================================================
 
-const BackendDef = struct {
-    host: []const u8,
-    port: u16,
-    weight: u16 = 1,
-};
-
-const CliConfig = struct {
-    port: u16,
-    host: []const u8,
-    strategy: types.LoadBalancerStrategy,
-    backends: []BackendDef,
-};
+const LoadBalancerConfig = config_mod.LoadBalancerConfig;
+const BackendDef = config_mod.BackendDef;
 
 // ============================================================================
 // CLI Parsing
 // ============================================================================
 
-fn parseArgs(allocator: std.mem.Allocator) !CliConfig {
+fn parseArgs(allocator: std.mem.Allocator) !LoadBalancerConfig {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -127,6 +118,7 @@ fn parseArgs(allocator: std.mem.Allocator) !CliConfig {
         .host = host,
         .strategy = strategy,
         .backends = try backend_list.toOwnedSlice(allocator),
+        // worker_count is ignored in single-process mode, use default
     };
 }
 
@@ -145,10 +137,11 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    const cli = try parseArgs(allocator);
-    defer allocator.free(cli.backends);
+    const config = try parseArgs(allocator);
+    defer allocator.free(config.backends);
 
-    const backend_defs = cli.backends;
+    // Validate configuration
+    try config.validate();
 
     // Connection pool (shared across all requests)
     var connection_pool = simple_pool.SimpleConnectionPool{};
@@ -158,19 +151,26 @@ pub fn main() !void {
     var backends: types.BackendsList = .empty;
     defer backends.deinit(allocator);
 
-    for (backend_defs) |b| {
+    for (config.backends) |b| {
         try backends.append(allocator, types.BackendServer.init(b.host, b.port, b.weight));
     }
     connection_pool.addBackends(backends.items.len);
 
     // Worker state (health state, circuit breaker, backend selector)
-    var worker_state = mp.WorkerState.init(&backends, &connection_pool, .{});
+    // Pass health check configuration from unified config
+    var worker_state = mp.WorkerState.init(&backends, &connection_pool, .{
+        .unhealthy_threshold = config.unhealthy_threshold,
+        .healthy_threshold = config.healthy_threshold,
+        .probe_interval_ms = config.probe_interval_ms,
+        .probe_timeout_ms = config.probe_timeout_ms,
+        .health_path = config.health_path,
+    });
     worker_state.setWorkerId(0);
 
     log.warn("=== Single-Process Load Balancer ===", .{});
     log.warn("Listen: {s}:{d}, Backends: {d}", .{
-        cli.host,
-        cli.port,
+        config.host,
+        config.port,
         backends.items.len,
     });
     for (backends.items, 0..) |b, idx| {
@@ -190,20 +190,20 @@ pub fn main() !void {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var router = switch (cli.strategy) {
+    var router = switch (config.strategy) {
         inline else => |s| try createRouter(allocator, &worker_state, s),
     };
     defer router.deinit(allocator);
 
     // No SO_REUSEPORT needed for single process
-    const addr = try Io.net.IpAddress.parse(cli.host, cli.port);
+    const addr = try Io.net.IpAddress.parse(config.host, config.port);
     var socket = try addr.listen(io, .{
         .kernel_backlog = 4096,
         .reuse_address = true,
     });
     defer socket.deinit(io);
 
-    log.warn("Listening on {s}:{d}", .{ cli.host, cli.port });
+    log.warn("Listening on {s}:{d}", .{ config.host, config.port });
 
     server = try Server.init(allocator, .{
         .socket_buffer_bytes = 1024 * 32,
