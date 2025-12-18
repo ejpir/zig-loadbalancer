@@ -66,6 +66,7 @@ inline fn proxyWithFailover(ctx: *const http.Context, primary_idx: usize, state:
 
         if (state.findHealthyBackend(primary_idx)) |failover_idx| {
             log.debug("Failing over to backend {d}", .{failover_idx + 1});
+            metrics.global_metrics.recordFailover();
 
             if (streamingProxy(ctx, &backends.items[failover_idx], failover_idx, state)) |response| {
                 state.recordSuccess(failover_idx);
@@ -80,18 +81,9 @@ inline fn proxyWithFailover(ctx: *const http.Context, primary_idx: usize, state:
     }
 }
 
-// Debug counters (per-worker, no atomics needed) - only in debug builds
+// Debug mode flag for verbose logging
 const enable_debug_counters = @import("builtin").mode == .Debug;
-var debug_pool_hits: usize = 0;
-var debug_pool_misses: usize = 0;
-var debug_stale_connections: usize = 0;
-var debug_send_failures: usize = 0;
-var debug_read_failures: usize = 0;
 var debug_request_count: usize = 0;
-
-inline fn incrementCounter(counter: *usize) void {
-    if (enable_debug_counters) counter.* += 1;
-}
 
 inline fn getRequestId() usize {
     if (enable_debug_counters) {
@@ -103,11 +95,8 @@ inline fn getRequestId() usize {
 
 /// Streaming proxy implementation
 inline fn streamingProxy(ctx: *const http.Context, backend: *const types.BackendServer, backend_idx: usize, state: *WorkerState) ProxyError!http.Respond {
-    // Only track timing in debug builds
-    const start_instant = if (enable_debug_counters)
-        std.time.Instant.now() catch null
-    else
-        null;
+    // Track request timing for metrics
+    const start_instant = std.time.Instant.now() catch null;
 
     const req_id = getRequestId();
 
@@ -116,19 +105,6 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
         ctx.request.uri orelse "/",
         @tagName(ctx.request.method orelse .GET),
     });
-
-    // Log stats periodically (only in debug builds)
-    if (enable_debug_counters and debug_request_count % 10000 == 0) {
-        log.warn("Worker {d}: reqs={d} pool_hits={d} pool_misses={d} stale={d} send_fail={d} read_fail={d}", .{
-            state.worker_id,
-            debug_request_count,
-            debug_pool_hits,
-            debug_pool_misses,
-            debug_stale_connections,
-            debug_send_failures,
-            debug_read_failures,
-        });
-    }
 
     // Try to get a pooled connection first, or create a fresh one
     var sock: UltraSock = undefined;
@@ -141,7 +117,7 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
         if (state.connection_pool.getConnection(backend_idx)) |pooled_sock| {
             sock = pooled_sock;
             from_pool = true;
-            incrementCounter(&debug_pool_hits);
+            metrics.global_metrics.recordPoolHit();
             log.debug("[REQ {d}] POOL HIT backend={d}", .{ req_id, backend_idx });
             // NOTE: Removed hasStaleData() poll syscall here.
             // Stale connections are detected on write failure and retried.
@@ -149,7 +125,7 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
     }
 
     if (!from_pool) {
-        incrementCounter(&debug_pool_misses);
+        metrics.global_metrics.recordPoolMiss();
         log.debug("[REQ {d}] POOL MISS backend={d}", .{ req_id, backend_idx });
         sock = UltraSock.fromBackendServer(ctx.allocator, backend) catch return ProxyError.ConnectionFailed;
         sock.connect(ctx.io) catch {
@@ -226,7 +202,7 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
 
     // If send failed on pooled connection, retry with fresh connection
     if (!send_ok and from_pool) {
-        incrementCounter(&debug_stale_connections);
+        metrics.global_metrics.recordStaleConnection();
         log.debug("[REQ {d}] Pooled conn stale on write, retrying with fresh", .{req_id});
         sock.close_blocking();
 
@@ -256,29 +232,29 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
         if (fresh_is_tls) {
             if (tls_conn_ptr) |tls_conn| {
                 tls_conn.writeAll(request_data) catch {
-                    incrementCounter(&debug_send_failures);
+                    metrics.global_metrics.recordSendFailure();
                     sock.close_blocking();
                     return ProxyError.SendFailed;
                 };
             } else {
-                incrementCounter(&debug_send_failures);
+                metrics.global_metrics.recordSendFailure();
                 sock.close_blocking();
                 return ProxyError.SendFailed;
             }
         } else {
             plain_writer.interface.writeAll(request_data) catch {
-                incrementCounter(&debug_send_failures);
+                metrics.global_metrics.recordSendFailure();
                 sock.close_blocking();
                 return ProxyError.SendFailed;
             };
             plain_writer.interface.flush() catch {
-                incrementCounter(&debug_send_failures);
+                metrics.global_metrics.recordSendFailure();
                 sock.close_blocking();
                 return ProxyError.SendFailed;
             };
         }
     } else if (!send_ok) {
-        incrementCounter(&debug_send_failures);
+        metrics.global_metrics.recordSendFailure();
         sock.close_blocking();
         return ProxyError.SendFailed;
     }
@@ -299,8 +275,8 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
                 log.debug("[REQ {d}] TLS reading (header_len={d})...", .{ req_id, header_len });
                 n = tls_conn.read(header_buffer[header_len..]) catch |err| {
                     log.debug("[REQ {d}] TLS read error: {}", .{ req_id, err });
-                    incrementCounter(&debug_read_failures);
-                    if (from_pool) incrementCounter(&debug_stale_connections);
+                    metrics.global_metrics.recordReadFailure();
+                    if (from_pool) metrics.global_metrics.recordStaleConnection();
                     sock.close_blocking();
                     return ProxyError.ReadFailed;
                 };
@@ -312,15 +288,15 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
         } else {
             var bufs: [1][]u8 = .{header_buffer[header_len..]};
             n = plain_reader.interface.readVec(&bufs) catch {
-                incrementCounter(&debug_read_failures);
-                if (from_pool) incrementCounter(&debug_stale_connections);
+                metrics.global_metrics.recordReadFailure();
+                if (from_pool) metrics.global_metrics.recordStaleConnection();
                 sock.close_blocking();
                 return ProxyError.ReadFailed;
             };
         }
         if (n == 0) {
-            incrementCounter(&debug_read_failures);
-            if (from_pool) incrementCounter(&debug_stale_connections);
+            metrics.global_metrics.recordReadFailure();
+            if (from_pool) metrics.global_metrics.recordStaleConnection();
             sock.close_blocking();
             return ProxyError.EmptyResponse;
         }
@@ -567,6 +543,11 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
         break :blk @intCast(now.since(start) / 1_000_000);
     } else 0;
     metrics.global_metrics.recordRequest(elapsed_ms, status_code);
+
+    // Track bytes transferred (headers + body)
+    const bytes_from_backend_total = header_end + bytes_received;
+    const bytes_to_client_total = header_bytes_written + total_body_written + body_to_write;
+    metrics.global_metrics.recordBytes(bytes_from_backend_total, bytes_to_client_total);
 
     // Determine if connection can be returned to pool
     // Critical check: ensure buffered reader has no leftover data

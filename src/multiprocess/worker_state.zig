@@ -6,6 +6,7 @@ const std = @import("std");
 const posix = std.posix;
 
 const types = @import("../core/types.zig");
+const metrics = @import("../utils/metrics.zig");
 
 /// Get current time in milliseconds using monotonic clock
 fn currentTimeMillis() i64 {
@@ -72,6 +73,9 @@ pub const WorkerState = struct {
         // Mark all backends healthy initially
         state.circuit_breaker.initBackends(backends.items.len);
 
+        // Initialize backend health metrics
+        metrics.global_metrics.updateBackendHealth(@intCast(backends.items.len), 0);
+
         return state;
     }
 
@@ -103,13 +107,33 @@ pub const WorkerState = struct {
     /// Record a successful request
     /// Hot path - inlined
     pub inline fn recordSuccess(self: *WorkerState, backend_idx: usize) void {
+        const was_healthy = self.circuit_breaker.isHealthy(backend_idx);
         self.circuit_breaker.recordSuccess(backend_idx);
+
+        // Update metrics if health state changed (backend recovered)
+        if (!was_healthy and self.circuit_breaker.isHealthy(backend_idx)) {
+            self.updateHealthMetrics();
+        }
     }
 
     /// Record a failed request
     /// Hot path - inlined
     pub inline fn recordFailure(self: *WorkerState, backend_idx: usize) void {
+        const was_healthy = self.circuit_breaker.isHealthy(backend_idx);
         self.circuit_breaker.recordFailure(backend_idx);
+
+        // Update metrics if health state changed (backend failed)
+        if (was_healthy and !self.circuit_breaker.isHealthy(backend_idx)) {
+            self.updateHealthMetrics();
+        }
+    }
+
+    /// Update backend health metrics
+    fn updateHealthMetrics(self: *const WorkerState) void {
+        const total = self.backends.items.len;
+        const healthy = self.circuit_breaker.countHealthy();
+        const unhealthy = if (total > healthy) total - healthy else 0;
+        metrics.global_metrics.updateBackendHealth(@intCast(healthy), @intCast(unhealthy));
     }
 
     /// Check if a backend is healthy

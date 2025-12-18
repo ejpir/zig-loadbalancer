@@ -10,7 +10,9 @@
 /// - Cache-friendly linear access
 const std = @import("std");
 const log = std.log.scoped(.simple_pool);
-const UltraSock = @import("../http/ultra_sock.zig").UltraSock;
+const ultra_sock = @import("../http/ultra_sock.zig");
+const UltraSock = ultra_sock.UltraSock;
+const TlsOptions = ultra_sock.TlsOptions;
 
 /// Maximum idle connections per backend
 pub const MAX_IDLE_CONNS: usize = 128;
@@ -105,7 +107,7 @@ pub const SimpleConnectionPool = struct {
     /// Get a connection for a backend (returns null if pool empty)
     /// Thread-safe with mutex
     pub inline fn getConnection(self: *SimpleConnectionPool, backend_idx: usize) ?UltraSock {
-        if (backend_idx >= self.backend_count) return null;
+        if (backend_idx >= MAX_BACKENDS or backend_idx >= self.backend_count) return null;
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.pools[backend_idx].pop();
@@ -114,7 +116,7 @@ pub const SimpleConnectionPool = struct {
     /// Return a connection to the pool
     /// Thread-safe with mutex
     pub inline fn returnConnection(self: *SimpleConnectionPool, backend_idx: usize, socket: UltraSock) void {
-        if (backend_idx >= self.backend_count) {
+        if (backend_idx >= MAX_BACKENDS or backend_idx >= self.backend_count) {
             // Invalid backend, just close
             var sock = socket;
             sock.close_blocking();
@@ -169,6 +171,7 @@ fn createMockSocket(allocator: std.mem.Allocator) UltraSock {
         .port = 8080,
         .connected = false,
         .allocator = allocator,
+        .tls_options = TlsOptions.insecure(),
     };
 }
 
