@@ -116,7 +116,8 @@ fn hasConnectionClose(headers: []const u8) bool {
         const line_start = i;
 
         // Find end of line
-        const line_end = std.mem.indexOfPos(u8, headers, i, "\r\n") orelse headers.len;
+        const line_end = std.mem.indexOfPos(u8, headers, i, "\r\n") orelse
+            headers.len;
         const line = headers[line_start..line_end];
 
         // Check if this is a Connection header
@@ -131,7 +132,10 @@ fn hasConnectionClose(headers: []const u8) bool {
         }
 
         // Move to next line
-        i = if (line_end + 2 <= headers.len) line_end + 2 else headers.len;
+        i = if (line_end + 2 <= headers.len)
+            line_end + 2
+        else
+            headers.len;
     }
     return false;
 }
@@ -160,32 +164,40 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 // ============================================================================
 
 test "checkHeadersForReuse: no Connection header - reusable" {
-    const headers = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 100\r\n\r\n";
+    const headers =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 100\r\n\r\n";
     const result = checkHeadersForReuse(headers);
     try std.testing.expect(result.canReuse());
 }
 
 test "checkHeadersForReuse: Connection: keep-alive - reusable" {
-    const headers = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 100\r\n\r\n";
+    const headers =
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 100\r\n\r\n";
     const result = checkHeadersForReuse(headers);
     try std.testing.expect(result.canReuse());
 }
 
 test "checkHeadersForReuse: Connection: close - not reusable" {
-    const headers = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 100\r\n\r\n";
+    const headers =
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 100\r\n\r\n";
     const result = checkHeadersForReuse(headers);
     try std.testing.expect(!result.canReuse());
-    try std.testing.expectEqual(NoReuseReason.connection_close_header, result.not_reusable);
+    try std.testing.expectEqual(
+        NoReuseReason.connection_close_header,
+        result.not_reusable,
+    );
 }
 
 test "checkHeadersForReuse: CONNECTION: CLOSE (uppercase) - not reusable" {
-    const headers = "HTTP/1.1 200 OK\r\nCONNECTION: CLOSE\r\nContent-Length: 100\r\n\r\n";
+    const headers =
+        "HTTP/1.1 200 OK\r\nCONNECTION: CLOSE\r\nContent-Length: 100\r\n\r\n";
     const result = checkHeadersForReuse(headers);
     try std.testing.expect(!result.canReuse());
 }
 
 test "checkHeadersForReuse: connection: Close (mixed case) - not reusable" {
-    const headers = "HTTP/1.1 200 OK\r\nconnection: Close\r\nContent-Length: 100\r\n\r\n";
+    const headers =
+        "HTTP/1.1 200 OK\r\nconnection: Close\r\nContent-Length: 100\r\n\r\n";
     const result = checkHeadersForReuse(headers);
     try std.testing.expect(!result.canReuse());
 }
@@ -198,13 +210,19 @@ test "checkBodyForReuse: content-length complete - reusable" {
 test "checkBodyForReuse: content-length incomplete - not reusable" {
     const result = checkBodyForReuse(.content_length, 100, 50, false);
     try std.testing.expect(!result.canReuse());
-    try std.testing.expectEqual(NoReuseReason.incomplete_body, result.not_reusable);
+    try std.testing.expectEqual(
+        NoReuseReason.incomplete_body,
+        result.not_reusable,
+    );
 }
 
 test "checkBodyForReuse: content-length with error - not reusable" {
     const result = checkBodyForReuse(.content_length, 100, 100, true);
     try std.testing.expect(!result.canReuse());
-    try std.testing.expectEqual(NoReuseReason.had_error, result.not_reusable);
+    try std.testing.expectEqual(
+        NoReuseReason.had_error,
+        result.not_reusable,
+    );
 }
 
 test "checkBodyForReuse: chunked without error - reusable" {
@@ -220,7 +238,10 @@ test "checkBodyForReuse: chunked with error - not reusable" {
 test "checkBodyForReuse: close_delimited - not reusable" {
     const result = checkBodyForReuse(.close_delimited, 0, 500, false);
     try std.testing.expect(!result.canReuse());
-    try std.testing.expectEqual(NoReuseReason.close_delimited, result.not_reusable);
+    try std.testing.expectEqual(
+        NoReuseReason.close_delimited,
+        result.not_reusable,
+    );
 }
 
 test "checkBodyForReuse: no_body - reusable" {
@@ -275,7 +296,8 @@ test "shouldReturnToPool: 204 no body - true" {
 }
 
 test "hasConnectionClose: close in middle of header list" {
-    const headers = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nServer: test\r\n\r\n";
+    const headers = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n" ++
+        "Connection: close\r\nServer: test\r\n\r\n";
     try std.testing.expect(hasConnectionClose(headers));
 }
 

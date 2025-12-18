@@ -158,11 +158,14 @@ test "CircuitBreaker: recordSuccess on healthy backend" {
 
     try std.testing.expect(cb.isHealthy(0));
     try std.testing.expectEqual(@as(u32, 0), cb.getFailureCount(0));
-    try std.testing.expectEqual(@as(u32, 0), cb.getSuccessCount(0)); // Not tracked for healthy
+    // Not tracked for healthy backends
+    try std.testing.expectEqual(@as(u32, 0), cb.getSuccessCount(0));
 }
 
 test "CircuitBreaker: recordFailure transitions to unhealthy at threshold" {
-    var cb = CircuitBreaker{ .config = .{ .unhealthy_threshold = 3 } };
+    var cb = CircuitBreaker{
+        .config = .{ .unhealthy_threshold = 3 },
+    };
     cb.initBackends(2);
 
     // First two failures: still healthy
@@ -184,7 +187,9 @@ test "CircuitBreaker: recordFailure transitions to unhealthy at threshold" {
 }
 
 test "CircuitBreaker: recordSuccess transitions to healthy at threshold" {
-    var cb = CircuitBreaker{ .config = .{ .healthy_threshold = 2 } };
+    var cb = CircuitBreaker{
+        .config = .{ .healthy_threshold = 2 },
+    };
     cb.initBackends(1);
     cb.health.markUnhealthy(0); // Start unhealthy
 
@@ -197,11 +202,14 @@ test "CircuitBreaker: recordSuccess transitions to healthy at threshold" {
     // Second success: transitions to healthy
     cb.recordSuccess(0);
     try std.testing.expect(cb.isHealthy(0));
-    try std.testing.expectEqual(@as(u32, 0), cb.getSuccessCount(0)); // Reset after transition
+    // Reset after transition
+    try std.testing.expectEqual(@as(u32, 0), cb.getSuccessCount(0));
 }
 
 test "CircuitBreaker: failure resets success count" {
-    var cb = CircuitBreaker{ .config = .{ .healthy_threshold = 3 } };
+    var cb = CircuitBreaker{
+        .config = .{ .healthy_threshold = 3 },
+    };
     cb.health.markUnhealthy(0);
 
     cb.recordSuccess(0);
@@ -216,7 +224,9 @@ test "CircuitBreaker: failure resets success count" {
 }
 
 test "CircuitBreaker: success resets failure count" {
-    var cb = CircuitBreaker{ .config = .{ .unhealthy_threshold = 3 } };
+    var cb = CircuitBreaker{
+        .config = .{ .unhealthy_threshold = 3 },
+    };
     cb.initBackends(1);
 
     cb.recordFailure(0);
@@ -230,7 +240,9 @@ test "CircuitBreaker: success resets failure count" {
 }
 
 test "CircuitBreaker: already unhealthy backend accumulates failures" {
-    var cb = CircuitBreaker{ .config = .{ .unhealthy_threshold = 2 } };
+    var cb = CircuitBreaker{
+        .config = .{ .unhealthy_threshold = 2 },
+    };
     cb.initBackends(1);
 
     // Trip the breaker
@@ -318,7 +330,9 @@ test "CircuitBreaker: threshold of 1 transitions immediately" {
 }
 
 test "CircuitBreaker: multiple backends independent" {
-    var cb = CircuitBreaker{ .config = .{ .unhealthy_threshold = 2 } };
+    var cb = CircuitBreaker{
+        .config = .{ .unhealthy_threshold = 2 },
+    };
     cb.initBackends(3);
 
     // Backend 0: 2 failures -> unhealthy
@@ -336,7 +350,9 @@ test "CircuitBreaker: multiple backends independent" {
 }
 
 test "CircuitBreaker: recovery requires exact threshold" {
-    var cb = CircuitBreaker{ .config = .{ .healthy_threshold = 3 } };
+    var cb = CircuitBreaker{
+        .config = .{ .healthy_threshold = 3 },
+    };
     cb.forceUnhealthy(0);
 
     cb.recordSuccess(0);

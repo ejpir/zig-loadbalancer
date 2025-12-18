@@ -32,7 +32,8 @@ pub const SimpleConnectionStack = struct {
     /// Returns false if stack is full
     pub inline fn push(self: *SimpleConnectionStack, socket: UltraSock) bool {
         if (self.top >= MAX_IDLE_CONNS) {
-            return false; // Stack full
+            // Caller must close socket when pool is full
+            return false;
         }
         self.sockets[self.top] = socket;
         self.top += 1;
@@ -43,7 +44,8 @@ pub const SimpleConnectionStack = struct {
     /// Returns null if stack is empty
     pub inline fn pop(self: *SimpleConnectionStack) ?UltraSock {
         if (self.top == 0) {
-            return null; // Stack empty
+            // No cached connection available; caller must create new one
+            return null;
         }
         self.top -= 1;
         const socket = self.sockets[self.top];
@@ -70,8 +72,8 @@ pub const SimpleConnectionStack = struct {
 
 /// Simple connection pool - thread-safe with mutex
 pub const SimpleConnectionPool = struct {
-    /// Per-backend connection stacks
-    pools: [MAX_BACKENDS]SimpleConnectionStack = undefined,
+    /// Per-backend connection stacks (zero-initialized for safety)
+    pools: [MAX_BACKENDS]SimpleConnectionStack = [_]SimpleConnectionStack{.{}} ** MAX_BACKENDS,
     /// Number of active backends
     backend_count: usize = 0,
     /// Initialized flag
@@ -115,9 +117,13 @@ pub const SimpleConnectionPool = struct {
 
     /// Return a connection to the pool
     /// Thread-safe with mutex
-    pub inline fn returnConnection(self: *SimpleConnectionPool, backend_idx: usize, socket: UltraSock) void {
+    pub inline fn returnConnection(
+        self: *SimpleConnectionPool,
+        backend_idx: usize,
+        socket: UltraSock,
+    ) void {
         if (backend_idx >= MAX_BACKENDS or backend_idx >= self.backend_count) {
-            // Invalid backend, just close
+            // Cannot pool connection to non-existent backend
             var sock = socket;
             sock.close_blocking();
             return;
@@ -128,7 +134,7 @@ pub const SimpleConnectionPool = struct {
         self.mutex.unlock();
 
         if (!pushed) {
-            // Pool full, close the connection
+            // Limit pool size to prevent unbounded memory growth
             var sock = socket;
             sock.close_blocking();
         }

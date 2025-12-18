@@ -62,7 +62,7 @@ pub const TlsOptions = struct {
 };
 
 /// UltraSock - A socket abstraction for HTTP/HTTPS connections
-/// Threadlocal TLS buffers (zero allocation - one active TLS handshake per worker)
+/// Threadlocal TLS buffers avoid allocation during handshake
 threadlocal var tls_input_buffer: [tls.input_buffer_len]u8 = undefined;
 threadlocal var tls_output_buffer: [tls.output_buffer_len]u8 = undefined;
 
@@ -98,7 +98,7 @@ pub const UltraSock = struct {
         tls_options: TlsOptions,
     ) UltraSock {
         if (protocol == .https and tls_options.isInsecure()) {
-            log.warn("HTTPS connection with insecure TLS options - use only for local development", .{});
+            log.warn("HTTPS with insecure TLS - dev only", .{});
         }
         return UltraSock{
             .protocol = protocol,
@@ -140,19 +140,8 @@ pub const UltraSock = struct {
 
     /// Resolve hostname using getaddrinfo (blocking)
     fn resolveDns(host: []const u8, port: u16) !Io.net.IpAddress {
-        // Create null-terminated strings for getaddrinfo
-        var host_buf: [256]u8 = undefined;
-        if (host.len >= host_buf.len) return error.HostNameTooLong;
-        @memcpy(host_buf[0..host.len], host);
-        host_buf[host.len] = 0;
-        const host_z: [*:0]const u8 = host_buf[0..host.len :0];
-
-        var port_buf: [8]u8 = undefined;
-        const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch return error.InvalidPort;
-        var port_z_buf: [8]u8 = undefined;
-        @memcpy(port_z_buf[0..port_str.len], port_str);
-        port_z_buf[port_str.len] = 0;
-        const port_z: [*:0]const u8 = port_z_buf[0..port_str.len :0];
+        const host_z = try makeNullTerminated(host);
+        const port_z = try makePortString(port);
 
         const hints: std.c.addrinfo = .{
             .flags = .{},
@@ -173,13 +162,40 @@ pub const UltraSock = struct {
         }
         defer if (res) |r| std.c.freeaddrinfo(r);
 
-        // Get first result
         const info = res orelse return error.NoAddressFound;
         const sockaddr = info.addr orelse return error.NoAddressFound;
 
-        // Convert to Io.net.IpAddress
+        return convertSockaddrToIpAddress(sockaddr, port);
+    }
+
+    // Threadlocal buffers for DNS resolution - avoids stack use-after-free.
+    threadlocal var dns_host_buf: [256]u8 = undefined;
+    threadlocal var dns_port_buf: [8]u8 = undefined;
+
+    /// Convert hostname to null-terminated string for getaddrinfo
+    fn makeNullTerminated(host: []const u8) ![*:0]const u8 {
+        if (host.len >= dns_host_buf.len) return error.HostNameTooLong;
+        @memcpy(dns_host_buf[0..host.len], host);
+        dns_host_buf[host.len] = 0;
+        return dns_host_buf[0..host.len :0];
+    }
+
+    /// Convert port to null-terminated string for getaddrinfo
+    fn makePortString(port: u16) ![*:0]const u8 {
+        const port_str = std.fmt.bufPrint(&dns_port_buf, "{d}", .{port}) catch
+            return error.InvalidPort;
+        dns_port_buf[port_str.len] = 0;
+        return dns_port_buf[0..port_str.len :0];
+    }
+
+    /// Convert sockaddr to Io.net.IpAddress
+    fn convertSockaddrToIpAddress(
+        sockaddr: *const std.c.sockaddr,
+        port: u16,
+    ) !Io.net.IpAddress {
         if (sockaddr.family == std.posix.AF.INET) {
-            const addr4: *const std.c.sockaddr.in = @ptrCast(@alignCast(sockaddr));
+            const addr4: *const std.c.sockaddr.in =
+                @ptrCast(@alignCast(sockaddr));
             return Io.net.IpAddress{
                 .ip4 = .{
                     .bytes = @bitCast(addr4.addr),
@@ -187,7 +203,8 @@ pub const UltraSock = struct {
                 },
             };
         } else if (sockaddr.family == std.posix.AF.INET6) {
-            const addr6: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(sockaddr));
+            const addr6: *const std.c.sockaddr.in6 =
+                @ptrCast(@alignCast(sockaddr));
             return Io.net.IpAddress{
                 .ip6 = .{
                     .bytes = addr6.addr,
@@ -204,47 +221,24 @@ pub const UltraSock = struct {
     fn performTlsHandshake(self: *UltraSock, io: Io) !void {
         const stream = self.stream orelse return error.SocketNotInitialized;
 
-        // Use threadlocal buffers (zero allocation)
+        try ensureCaBundleLoaded(io, self.tls_options.ca);
+
         const input_buf = &tls_input_buffer;
         const output_buf = &tls_output_buffer;
 
-        // Load global CA bundle once (lazy initialization)
-        if (self.tls_options.ca == .system and !ca_bundle_loaded) {
-            global_ca_bundle = tls.config.cert.fromSystem(std.heap.page_allocator, io) catch |err| {
-                log.err("Failed to load system CA bundle: {}", .{err});
-                return error.CaBundleLoadFailed;
-            };
-            ca_bundle_loaded = true;
-            log.info("Loaded {} certificates from system trust store (global)", .{global_ca_bundle.?.map.count()});
-        }
-
-        // Use embedded reader/writer (stable addresses, zero allocation)
         self.stream_reader = stream.reader(io, input_buf);
         self.stream_writer = stream.writer(io, output_buf);
         self.has_reader_writer = true;
 
-        // Get current time for certificate validation
         const now = try Io.Clock.real.now(io);
-
         log.debug("Starting TLS handshake with {s}:{}", .{ self.host, self.port });
 
-        // Build TLS options
-        const client_opts: tls.config.Client = .{
-            .host = switch (self.tls_options.host) {
-                .none => "",
-                .from_connection => self.host,
-                .explicit => |h| h,
-            },
-            .root_ca = switch (self.tls_options.ca) {
-                .none => .{},
-                .system => global_ca_bundle.?,
-                .custom => |bundle| bundle,
-            },
-            .insecure_skip_verify = self.tls_options.ca == .none,
-            .now = now,
-        };
+        const client_opts = try buildTlsClientOptions(
+            self.tls_options,
+            self.host,
+            now,
+        );
 
-        // Perform TLS handshake
         self.tls_conn = tls.client(
             &self.stream_reader.interface,
             &self.stream_writer.interface,
@@ -255,6 +249,42 @@ pub const UltraSock = struct {
         };
 
         log.info("TLS connection established with {s}:{}", .{ self.host, self.port });
+    }
+
+    /// Ensure CA bundle is loaded (only once per process)
+    fn ensureCaBundleLoaded(io: Io, ca_mode: TlsOptions.CaVerification) !void {
+        if (ca_mode == .system and !ca_bundle_loaded) {
+            global_ca_bundle =
+                tls.config.cert.fromSystem(std.heap.page_allocator, io) catch |err| {
+                    log.err("Failed to load system CA bundle: {}", .{err});
+                    return error.CaBundleLoadFailed;
+                };
+            ca_bundle_loaded = true;
+            const cert_count = global_ca_bundle.?.map.count();
+            log.info("Loaded {} certificates from system trust store", .{cert_count});
+        }
+    }
+
+    /// Build TLS client options from verification settings
+    fn buildTlsClientOptions(
+        tls_options: TlsOptions,
+        host: []const u8,
+        now: Io.Timestamp,
+    ) !tls.config.Client {
+        return tls.config.Client{
+            .host = switch (tls_options.host) {
+                .none => "",
+                .from_connection => host,
+                .explicit => |h| h,
+            },
+            .root_ca = switch (tls_options.ca) {
+                .none => .{},
+                .system => global_ca_bundle.?,
+                .custom => |bundle| bundle,
+            },
+            .insecure_skip_verify = tls_options.ca == .none,
+            .now = now,
+        };
     }
 
     /// Send all data over the socket
@@ -333,6 +363,16 @@ pub const UltraSock = struct {
         return null;
     }
 
+    /// Fix TLS connection pointers after struct copy.
+    /// Must be called after copying UltraSock to update internal TLS pointers.
+    pub fn fixTlsPointersAfterCopy(self: *UltraSock) void {
+        if (self.tls_conn != null and self.has_reader_writer) {
+            // Update TLS connection to point to THIS struct's reader/writer.
+            self.tls_conn.?.input = &self.stream_reader.interface;
+            self.tls_conn.?.output = &self.stream_writer.interface;
+        }
+    }
+
     /// Close the underlying TCP stream
     fn closeStream(self: *UltraSock) void {
         if (self.stream) |stream| {
@@ -384,7 +424,12 @@ pub const UltraSock = struct {
             .sec = @intCast(seconds),
             .usec = @intCast(microseconds),
         };
-        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {
+        std.posix.setsockopt(
+            fd,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&timeout),
+        ) catch {
             return error.SetTimeoutFailed;
         };
     }
@@ -398,7 +443,12 @@ pub const UltraSock = struct {
             .sec = @intCast(seconds),
             .usec = @intCast(microseconds),
         };
-        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {
+        std.posix.setsockopt(
+            fd,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.SNDTIMEO,
+            std.mem.asBytes(&timeout),
+        ) catch {
             return error.SetTimeoutFailed;
         };
     }
@@ -409,18 +459,33 @@ pub const UltraSock = struct {
 
         // Enable keepalive
         const enable: u32 = 1;
-        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.KEEPALIVE, std.mem.asBytes(&enable)) catch {
+        std.posix.setsockopt(
+            fd,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.KEEPALIVE,
+            std.mem.asBytes(&enable),
+        ) catch {
             return error.SetOptionFailed;
         };
 
-        // Set keepalive parameters (macOS uses TCP_KEEPALIVE for idle time)
-        const idle_secs: u32 = 5; // Start probes after 5 seconds idle
+        // Probes start after idle period (platform-specific)
+        const idle_secs: u32 = 5;
         if (@hasDecl(std.posix.TCP, "KEEPALIVE")) {
             // macOS
-            std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPALIVE, std.mem.asBytes(&idle_secs)) catch {};
+            std.posix.setsockopt(
+                fd,
+                std.posix.IPPROTO.TCP,
+                std.posix.TCP.KEEPALIVE,
+                std.mem.asBytes(&idle_secs),
+            ) catch {};
         } else if (@hasDecl(std.posix.TCP, "KEEPIDLE")) {
             // Linux
-            std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.KEEPIDLE, std.mem.asBytes(&idle_secs)) catch {};
+            std.posix.setsockopt(
+                fd,
+                std.posix.IPPROTO.TCP,
+                std.posix.TCP.KEEPIDLE,
+                std.mem.asBytes(&idle_secs),
+            ) catch {};
         }
     }
 

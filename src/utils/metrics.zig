@@ -112,33 +112,8 @@ pub const MetricsCollector = struct {
 
     /// Generate Prometheus format metrics into a fixed buffer (zero allocation)
     pub fn toPrometheusFormat(self: *MetricsCollector, buffer: []u8) ![]u8 {
-        const requests_total = self.requests_total.load(.acquire);
-        const duration_total = self.request_duration_total_ms.load(.acquire);
-        const requests_success = self.requests_success.load(.acquire);
-        const requests_client_error = self.requests_client_error.load(.acquire);
-        const requests_server_error = self.requests_server_error.load(.acquire);
-        const pool_hits = self.pool_hits.load(.acquire);
-        const pool_misses = self.pool_misses.load(.acquire);
-        const stale_conns = self.stale_connections.load(.acquire);
-        const send_failures = self.backend_send_failures.load(.acquire);
-        const read_failures = self.backend_read_failures.load(.acquire);
-        const failovers = self.backend_failovers.load(.acquire);
-        const healthy = self.backends_healthy.load(.acquire);
-        const unhealthy = self.backends_unhealthy.load(.acquire);
-        const bytes_in = self.bytes_from_backend.load(.acquire);
-        const bytes_out = self.bytes_to_client.load(.acquire);
-
-        // Calculate derived metrics
-        const avg_duration_ms: f64 = if (requests_total > 0)
-            @as(f64, @floatFromInt(duration_total)) / @as(f64, @floatFromInt(requests_total))
-        else
-            0.0;
-
-        const pool_total = pool_hits + pool_misses;
-        const pool_hit_rate: f64 = if (pool_total > 0)
-            @as(f64, @floatFromInt(pool_hits)) / @as(f64, @floatFromInt(pool_total)) * 100.0
-        else
-            0.0;
+        const snapshot = self.loadSnapshot();
+        const derived = calculateDerivedMetrics(snapshot);
 
         return std.fmt.bufPrint(buffer,
             \\# HELP zzz_lb_requests_total Total requests processed
@@ -206,23 +181,90 @@ pub const MetricsCollector = struct {
             \\zzz_lb_bytes_to_client {d}
             \\
         , .{
-            requests_total,
-            requests_success,
-            requests_client_error,
-            requests_server_error,
-            avg_duration_ms,
-            pool_hits,
-            pool_misses,
-            pool_hit_rate,
-            stale_conns,
-            send_failures,
-            read_failures,
-            failovers,
-            healthy,
-            unhealthy,
-            bytes_in,
-            bytes_out,
+            snapshot.requests_total,
+            snapshot.requests_success,
+            snapshot.requests_client_error,
+            snapshot.requests_server_error,
+            derived.avg_duration_ms,
+            snapshot.pool_hits,
+            snapshot.pool_misses,
+            derived.pool_hit_rate,
+            snapshot.stale_conns,
+            snapshot.send_failures,
+            snapshot.read_failures,
+            snapshot.failovers,
+            snapshot.healthy,
+            snapshot.unhealthy,
+            snapshot.bytes_in,
+            snapshot.bytes_out,
         });
+    }
+
+    /// Atomic snapshot of all metrics values
+    const MetricsSnapshot = struct {
+        requests_total: u64,
+        requests_success: u64,
+        requests_client_error: u64,
+        requests_server_error: u64,
+        duration_total: u64,
+        pool_hits: u64,
+        pool_misses: u64,
+        stale_conns: u64,
+        send_failures: u64,
+        read_failures: u64,
+        failovers: u64,
+        healthy: u64,
+        unhealthy: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+    };
+
+    /// Load atomic snapshot of all metrics
+    fn loadSnapshot(self: *MetricsCollector) MetricsSnapshot {
+        return .{
+            .requests_total = self.requests_total.load(.acquire),
+            .requests_success = self.requests_success.load(.acquire),
+            .requests_client_error = self.requests_client_error.load(.acquire),
+            .requests_server_error = self.requests_server_error.load(.acquire),
+            .duration_total = self.request_duration_total_ms.load(.acquire),
+            .pool_hits = self.pool_hits.load(.acquire),
+            .pool_misses = self.pool_misses.load(.acquire),
+            .stale_conns = self.stale_connections.load(.acquire),
+            .send_failures = self.backend_send_failures.load(.acquire),
+            .read_failures = self.backend_read_failures.load(.acquire),
+            .failovers = self.backend_failovers.load(.acquire),
+            .healthy = self.backends_healthy.load(.acquire),
+            .unhealthy = self.backends_unhealthy.load(.acquire),
+            .bytes_in = self.bytes_from_backend.load(.acquire),
+            .bytes_out = self.bytes_to_client.load(.acquire),
+        };
+    }
+
+    /// Derived metrics calculated from snapshot
+    const DerivedMetrics = struct {
+        avg_duration_ms: f64,
+        pool_hit_rate: f64,
+    };
+
+    /// Calculate derived metrics from snapshot
+    fn calculateDerivedMetrics(snapshot: MetricsSnapshot) DerivedMetrics {
+        const avg_duration_ms: f64 = if (snapshot.requests_total > 0)
+            @as(f64, @floatFromInt(snapshot.duration_total)) /
+                @as(f64, @floatFromInt(snapshot.requests_total))
+        else
+            0.0;
+
+        const pool_total = snapshot.pool_hits + snapshot.pool_misses;
+        const pool_hit_rate: f64 = if (pool_total > 0)
+            @as(f64, @floatFromInt(snapshot.pool_hits)) /
+                @as(f64, @floatFromInt(pool_total)) * 100.0
+        else
+            0.0;
+
+        return .{
+            .avg_duration_ms = avg_duration_ms,
+            .pool_hit_rate = pool_hit_rate,
+        };
     }
 };
 
@@ -245,7 +287,7 @@ pub fn metricsHandler(ctx: *const Context, data: void) !Respond {
     };
 
     return ctx.response.apply(.{
-        .status = .@"OK",
+        .status = .OK,
         .mime = http.Mime.TEXT,
         .body = metrics_output,
     });

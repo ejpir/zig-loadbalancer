@@ -40,23 +40,18 @@ const BackendDef = struct {
     weight: u16 = 1,
 };
 
+const CliConfig = struct {
+    port: u16,
+    host: []const u8,
+    strategy: types.LoadBalancerStrategy,
+    backends: []BackendDef,
+};
+
 // ============================================================================
-// Main
+// CLI Parsing
 // ============================================================================
 
-var server: Server = undefined;
-
-fn shutdown(_: std.c.SIG) callconv(.c) void {
-    server.stop();
-}
-
-pub fn main() !void {
-    // Thread-safe allocator since health probes run in separate thread
-    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
-    const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
-
-    // Parse args
+fn parseArgs(allocator: std.mem.Allocator) !CliConfig {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -64,33 +59,46 @@ pub fn main() !void {
     var host: []const u8 = "0.0.0.0";
     var strategy: types.LoadBalancerStrategy = .round_robin;
 
-    // Dynamic backend list
     var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
-    defer backend_list.deinit(allocator);
+    errdefer backend_list.deinit(allocator);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--port") or std.mem.eql(u8, args[i], "-p")) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--port") or
+            std.mem.eql(u8, arg, "-p")) {
             if (i + 1 < args.len) {
                 port = try std.fmt.parseInt(u16, args[i + 1], 10);
                 i += 1;
             }
-        } else if (std.mem.eql(u8, args[i], "--host") or std.mem.eql(u8, args[i], "-h")) {
+        } else if (std.mem.eql(u8, arg, "--host") or
+                   std.mem.eql(u8, arg, "-h")) {
             if (i + 1 < args.len) {
-                host = args[i + 1];
+                // Dupe host string - args freed after parseArgs returns.
+                host = try allocator.dupe(u8, args[i + 1]);
                 i += 1;
             }
-        } else if (std.mem.eql(u8, args[i], "--backend") or std.mem.eql(u8, args[i], "-b")) {
+        } else if (std.mem.eql(u8, arg, "--backend") or
+                   std.mem.eql(u8, arg, "-b")) {
             if (i + 1 < args.len) {
                 const backend_str = args[i + 1];
                 if (std.mem.lastIndexOf(u8, backend_str, ":")) |colon| {
-                    const backend_host = backend_str[0..colon];
-                    const backend_port = try std.fmt.parseInt(u16, backend_str[colon + 1 ..], 10);
-                    try backend_list.append(allocator, .{ .host = backend_host, .port = backend_port });
+                    // Dupe host string - args freed after parseArgs returns.
+                    const backend_host = try allocator.dupe(
+                        u8,
+                        backend_str[0..colon],
+                    );
+                    const port_str = backend_str[colon + 1 ..];
+                    const backend_port = try std.fmt.parseInt(u16, port_str, 10);
+                    try backend_list.append(
+                        allocator,
+                        .{ .host = backend_host, .port = backend_port },
+                    );
                 }
                 i += 1;
             }
-        } else if (std.mem.eql(u8, args[i], "--strategy") or std.mem.eql(u8, args[i], "-s")) {
+        } else if (std.mem.eql(u8, arg, "--strategy") or
+                   std.mem.eql(u8, arg, "-s")) {
             if (i + 1 < args.len) {
                 if (std.mem.eql(u8, args[i + 1], "random")) {
                     strategy = .random;
@@ -102,13 +110,45 @@ pub fn main() !void {
         }
     }
 
-    // Default backends if none specified
+    // Provide defaults when user doesn't specify backends
     if (backend_list.items.len == 0) {
-        try backend_list.append(allocator, .{ .host = "127.0.0.1", .port = 9001 });
-        try backend_list.append(allocator, .{ .host = "127.0.0.1", .port = 9002 });
+        try backend_list.append(
+            allocator,
+            .{ .host = "127.0.0.1", .port = 9001 },
+        );
+        try backend_list.append(
+            allocator,
+            .{ .host = "127.0.0.1", .port = 9002 },
+        );
     }
 
-    const backend_defs = backend_list.items;
+    return .{
+        .port = port,
+        .host = host,
+        .strategy = strategy,
+        .backends = try backend_list.toOwnedSlice(allocator),
+    };
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+var server: Server = undefined;
+
+fn shutdown(_: std.c.SIG) callconv(.c) void {
+    server.stop();
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
+    const allocator = gpa.allocator();
+    defer _ = gpa.deinit();
+
+    const cli = try parseArgs(allocator);
+    defer allocator.free(cli.backends);
+
+    const backend_defs = cli.backends;
 
     // Connection pool (shared across all requests)
     var connection_pool = simple_pool.SimpleConnectionPool{};
@@ -129,7 +169,11 @@ pub fn main() !void {
     worker_state.setWorkerId(0);
 
     log.warn("=== Single-Process Load Balancer ===", .{});
-    log.warn("Listen: {s}:{d}, Backends: {d}", .{ host, port, backends.items.len });
+    log.warn("Listen: {s}:{d}, Backends: {d}", .{
+        cli.host,
+        cli.port,
+        backends.items.len,
+    });
     for (backends.items, 0..) |b, idx| {
         log.warn("  Backend {d}: {s}:{d}", .{ idx + 1, b.getHost(), b.port });
     }
@@ -141,37 +185,27 @@ pub fn main() !void {
     };
     defer health_thread.detach();
 
-    // Signal handling
-    posix.sigaction(posix.SIG.TERM, &.{
-        .handler = .{ .handler = shutdown },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    }, null);
-    posix.sigaction(posix.SIG.INT, &.{
-        .handler = .{ .handler = shutdown },
-        .mask = posix.sigemptyset(),
-        .flags = 0,
-    }, null);
+    setupSignalHandlers();
 
-    // std.Io runtime (uses internal thread pool for concurrency)
     var threaded: Io.Threaded = .init(allocator);
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Router
-    var router = switch (strategy) {
+    var router = switch (cli.strategy) {
         inline else => |s| try createRouter(allocator, &worker_state, s),
     };
     defer router.deinit(allocator);
 
-    // Socket - no SO_REUSEPORT needed for single process
-    const addr = try Io.net.IpAddress.parse(host, port);
-    var socket = try addr.listen(io, .{ .kernel_backlog = 4096, .reuse_address = true });
+    // No SO_REUSEPORT needed for single process
+    const addr = try Io.net.IpAddress.parse(cli.host, cli.port);
+    var socket = try addr.listen(io, .{
+        .kernel_backlog = 4096,
+        .reuse_address = true,
+    });
     defer socket.deinit(io);
 
-    log.warn("Listening on {s}:{d}", .{ host, port });
+    log.warn("Listening on {s}:{d}", .{ cli.host, cli.port });
 
-    // Server with tuned settings
     server = try Server.init(allocator, .{
         .socket_buffer_bytes = 1024 * 32,
         .keepalive_count_max = 1000,
@@ -182,7 +216,24 @@ pub fn main() !void {
     try server.serve(io, &router, &socket);
 }
 
-fn createRouter(allocator: std.mem.Allocator, state: *mp.WorkerState, comptime strategy: types.LoadBalancerStrategy) !Router {
+fn setupSignalHandlers() void {
+    posix.sigaction(posix.SIG.TERM, &.{
+        .handler = .{ .handler = shutdown },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+    posix.sigaction(posix.SIG.INT, &.{
+        .handler = .{ .handler = shutdown },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+}
+
+fn createRouter(
+    allocator: std.mem.Allocator,
+    state: *mp.WorkerState,
+    comptime strategy: types.LoadBalancerStrategy,
+) !Router {
     return try Router.init(allocator, &.{
         Route.init("/metrics").get({}, metrics.metricsHandler).layer(),
         Route.init("/").all(state, mp.generateHandler(strategy)).layer(),

@@ -198,7 +198,8 @@ pub fn findLineEnd(data: []const u8) ?usize {
 test "findHeaderEnd - basic" {
     const data = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
     const pos = findHeaderEnd(data);
-    try std.testing.expectEqual(@as(?usize, 34), pos);  // \r\n\r\n starts at position 34
+    // \r\n\r\n starts at position 34
+    try std.testing.expectEqual(@as(?usize, 34), pos);
 }
 
 test "findHeaderEnd - at start" {
@@ -215,7 +216,7 @@ test "findHeaderEnd - not found" {
 
 test "findHeaderEnd - large buffer (SIMD path)" {
     // Create a large buffer that will trigger SIMD path
-    var buffer: [256]u8 = undefined;
+    var buffer: [256]u8 = [_]u8{0} ** 256;
     @memset(&buffer, 'x');
     // Place the needle near the end
     buffer[200] = '\r';
@@ -231,7 +232,8 @@ test "findHeaderEnd - matches std.mem.indexOf" {
     // Fuzz test: verify SIMD matches scalar for various inputs
     const test_cases = [_][]const u8{
         "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n",
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1234\r\nServer: zzz\r\n\r\n<!DOCTYPE html>",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n" ++
+            "Content-Length: 1234\r\nServer: zzz\r\n\r\n<!DOCTYPE html>",
         "\r\n\r\n",
         "no header end here",
         "",

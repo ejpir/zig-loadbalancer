@@ -18,10 +18,15 @@ fn handler(ctx: *const Context, _: void) !Respond {
         ctx.request.uri orelse "/",
     });
 
+    const body =
+        "<html><body>" ++
+        "<h1>Hello from Backend 2!</h1>" ++
+        "<p>This request was handled by backend server 2.</p>" ++
+        "</body></html>";
     return ctx.response.apply(.{
         .status = .OK,
         .mime = http.Mime.HTML,
-        .body = "<html><body><h1>Hello from Backend 2!</h1><p>This request was handled by backend server 2.</p></body></html>",
+        .body = body,
     });
 }
 
@@ -55,7 +60,10 @@ pub fn main() !void {
     defer router.deinit(allocator);
 
     const addr = try Io.net.IpAddress.parse(host, port);
-    var socket = try addr.listen(io, .{ .kernel_backlog = 4096, .reuse_address = true });
+    var socket = try addr.listen(io, .{
+        .kernel_backlog = 4096,
+        .reuse_address = true,
+    });
     defer socket.deinit(io);
 
     log.info("Backend 2 listening on {s}:{d}", .{ host, port });
