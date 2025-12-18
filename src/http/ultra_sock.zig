@@ -619,3 +619,54 @@ pub const UltraSock = struct {
         return initWithTls(protocol, backend.getHost(), backend.port, tls_options);
     }
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "UltraSock: init creates correct protocol" {
+    const http_sock = UltraSock.init(.http, "example.com", 80);
+    try std.testing.expectEqual(Protocol.http, http_sock.protocol);
+    try std.testing.expectEqualStrings("example.com", http_sock.host);
+    try std.testing.expectEqual(@as(u16, 80), http_sock.port);
+
+    const https_sock = UltraSock.init(.https, "secure.com", 443);
+    try std.testing.expectEqual(Protocol.https, https_sock.protocol);
+}
+
+test "UltraSock: isTls returns false for non-TLS connection" {
+    var sock = UltraSock.init(.http, "example.com", 80);
+    try std.testing.expect(!sock.isTls());
+}
+
+test "UltraSock: fixTlsPointersAfterCopy is safe on non-TLS socket" {
+    var sock = UltraSock.init(.http, "example.com", 80);
+    // Should not crash when called on non-TLS socket.
+    sock.fixTlsPointersAfterCopy();
+    try std.testing.expect(!sock.isTls());
+}
+
+test "UltraSock: getTlsConnection returns null for non-TLS" {
+    var sock = UltraSock.init(.http, "example.com", 80);
+    try std.testing.expect(sock.getTlsConnection() == null);
+}
+
+test "DNS helpers: makeNullTerminated handles valid host" {
+    const host_z = try UltraSock.makeNullTerminated("example.com");
+    try std.testing.expectEqualStrings("example.com", std.mem.span(host_z));
+}
+
+test "DNS helpers: makeNullTerminated rejects too-long host" {
+    var long_host: [300]u8 = undefined;
+    @memset(&long_host, 'a');
+    const result = UltraSock.makeNullTerminated(&long_host);
+    try std.testing.expectError(error.HostNameTooLong, result);
+}
+
+test "DNS helpers: makePortString formats port correctly" {
+    const port_z = try UltraSock.makePortString(8080);
+    try std.testing.expectEqualStrings("8080", std.mem.span(port_z));
+
+    const port_443 = try UltraSock.makePortString(443);
+    try std.testing.expectEqualStrings("443", std.mem.span(port_443));
+}
