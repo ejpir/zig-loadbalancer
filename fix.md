@@ -1147,3 +1147,40 @@ To go faster, you'd need to either:
 1. Event loop blocking - Our proxy code blocks the main loop
 2. Connection pool contention - One stuck connection blocks pool access
 - Fully async I/O without any blocking calls
+
+---
+
+⏺ TLS is now working for the load balancer with HTTPS backends. Here's a summary of the key fixes:
+
+  Summary of TLS Fixes
+
+  1. Proxy was bypassing TLS layer (src/multiprocess/proxy.zig)
+
+  The proxy was directly accessing sock.stream to create readers/writers, completely bypassing the TLS client. Fixed by:
+  - Using sock.getTlsClient() to get the TLS client
+  - Using tls_client.writer.writeAll() and tls_client.reader.readVec() for TLS connections
+
+  2. TLS output not flushed to network (src/multiprocess/proxy.zig)
+
+  The TLS client's writer.flush() only prepares ciphertext in the buffer - it doesn't actually send to the network. Fixed
+  by adding:
+  tls_c.output.flush()  // Must call after tls_c.writer.flush()
+
+  3. TLS records can span TCP segments (src/multiprocess/proxy.zig)
+
+  When the TLS reader returns 0 bytes, it means it doesn't have enough data to complete a TLS record. Fixed by adding a
+  retry loop with nanosleep:
+  if (n == 0 and is_tls) {
+      while (n == 0 and retry_count < 100) {
+          std.posix.nanosleep(0, 10_000_000); // 10ms
+          n = tls_client.reader.readVec(&bufs) catch break;
+          retry_count += 1;
+      }
+  }
+
+  4. Added TLS diagnostic methods (src/http/ultra_sock.zig)
+
+  - getTlsClient() - Get TLS client for direct reader/writer access
+  - getStreamReaderError() / getStreamWriterError() - Debug underlying I/O errors
+
+  The load balancer can now proxy to HTTPS backends like httpbin.org:443.

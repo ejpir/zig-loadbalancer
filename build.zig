@@ -89,19 +89,6 @@ pub fn build(b: *std.Build) void {
     const build_load_balancer_sp = b.addInstallArtifact(load_balancer_sp, .{});
     const run_load_balancer_sp_cmd = b.addRunArtifact(load_balancer_sp);
 
-    // TCP passthrough load balancer (Layer 4, no HTTP parsing)
-    const tcp_passthrough_mod = b.createModule(.{
-        .root_source_file = b.path("main_tcp_passthrough.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const tcp_passthrough = b.addExecutable(.{
-        .name = "tcp_passthrough",
-        .root_module = tcp_passthrough_mod,
-    });
-    const build_tcp_passthrough = b.addInstallArtifact(tcp_passthrough, .{});
-    const run_tcp_passthrough_cmd = b.addRunArtifact(tcp_passthrough);
-
     // Unit tests
     const unit_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/test_load_balancer.zig"),
@@ -122,7 +109,6 @@ pub fn build(b: *std.Build) void {
     build_all.dependOn(&build_backend_proxy.step);
     build_all.dependOn(&build_load_balancer_mp.step);
     build_all.dependOn(&build_load_balancer_sp.step);
-    build_all.dependOn(&build_tcp_passthrough.step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
@@ -132,9 +118,6 @@ pub fn build(b: *std.Build) void {
 
     const run_lb_sp_step = b.step("run-lb-sp", "Run load balancer (single-process, threaded)");
     run_lb_sp_step.dependOn(&run_load_balancer_sp_cmd.step);
-
-    const run_tcp_step = b.step("run-tcp", "Run TCP passthrough load balancer (Layer 4)");
-    run_tcp_step.dependOn(&run_tcp_passthrough_cmd.step);
 
     const run_backend1_step = b.step("run-backend1", "Run backend server 1");
     run_backend1_step.dependOn(&run_backend1.step);

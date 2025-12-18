@@ -36,12 +36,16 @@ services:
     build: .
     # NOTE: Using single-process (_sp) because fork() + io_uring don't work together on Linux.
     # Multi-process (_mp) works on macOS (kqueue) but not Linux (io_uring).
-    command: [
-      "./zig-out/bin/load_balancer_sp",
-      "--port", "8080",
-      "--backend", "172.28.0.2:9001",
-      "--backend", "172.28.0.3:9002"
-    ]
+    command:
+      [
+        "./zig-out/bin/load_balancer_sp",
+        "--port",
+        "8080",
+        "--backend",
+        "172.28.0.2:9001",
+        "--backend",
+        "172.28.0.3:9002",
+      ]
     ports:
       - "8080:8080"
     networks:
