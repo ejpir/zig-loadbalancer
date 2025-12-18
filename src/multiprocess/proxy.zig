@@ -260,8 +260,8 @@ inline fn streamingProxy(
     };
 
     // Phase 3: Read and parse headers.
-    // Prevent data leaks if error occurs mid-parsing, deterministic debugging.
-    var header_buffer = [_]u8{0} ** MAX_HEADER_BYTES;
+    // Safe undefined: buffer fully written by backend read before parsing.
+    var header_buffer: [MAX_HEADER_BYTES]u8 = undefined;
     var header_len: u32 = 0;
     var header_end: u32 = 0;
     const msg_len = streamingProxy_readHeaders(
@@ -396,7 +396,8 @@ fn streamingProxy_sendRequest(
     std.debug.assert(proxy_state.sock.stream != null);
 
     // Prevent data leaks if error occurs mid-formatting, deterministic debugging.
-    var request_buf = [_]u8{0} ** MAX_REQUEST_BYTES;
+    // Safe undefined: buffer fully written by bufPrint before send.
+    var request_buf: [MAX_REQUEST_BYTES]u8 = undefined;
     const fmt_str = "{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\n" ++
         "Connection: keep-alive\r\n\r\n";
     const request_data = std.fmt.bufPrint(&request_buf, fmt_str, .{
@@ -472,7 +473,8 @@ fn streamingProxy_sendRequest_plain(
 ) bool {
     const stream = proxy_state.sock.stream orelse return false;
     // Prevent data leaks if error occurs mid-write, deterministic debugging.
-    var write_buf = [_]u8{0} ** MAX_BODY_CHUNK_BYTES;
+    // Safe undefined: buffer fully written by I/O before use.
+    var write_buf: [MAX_BODY_CHUNK_BYTES]u8 = undefined;
     var writer = stream.writer(ctx.io, &write_buf);
     writer.interface.writeAll(request_data) catch return false;
     writer.interface.flush() catch return false;
@@ -621,7 +623,8 @@ fn streamingProxy_readHeaders_read(
         return error.NoTlsConnection;
     } else {
         // Prevent data leaks if error occurs mid-read, deterministic debugging.
-        var read_buf = [_]u8{0} ** MAX_BODY_CHUNK_BYTES;
+        // Safe undefined: buffer fully written by read before use.
+        var read_buf: [MAX_BODY_CHUNK_BYTES]u8 = undefined;
         var reader = stream.reader(ctx.io, &read_buf);
         var bufs: [1][]u8 = .{header_buffer[header_len..]};
         return try reader.interface.readVec(&bufs);
@@ -845,7 +848,8 @@ fn streamingProxy_streamBody_contentLength(
     bytes_received: *u32,
 ) void {
     // Prevent data leaks if error occurs mid-read, deterministic debugging.
-    var body_buf = [_]u8{0} ** MAX_BODY_CHUNK_BYTES;
+    // Safe undefined: buffer fully written by read before forwarding.
+    var body_buf: [MAX_BODY_CHUNK_BYTES]u8 = undefined;
 
     // Prevent infinite loops from malicious backends sending endless body data.
     var iterations: u32 = 0;
@@ -898,7 +902,8 @@ fn streamingProxy_streamBody_chunked(
     bytes_received: *u32,
 ) void {
     // Prevent data leaks if error occurs mid-read, deterministic debugging.
-    var body_buf = [_]u8{0} ** MAX_BODY_CHUNK_BYTES;
+    // Safe undefined: buffer fully written by read before forwarding.
+    var body_buf: [MAX_BODY_CHUNK_BYTES]u8 = undefined;
 
     // Prevent infinite loops from malicious backends sending endless chunked data.
     var iterations: u32 = 0;
@@ -953,7 +958,8 @@ fn streamingProxy_streamBody_read(
         return error.NoTlsConnection;
     } else {
         // Prevent data leaks if error occurs mid-read, deterministic debugging.
-        var read_buf = [_]u8{0} ** MAX_BODY_CHUNK_BYTES;
+        // Safe undefined: buffer fully written by read before use.
+        var read_buf: [MAX_BODY_CHUNK_BYTES]u8 = undefined;
         var reader = stream.reader(ctx.io, &read_buf);
         var bufs: [1][]u8 = .{body_buf[0..read_size]};
         return try reader.interface.readVec(&bufs);
@@ -984,7 +990,8 @@ fn streamingProxy_finalize(
     if (proxy_state.is_tls) {
         proxy_state.can_return_to_pool = false;
     } else if (proxy_state.sock.stream) |stream| {
-        var read_buf = [_]u8{0} ** MAX_BODY_CHUNK_BYTES;
+        // Safe undefined: buffer fully written by read before use.
+        var read_buf: [MAX_BODY_CHUNK_BYTES]u8 = undefined;
         var reader = stream.reader(ctx.io, &read_buf);
         const buffered_remaining = reader.interface.bufferedLen();
         if (buffered_remaining > 0) {
