@@ -1,13 +1,12 @@
 /// Universal Socket Abstraction for HTTP/HTTPS
 ///
 /// Simplified socket wrapper using Zig 0.16's std.Io for async operations.
-/// Supports TLS via std.crypto.tls.Client with configurable certificate verification.
+/// Supports TLS via ianic/tls.zig for reliable HTTPS connections.
 const std = @import("std");
 const log = std.log.scoped(.ultra_sock);
 
 const Io = std.Io;
-const tls = std.crypto.tls;
-const Certificate = std.crypto.Certificate;
+const tls = @import("tls");
 
 /// Protocol type
 pub const Protocol = enum {
@@ -24,7 +23,7 @@ pub const TlsOptions = struct {
         /// Use system trust store (default)
         system,
         /// Use custom certificate bundle
-        custom: Certificate.Bundle,
+        custom: tls.config.cert.Bundle,
     };
 
     /// Host verification mode
@@ -65,8 +64,8 @@ pub const TlsOptions = struct {
 /// UltraSock - A socket abstraction for HTTP/HTTPS connections
 pub const UltraSock = struct {
     stream: ?Io.net.Stream = null,
-    tls_client: ?tls.Client = null,
-    ca_bundle: ?Certificate.Bundle = null,
+    tls_conn: ?tls.Connection = null,
+    ca_bundle: ?tls.config.cert.Bundle = null,
     io: ?Io = null,
     protocol: Protocol,
     host: []const u8,
@@ -75,12 +74,13 @@ pub const UltraSock = struct {
     allocator: std.mem.Allocator,
     tls_options: TlsOptions,
 
-    // TLS I/O state (kept alive for duration of connection)
-    tls_read_buf: ?[]u8 = null,
-    tls_write_buf: ?[]u8 = null,
-    // Stream reader/writer must persist for TLS client lifetime
-    tls_stream_reader: ?Io.net.Stream.Reader = null,
-    tls_stream_writer: ?Io.net.Stream.Writer = null,
+    // I/O buffers for TLS (must remain valid for connection lifetime)
+    input_buf: ?[]u8 = null,
+    output_buf: ?[]u8 = null,
+
+    // Stream reader/writer - heap allocated for stable addresses
+    stream_reader: ?*Io.net.Stream.Reader = null,
+    stream_writer: ?*Io.net.Stream.Writer = null,
 
     /// Initialize a new UltraSock with default TLS options (production)
     pub fn init(allocator: std.mem.Allocator, protocol: Protocol, host: []const u8, port: u16) !UltraSock {
@@ -199,80 +199,73 @@ pub const UltraSock = struct {
         return error.UnsupportedAddressFamily;
     }
 
-    /// Perform TLS handshake
+    /// Perform TLS handshake using ianic/tls.zig
     fn performTlsHandshake(self: *UltraSock, io: Io) !void {
         const stream = self.stream orelse return error.SocketNotInitialized;
 
-        // Allocate TLS buffers
-        self.tls_read_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
+        // Allocate I/O buffers
+        self.input_buf = try self.allocator.alloc(u8, tls.input_buffer_len);
         errdefer {
-            if (self.tls_read_buf) |b| self.allocator.free(b);
-            self.tls_read_buf = null;
+            if (self.input_buf) |b| self.allocator.free(b);
+            self.input_buf = null;
         }
 
-        self.tls_write_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
+        self.output_buf = try self.allocator.alloc(u8, tls.output_buffer_len);
         errdefer {
-            if (self.tls_write_buf) |b| self.allocator.free(b);
-            self.tls_write_buf = null;
+            if (self.output_buf) |b| self.allocator.free(b);
+            self.output_buf = null;
         }
 
         // Load system CA bundle if needed
         if (self.tls_options.ca == .system) {
-            self.ca_bundle = .{};
-            // Get current wall clock time using POSIX clock_gettime
-            const ts = std.posix.clock_gettime(.REALTIME) catch {
-                log.err("Failed to get current time for CA bundle", .{});
-                return error.CaBundleLoadFailed;
-            };
-            const now: Io.Timestamp = .{
-                .nanoseconds = @as(i96, ts.sec) * std.time.ns_per_s + ts.nsec,
-            };
-            self.ca_bundle.?.rescan(self.allocator, io, now) catch |err| {
+            self.ca_bundle = tls.config.cert.fromSystem(self.allocator, io) catch |err| {
                 log.err("Failed to load system CA bundle: {}", .{err});
                 return error.CaBundleLoadFailed;
             };
             log.debug("Loaded {} certificates from system trust store", .{self.ca_bundle.?.map.count()});
         }
 
-        // Set up TCP stream readers/writers for TLS - must persist for TLS client lifetime
-        self.tls_stream_reader = stream.reader(io, self.tls_read_buf.?);
-        self.tls_stream_writer = stream.writer(io, self.tls_write_buf.?);
+        // Heap-allocate stream reader/writer for stable addresses
+        self.stream_reader = try self.allocator.create(Io.net.Stream.Reader);
+        errdefer {
+            if (self.stream_reader) |r| self.allocator.destroy(r);
+            self.stream_reader = null;
+        }
+        self.stream_reader.?.* = stream.reader(io, self.input_buf.?);
 
-        // Generate entropy for handshake
-        var entropy: [176]u8 = undefined;
-        std.crypto.random.bytes(&entropy);
+        self.stream_writer = try self.allocator.create(Io.net.Stream.Writer);
+        errdefer {
+            if (self.stream_writer) |w| self.allocator.destroy(w);
+            self.stream_writer = null;
+        }
+        self.stream_writer.?.* = stream.writer(io, self.output_buf.?);
 
-        // Get current time in seconds for certificate validation
-        const time_ts = std.posix.clock_gettime(.REALTIME) catch {
-            log.err("Failed to get current time for TLS handshake", .{});
-            return error.TlsHandshakeFailed;
-        };
-        const now_sec: i64 = time_ts.sec;
+        // Get current time for certificate validation
+        const now = try Io.Clock.real.now(io);
 
         log.debug("Starting TLS handshake with {s}:{}", .{ self.host, self.port });
 
-        // Build TLS options inline (the types are anonymous unions)
-        const options: tls.Client.Options = .{
+        // Build TLS options
+        const client_opts: tls.config.Client = .{
             .host = switch (self.tls_options.host) {
-                .none => .no_verification,
-                .from_connection => .{ .explicit = self.host },
-                .explicit => |h| .{ .explicit = h },
+                .none => "",
+                .from_connection => self.host,
+                .explicit => |h| h,
             },
-            .ca = switch (self.tls_options.ca) {
-                .none => .no_verification,
-                .system => .{ .bundle = self.ca_bundle.? },
-                .custom => |bundle| .{ .bundle = bundle },
+            .root_ca = switch (self.tls_options.ca) {
+                .none => .{},
+                .system => self.ca_bundle.?,
+                .custom => |bundle| bundle,
             },
-            .read_buffer = self.tls_read_buf.?,
-            .write_buffer = self.tls_write_buf.?,
-            .entropy = &entropy,
-            .realtime_now_seconds = now_sec,
+            .insecure_skip_verify = self.tls_options.ca == .none,
+            .now = now,
         };
 
-        self.tls_client = tls.Client.init(
-            &self.tls_stream_reader.?.interface,
-            &self.tls_stream_writer.?.interface,
-            options,
+        // Perform TLS handshake
+        self.tls_conn = tls.client(
+            &self.stream_reader.?.interface,
+            &self.stream_writer.?.interface,
+            client_opts,
         ) catch |err| {
             log.err("TLS handshake failed: {}", .{err});
             return error.TlsHandshakeFailed;
@@ -281,20 +274,15 @@ pub const UltraSock = struct {
         log.info("TLS connection established with {s}:{}", .{ self.host, self.port });
     }
 
-    /// Send all data over the socket - uses passed io context
+    /// Send all data over the socket
     pub fn send_all(self: *UltraSock, io: Io, data: []const u8) !usize {
         if (!self.connected) return error.NotConnected;
 
-        if (self.tls_client) |*tls_c| {
-            // TLS: write through encrypted channel
-            tls_c.writer.writeAll(data) catch |err| {
+        if (self.tls_conn) |*conn| {
+            // TLS: write through encrypted channel (uses io context from handshake)
+            conn.writeAll(data) catch |err| {
                 self.connected = false;
                 log.debug("TLS write error: {}", .{err});
-                return error.BrokenPipe;
-            };
-            tls_c.writer.flush() catch |err| {
-                self.connected = false;
-                log.debug("TLS flush error: {}", .{err});
                 return error.BrokenPipe;
             };
             return data.len;
@@ -320,14 +308,13 @@ pub const UltraSock = struct {
         return self.send_all(io, data);
     }
 
-    /// Receive data from the socket - uses passed io context
+    /// Receive data from the socket
     pub fn recv(self: *UltraSock, io: Io, buffer: []u8) !usize {
         if (!self.connected) return error.NotConnected;
 
-        if (self.tls_client) |*tls_c| {
-            // TLS: read from decrypted channel
-            var bufs: [1][]u8 = .{buffer};
-            const n = tls_c.reader.readVec(&bufs) catch |err| {
+        if (self.tls_conn) |*conn| {
+            // TLS: read from decrypted channel (uses io context from handshake)
+            const n = conn.read(buffer) catch |err| {
                 self.connected = false;
                 if (err == error.EndOfStream) return 0;
                 log.debug("TLS read error: {}", .{err});
@@ -355,6 +342,14 @@ pub const UltraSock = struct {
         }
     }
 
+    /// Get the TLS connection (for direct access to writeAll/read/next)
+    pub fn getTlsConnection(self: *UltraSock) ?*tls.Connection {
+        if (self.tls_conn != null) {
+            return &self.tls_conn.?;
+        }
+        return null;
+    }
+
     /// Close the underlying TCP stream
     fn closeStream(self: *UltraSock) void {
         if (self.stream) |stream| {
@@ -365,23 +360,36 @@ pub const UltraSock = struct {
 
     /// Free TLS resources
     fn freeTlsResources(self: *UltraSock) void {
-        self.tls_client = null;
-        self.tls_stream_reader = null;
-        self.tls_stream_writer = null;
+        // Close TLS connection gracefully
+        if (self.tls_conn) |*conn| {
+            conn.close() catch {};
+            self.tls_conn = null;
+        }
 
+        // Free heap-allocated stream reader/writer
+        if (self.stream_reader) |r| {
+            self.allocator.destroy(r);
+            self.stream_reader = null;
+        }
+        if (self.stream_writer) |w| {
+            self.allocator.destroy(w);
+            self.stream_writer = null;
+        }
+
+        // Free CA bundle
         if (self.ca_bundle) |*bundle| {
             bundle.deinit(self.allocator);
             self.ca_bundle = null;
         }
 
-        if (self.tls_read_buf) |buf| {
+        // Free I/O buffers
+        if (self.input_buf) |buf| {
             self.allocator.free(buf);
-            self.tls_read_buf = null;
+            self.input_buf = null;
         }
-
-        if (self.tls_write_buf) |buf| {
+        if (self.output_buf) |buf| {
             self.allocator.free(buf);
-            self.tls_write_buf = null;
+            self.output_buf = null;
         }
     }
 
@@ -456,7 +464,7 @@ pub const UltraSock = struct {
     /// Write all data using POSIX (returns error instead of panicking)
     /// Note: For TLS connections, use send_all instead
     pub fn posixWriteAll(self: *UltraSock, data: []const u8) !void {
-        if (self.tls_client != null) {
+        if (self.tls_conn != null) {
             // For TLS, we need io context - this is a legacy API
             return error.UseSendAllForTls;
         }
@@ -485,7 +493,7 @@ pub const UltraSock = struct {
     /// Read data using POSIX (returns error instead of panicking)
     /// Note: For TLS connections, use recv instead
     pub fn posixRead(self: *UltraSock, buffer: []u8) !usize {
-        if (self.tls_client != null) {
+        if (self.tls_conn != null) {
             // For TLS, we need io context - this is a legacy API
             return error.UseRecvForTls;
         }
@@ -549,32 +557,7 @@ pub const UltraSock = struct {
 
     /// Check if this is a TLS connection
     pub fn isTls(self: *const UltraSock) bool {
-        return self.tls_client != null;
-    }
-
-    /// Get mutable pointer to TLS client (for direct reader/writer access)
-    /// Returns null for plain HTTP connections
-    pub fn getTlsClient(self: *UltraSock) ?*tls.Client {
-        if (self.tls_client != null) {
-            return &self.tls_client.?;
-        }
-        return null;
-    }
-
-    /// Get the underlying stream reader error (for debugging TLS read failures)
-    pub fn getStreamReaderError(self: *UltraSock) ?Io.net.Stream.Reader.Error {
-        if (self.tls_stream_reader) |*reader| {
-            return reader.err;
-        }
-        return null;
-    }
-
-    /// Get the underlying stream writer error (for debugging TLS write failures)
-    pub fn getStreamWriterError(self: *UltraSock) ?Io.net.Stream.Writer.Error {
-        if (self.tls_stream_writer) |*writer| {
-            return writer.err;
-        }
-        return null;
+        return self.tls_conn != null;
     }
 
     /// Create from backend config

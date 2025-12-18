@@ -13,6 +13,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     }).module("zzz");
 
+    // TLS module (ianic/tls.zig - better TLS implementation than std)
+    const tls_module = b.addModule("tls", .{
+        .root_source_file = b.path("vendor/tls/src/root.zig"),
+    });
+
     // Backend 1
     const backend1_mod = b.createModule(.{
         .root_source_file = b.path("backend1.zig"),
@@ -61,6 +66,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     load_balancer_mp_mod.addImport("zzz", zzz_module);
+    load_balancer_mp_mod.addImport("tls", tls_module);
     const load_balancer_mp = b.addExecutable(.{
         .name = "load_balancer_mp",
         .root_module = load_balancer_mp_mod,
@@ -75,6 +81,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     load_balancer_sp_mod.addImport("zzz", zzz_module);
+    load_balancer_sp_mod.addImport("tls", tls_module);
     const load_balancer_sp = b.addExecutable(.{
         .name = "load_balancer_sp",
         .root_module = load_balancer_sp_mod,
