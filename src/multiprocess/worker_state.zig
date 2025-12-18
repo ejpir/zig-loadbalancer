@@ -1,7 +1,8 @@
 /// Worker State
 ///
 /// Composite state for a single-threaded worker process.
-/// Combines health tracking, circuit breaker, backend selection, and connection pooling.
+/// Combines health tracking, circuit breaker, backend selection,
+/// and connection pooling.
 const std = @import("std");
 const posix = std.posix;
 
@@ -74,7 +75,8 @@ pub const WorkerState = struct {
         state.circuit_breaker.initBackends(backends.items.len);
 
         // Initialize backend health metrics
-        metrics.global_metrics.updateBackendHealth(@intCast(backends.items.len), 0);
+        const backend_count: u32 = @intCast(backends.items.len);
+        metrics.global_metrics.updateBackendHealth(backend_count, 0);
 
         return state;
     }
@@ -85,8 +87,12 @@ pub const WorkerState = struct {
     }
 
     /// Select a backend using the specified strategy
-    /// Hot path - comptime strategy for zero-cost abstraction
-    pub inline fn selectBackend(self: *WorkerState, comptime strategy: types.LoadBalancerStrategy) ?usize {
+    /// Hot path - comptime strategy enables zero-cost abstraction
+    pub inline fn selectBackend(
+        self: *WorkerState,
+        comptime strategy: types.LoadBalancerStrategy,
+    ) ?usize {
+        std.debug.assert(self.backends.items.len <= MAX_BACKENDS);
         if (self.backends.items.len == 0) return null;
 
         var selector = BackendSelector{
@@ -133,7 +139,9 @@ pub const WorkerState = struct {
         const total = self.backends.items.len;
         const healthy = self.circuit_breaker.countHealthy();
         const unhealthy = if (total > healthy) total - healthy else 0;
-        metrics.global_metrics.updateBackendHealth(@intCast(healthy), @intCast(unhealthy));
+        const healthy_u32: u32 = @intCast(healthy);
+        const unhealthy_u32: u32 = @intCast(unhealthy);
+        metrics.global_metrics.updateBackendHealth(healthy_u32, unhealthy_u32);
     }
 
     /// Check if a backend is healthy
@@ -156,6 +164,7 @@ pub const WorkerState = struct {
 
     /// Get backend by index
     pub fn getBackend(self: *const WorkerState, idx: usize) ?*const types.BackendServer {
+        std.debug.assert(self.backends.items.len <= MAX_BACKENDS);
         if (idx >= self.backends.items.len) return null;
         return &self.backends.items[idx];
     }
@@ -170,7 +179,8 @@ pub const WorkerState = struct {
         if (backend_idx >= MAX_BACKENDS) return false;
         const now = currentTimeMillis();
         const last = self.last_check_time[backend_idx];
-        return (now - last) >= @as(i64, @intCast(self.config.probe_interval_ms));
+        const interval: i64 = @intCast(self.config.probe_interval_ms);
+        return (now - last) >= interval;
     }
 
     /// Update last probe time
@@ -264,7 +274,8 @@ test "WorkerState: round-robin counter increments correctly" {
 
     // Verify alternating pattern over many requests
     for (0..10) |i| {
-        const expected_backend = (i + 2) % 2; // +2 because we already did 2 selections
+        // +2 offset because we already did 2 selections above
+        const expected_backend = (i + 2) % 2;
         const selected = state.selectBackend(.round_robin);
         try std.testing.expectEqual(@as(?usize, expected_backend), selected);
     }

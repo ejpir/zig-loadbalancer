@@ -1,7 +1,7 @@
 /// Multi-Process Health Probing
 ///
-/// Periodic health probes that check backend availability in a background thread.
-/// Uses blocking I/O since probes run independently of the main request handling.
+/// Periodic health probes check backend availability in background thread.
+/// Uses blocking I/O since probes run independently of request handling.
 const std = @import("std");
 const log = std.log.scoped(.health);
 const posix = std.posix;
@@ -20,7 +20,10 @@ fn healthProbeLoop(state: *WorkerState, worker_id: usize) void {
     const backends = state.backends;
     const config = state.config;
 
-    log.info("Worker {d}: Health probe thread started (interval: {d}ms)", .{ worker_id, config.probe_interval_ms });
+    log.info(
+        "Worker {d}: Health probe thread started (interval: {d}ms)",
+        .{ worker_id, config.probe_interval_ms },
+    );
 
     // Initial delay before first probe
     posix.nanosleep(1, 0);
@@ -33,12 +36,10 @@ fn healthProbeLoop(state: *WorkerState, worker_id: usize) void {
                 if (!state.isHealthy(idx)) {
                     state.recordSuccess(idx);
                     if (state.isHealthy(idx)) {
-                        log.warn("Worker {d}: Backend {d} ({s}:{d}) now HEALTHY", .{
-                            worker_id,
-                            idx + 1,
-                            backend.getFullHost(),
-                            backend.port,
-                        });
+                        log.warn(
+                            "Worker {d}: Backend {d} ({s}:{d}) now HEALTHY",
+                            .{ worker_id, idx + 1, backend.getFullHost(), backend.port },
+                        );
                     }
                 } else {
                     // Already healthy, reset failure count
@@ -48,12 +49,10 @@ fn healthProbeLoop(state: *WorkerState, worker_id: usize) void {
                 if (state.isHealthy(idx)) {
                     state.recordFailure(idx);
                     if (!state.isHealthy(idx)) {
-                        log.warn("Worker {d}: Backend {d} ({s}:{d}) now UNHEALTHY", .{
-                            worker_id,
-                            idx + 1,
-                            backend.getFullHost(),
-                            backend.port,
-                        });
+                        log.warn(
+                            "Worker {d}: Backend {d} ({s}:{d}) now UNHEALTHY",
+                            .{ worker_id, idx + 1, backend.getFullHost(), backend.port },
+                        );
                     }
                 }
             }
@@ -80,17 +79,21 @@ fn probeBackend(backend: *const types.BackendServer, config: Config) bool {
         .addr = 0,
     };
 
-    // Parse dotted-decimal IP
-    var parts: [4]u8 = undefined;
+    // Parse dotted-decimal IP (IPv4 = 4 octets)
+    const MAX_IP_OCTETS = 4;
+    var parts: [MAX_IP_OCTETS]u8 = [_]u8{0} ** MAX_IP_OCTETS;
     var iter = std.mem.splitScalar(u8, host, '.');
     var i: usize = 0;
     while (iter.next()) |part| : (i += 1) {
-        if (i >= 4) return false;
+        if (i >= MAX_IP_OCTETS) return false;
         parts[i] = std.fmt.parseInt(u8, part, 10) catch return false;
     }
-    if (i != 4) return false;
+    if (i != MAX_IP_OCTETS) return false;
 
-    addr.addr = @as(u32, parts[0]) | (@as(u32, parts[1]) << 8) | (@as(u32, parts[2]) << 16) | (@as(u32, parts[3]) << 24);
+    addr.addr = @as(u32, parts[0]) |
+        (@as(u32, parts[1]) << 8) |
+        (@as(u32, parts[2]) << 16) |
+        (@as(u32, parts[3]) << 24);
 
     return probeAddressRaw(&addr, config);
 }
@@ -106,20 +109,27 @@ fn probeAddressRaw(addr: *const posix.sockaddr.in, config: Config) bool {
         .sec = @intCast(@divTrunc(timeout_us, 1_000_000)),
         .usec = @intCast(@mod(timeout_us, 1_000_000)),
     };
-    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
-    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout)) catch {};
+    const timeout_bytes = std.mem.asBytes(&timeout);
+    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, timeout_bytes) catch {};
+    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, timeout_bytes) catch {};
 
     // Connect
-    posix.connect(sock, @ptrCast(addr), @sizeOf(posix.sockaddr.in)) catch return false;
+    const addr_size = @sizeOf(posix.sockaddr.in);
+    posix.connect(sock, @ptrCast(addr), addr_size) catch return false;
 
     // Send HTTP request
-    var request_buf: [256]u8 = undefined;
-    const request = std.fmt.bufPrint(&request_buf, "GET {s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{config.health_path}) catch return false;
+    var request_buf: [256]u8 = [_]u8{0} ** 256;
+    const fmt_str = "GET {s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    const request = std.fmt.bufPrint(
+        &request_buf,
+        fmt_str,
+        .{config.health_path},
+    ) catch return false;
 
     _ = posix.send(sock, request, 0) catch return false;
 
     // Read response
-    var buffer: [512]u8 = undefined;
+    var buffer: [512]u8 = [_]u8{0} ** 512;
     const n = posix.recv(sock, &buffer, 0) catch return false;
     if (n == 0) return false;
 

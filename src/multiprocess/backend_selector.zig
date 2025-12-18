@@ -37,8 +37,9 @@ pub const BackendSelector = struct {
     }
 
     /// Round-robin selection among healthy backends
-    /// Precondition: at least one healthy backend exists (checked by select())
+    /// Precondition: at least one healthy backend exists
     fn selectRoundRobin(self: *BackendSelector) usize {
+        std.debug.assert(self.health.countHealthy() > 0);
         var attempts: usize = 0;
         while (attempts < self.backend_count) : (attempts += 1) {
             const candidate = (self.rr_counter +% attempts) % self.backend_count;
@@ -54,6 +55,7 @@ pub const BackendSelector = struct {
     /// Fast random selection using bit manipulation
     /// O(popcount) instead of O(backend_count) - uses findNthHealthy
     inline fn selectRandomFast(self: *BackendSelector, healthy_count: usize) usize {
+        std.debug.assert(healthy_count > 0);
         if (healthy_count == 0) return 0;
 
         // Simple xorshift PRNG - fast and good enough for load balancing
@@ -63,7 +65,9 @@ pub const BackendSelector = struct {
         if (self.random_state == 0) {
             // Seed from monotonic clock
             if (std.posix.clock_gettime(.MONOTONIC)) |ts| {
-                self.random_state = @as(u64, @intCast(ts.nsec)) ^ @as(u64, @intCast(ts.sec));
+                const nsec = @as(u64, @intCast(ts.nsec));
+                const sec = @as(u64, @intCast(ts.sec));
+                self.random_state = nsec ^ sec;
             } else |_| {
                 self.random_state = 1;
             }

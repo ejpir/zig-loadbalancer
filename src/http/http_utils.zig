@@ -33,7 +33,8 @@ pub fn determineMessageLength(
 
             // Check if chunked is the final encoding
             if (std.mem.lastIndexOfScalar(u8, value_str, ',')) |comma_pos| {
-                const final_encoding = std.mem.trim(u8, value_str[comma_pos + 1 ..], " \t");
+                const final_encoding =
+                    std.mem.trim(u8, value_str[comma_pos + 1 ..], " \t");
                 if (std.ascii.eqlIgnoreCase(final_encoding, "chunked")) {
                     return .{ .type = .chunked };
                 }
@@ -89,7 +90,8 @@ fn getContentLength(data: []const u8) ?usize {
     while (line_iter.next()) |line| {
         if (std.ascii.indexOfIgnoreCase(line, "content-length:")) |pos| {
             const value_start = pos + "content-length:".len;
-            const value_str = std.mem.trim(u8, line[value_start..], " \t");
+            const value_str =
+                std.mem.trim(u8, line[value_start..], " \t");
             return std.fmt.parseInt(usize, value_str, 10) catch null;
         }
     }
@@ -103,7 +105,8 @@ fn hasConflictingContentLength(data: []const u8) bool {
     while (line_iter.next()) |line| {
         if (std.ascii.indexOfIgnoreCase(line, "content-length:")) |pos| {
             const value_start = pos + "content-length:".len;
-            const value_str = std.mem.trim(u8, line[value_start..], " \t");
+            const value_str =
+                std.mem.trim(u8, line[value_start..], " \t");
             const length = std.fmt.parseInt(usize, value_str, 10) catch {
                 return true;
             };

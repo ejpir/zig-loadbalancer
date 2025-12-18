@@ -14,7 +14,7 @@
 /// - `[N]u64` array for manual scaling
 ///
 /// Related constants in: circuit_breaker.zig, backend_selector.zig,
-/// worker_state.zig, simple_connection_pool.zig
+/// worker_state.zig, and simple_connection_pool.zig
 const std = @import("std");
 
 /// Maximum supported backends. Limited by u64 bitmap.

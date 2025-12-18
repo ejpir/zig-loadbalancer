@@ -29,24 +29,30 @@ fn proxyHandler(ctx: *const Context, _: void) !Respond {
     defer backend.close(io);
 
     // Forward request
-    var write_buf: [4096]u8 = undefined;
+    var write_buf = [_]u8{0} ** 4096;
     var writer = backend.writer(io, &write_buf);
 
     const method = @tagName(ctx.request.method orelse .GET);
     const uri = ctx.request.uri orelse "/";
 
-    writer.interface.print("{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:9002\r\nConnection: close\r\n\r\n", .{ method, uri }) catch {
-        return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.HTML });
+    const fmt = "{s} {s} HTTP/1.1\r\n" ++
+        "Host: 127.0.0.1:9002\r\n" ++
+        "Connection: close\r\n\r\n";
+    writer.interface.print(fmt, .{ method, uri }) catch {
+        return ctx.response.apply(.{
+            .status = .@"Bad Gateway",
+            .mime = http.Mime.HTML,
+        });
     };
     writer.interface.flush() catch {
         return ctx.response.apply(.{ .status = .@"Bad Gateway", .mime = http.Mime.HTML });
     };
 
     // Read response
-    var read_buf: [4096]u8 = undefined;
+    var read_buf = [_]u8{0} ** 4096;
     var reader = backend.reader(io, &read_buf);
 
-    var response_buf: [8192]u8 = undefined;
+    var response_buf = [_]u8{0} ** 8192;
     var response_len: usize = 0;
 
     while (response_len < response_buf.len) {
@@ -104,10 +110,16 @@ pub fn main() !void {
     defer router.deinit(allocator);
 
     const addr = try Io.net.IpAddress.parse(host, port);
-    var socket = try addr.listen(io, .{ .kernel_backlog = 4096, .reuse_address = true });
+    var socket = try addr.listen(io, .{
+        .kernel_backlog = 4096,
+        .reuse_address = true,
+    });
     defer socket.deinit(io);
 
-    log.warn("Proxy backend listening on {s}:{d} -> 127.0.0.1:9002", .{ host, port });
+    log.warn("Proxy backend listening on {s}:{d} -> 127.0.0.1:9002", .{
+        host,
+        port,
+    });
 
     server = try Server.init(allocator, .{
         .socket_buffer_bytes = 1024 * 32,

@@ -33,7 +33,8 @@ pub const HttpVersion = struct {
     minor: u8,
 
     pub fn isAtLeast(self: HttpVersion, major: u8, minor: u8) bool {
-        return (self.major > major) or (self.major == major and self.minor >= minor);
+        return (self.major > major) or
+            (self.major == major and self.minor >= minor);
     }
 
     pub const HTTP_1_0 = HttpVersion{ .major = 1, .minor = 0 };
@@ -45,7 +46,7 @@ pub const HttpVersion = struct {
 /// Data structure optimized for CPU cache performance by separating hot and cold data.
 pub const BackendServer = struct {
     // === HOT PATH DATA (First Cache Line - 64 bytes) ===
-    /// Health status - checked on every request
+    /// Align to cache line boundary to prevent false sharing across threads
     healthy: std.atomic.Value(bool) align(64) = std.atomic.Value(bool).init(true),
 
     /// Host string pointer and length
