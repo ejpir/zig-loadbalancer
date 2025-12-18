@@ -208,7 +208,7 @@ pub fn main() !void {
 
     server = try Server.init(allocator, .{
         .socket_buffer_bytes = 1024 * 32,
-        .keepalive_count_max = 1000,
+        .keepalive_count_max = null, // unlimited
         .connection_count_max = 10000,
     });
     defer server.deinit();

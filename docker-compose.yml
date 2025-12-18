@@ -38,7 +38,9 @@ services:
     # Multi-process (_mp) works on macOS (kqueue) but not Linux (io_uring).
     command:
       [
-        "./zig-out/bin/load_balancer_sp",
+        "./zig-out/bin/load_balancer_mp",
+        "--workers",
+        "4",
         "--port",
         "8080",
         "--backend",
