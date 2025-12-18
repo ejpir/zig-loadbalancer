@@ -89,11 +89,17 @@ Mix HTTP and HTTPS backends freely.
 -b, --backend H:P    Backend server (repeat for multiple)
 ```
 
-Single-process mode for macOS or simpler setups:
+## Modes
+
+**Multi-process** (`load_balancer_mp`) — nginx-style fork() with SO_REUSEPORT. Best for Linux production.
+
+**Single-process** (`load_balancer_sp`) — One process, internal thread pool. Best for macOS or lower memory footprint.
 
 ```bash
 ./zig-out/bin/load_balancer_sp -p 8080 -b localhost:9001
 ```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for threading details.
 
 ## Metrics
 
