@@ -203,11 +203,13 @@ Full compliance with HTTP/1.1 message framing:
 
 ### Socket Abstraction (`ultra_sock.zig`)
 
-Universal socket abstraction for HTTP:
+Universal socket abstraction for HTTP/HTTPS:
 - Unified interface for backend connections
 - Uses `std.Io.net.Stream` for async I/O
 - Connection pooling for backend reuse
-- HTTPS support planned (currently falls back to HTTP)
+- TLS support via ianic/tls.zig (TLS 1.2/1.3)
+- Automatic HTTPS for port 443 backends
+- System CA bundle for certificate verification
 
 ## Performance Characteristics
 
