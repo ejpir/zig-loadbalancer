@@ -95,7 +95,6 @@ pub const BackendSelector = struct {
     inline fn selectRandomFast(self: *BackendSelector, healthy_count: usize) usize {
         std.debug.assert(healthy_count > 0);
         std.debug.assert(self.random_state != 0); // Must be seeded by WorkerState
-        if (healthy_count == 0) return 0;
 
         // Simple xorshift PRNG - fast and good enough for load balancing
         self.random_state ^= self.random_state << 13;
