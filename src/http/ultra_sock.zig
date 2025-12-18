@@ -153,7 +153,7 @@ pub const UltraSock = struct {
         port_z_buf[port_str.len] = 0;
         const port_z: [*:0]const u8 = port_z_buf[0..port_str.len :0];
 
-        const hints: std.posix.addrinfo = .{
+        const hints: std.c.addrinfo = .{
             .flags = .{},
             .family = std.posix.AF.UNSPEC,
             .socktype = std.posix.SOCK.STREAM,
@@ -164,13 +164,13 @@ pub const UltraSock = struct {
             .next = null,
         };
 
-        var res: ?*std.posix.addrinfo = null;
-        const rc = std.posix.system.getaddrinfo(host_z, port_z, &hints, &res);
-        if (rc != @as(std.posix.system.EAI, @enumFromInt(0))) {
+        var res: ?*std.c.addrinfo = null;
+        const rc = std.c.getaddrinfo(host_z, port_z, &hints, &res);
+        if (@intFromEnum(rc) != 0) {
             log.err("getaddrinfo failed for {s}", .{host});
             return error.DnsResolutionFailed;
         }
-        defer if (res) |r| std.posix.system.freeaddrinfo(r);
+        defer if (res) |r| std.c.freeaddrinfo(r);
 
         // Get first result
         const info = res orelse return error.NoAddressFound;
@@ -178,7 +178,7 @@ pub const UltraSock = struct {
 
         // Convert to Io.net.IpAddress
         if (sockaddr.family == std.posix.AF.INET) {
-            const addr4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(sockaddr));
+            const addr4: *const std.c.sockaddr.in = @ptrCast(@alignCast(sockaddr));
             return Io.net.IpAddress{
                 .ip4 = .{
                     .bytes = @bitCast(addr4.addr),
@@ -186,7 +186,7 @@ pub const UltraSock = struct {
                 },
             };
         } else if (sockaddr.family == std.posix.AF.INET6) {
-            const addr6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(sockaddr));
+            const addr6: *const std.c.sockaddr.in6 = @ptrCast(@alignCast(sockaddr));
             return Io.net.IpAddress{
                 .ip6 = .{
                     .bytes = addr6.addr,

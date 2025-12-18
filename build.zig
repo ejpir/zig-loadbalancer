@@ -64,6 +64,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("main_multiprocess.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true, // Required for DNS resolution (getaddrinfo)
     });
     load_balancer_mp_mod.addImport("zzz", zzz_module);
     load_balancer_mp_mod.addImport("tls", tls_module);
@@ -79,6 +80,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("main_singleprocess.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true, // Required for DNS resolution (getaddrinfo)
     });
     load_balancer_sp_mod.addImport("zzz", zzz_module);
     load_balancer_sp_mod.addImport("tls", tls_module);
@@ -94,8 +96,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/test_load_balancer.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true, // Required for DNS resolution (getaddrinfo)
     });
     unit_tests_mod.addImport("zzz", zzz_module);
+    unit_tests_mod.addImport("tls", tls_module);
     const unit_tests = b.addTest(.{
         .name = "unit_tests",
         .root_module = unit_tests_mod,
