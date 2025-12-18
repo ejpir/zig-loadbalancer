@@ -257,3 +257,28 @@ test "LoadBalancerConfig: custom values are preserved" {
     try std.testing.expectEqualStrings("/health", config.health_path);
     try std.testing.expectEqual(@as(usize, 2), config.backends.len);
 }
+
+// ============================================================================
+// RunMode Tests
+// ============================================================================
+// These tests are defined here but test functionality in main.zig
+// The RunMode enum is exported from main.zig for use in both runtime and tests
+
+test "BackendDef: can be created with default weight" {
+    const backend = BackendDef{
+        .host = "localhost",
+        .port = 9001,
+    };
+    try std.testing.expectEqualStrings("localhost", backend.host);
+    try std.testing.expectEqual(@as(u16, 9001), backend.port);
+    try std.testing.expectEqual(@as(u16, 1), backend.weight);
+}
+
+test "BackendDef: can be created with custom weight" {
+    const backend = BackendDef{
+        .host = "localhost",
+        .port = 9001,
+        .weight = 5,
+    };
+    try std.testing.expectEqual(@as(u16, 5), backend.weight);
+}

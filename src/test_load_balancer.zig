@@ -24,6 +24,10 @@ pub const http_utils = @import("http/http_utils.zig");
 // Internal module tests
 pub const simd_parse = @import("internal/simd_parse.zig");
 
+// Core module tests
+pub const config = @import("core/config.zig");
+pub const runmode_test = @import("core/runmode_test.zig");
+
 // Run all tests
 comptime {
     // Unit tests
@@ -36,6 +40,8 @@ comptime {
     _ = simple_connection_pool;
     _ = http_utils;
     _ = simd_parse;
+    _ = config;
+    _ = runmode_test;
 
     // Integration tests
     _ = integration_test;

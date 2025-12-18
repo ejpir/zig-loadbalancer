@@ -34,11 +34,13 @@ services:
 
   loadbalancer:
     build: .
-    # NOTE: Using single-process (_sp) because fork() + io_uring don't work together on Linux.
-    # Multi-process (_mp) works on macOS (kqueue) but not Linux (io_uring).
+    # Using unified load_balancer with explicit mode selection
+    # mp (multiprocess) mode works on Linux with SO_REUSEPORT
     command:
       [
-        "./zig-out/bin/load_balancer_mp",
+        "./zig-out/bin/load_balancer",
+        "--mode",
+        "mp",
         "--workers",
         "4",
         "--port",
