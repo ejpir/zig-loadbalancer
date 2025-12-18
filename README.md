@@ -189,6 +189,87 @@ main() ────────────────────────�
 | Connection pool | SimpleConnectionPool - no atomics needed |
 | Health probes | Background thread per worker - independent health state |
 
+### Single-Process Architecture (Alternative)
+
+For simpler deployments or macOS (where SO_REUSEPORT doesn't provide kernel load balancing):
+
+```bash
+# Start single-process load balancer
+./zig-out/bin/load_balancer_sp --port 8080 --strategy round_robin
+```
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    SINGLE PROCESS                           │
+│                                                             │
+│  ┌─────────────────┐    ┌─────────────────┐                │
+│  │  std.Io.Threaded │    │  Health Probe   │                │
+│  │   (thread pool)  │    │    Thread       │                │
+│  └────────┬────────┘    └────────┬────────┘                │
+│           │                      │                          │
+│           ▼                      ▼                          │
+│  ┌─────────────────────────────────────────┐               │
+│  │           Shared State                   │               │
+│  │  ┌─────────────┐  ┌──────────────────┐  │               │
+│  │  │ Connection  │  │  WorkerState     │  │               │
+│  │  │    Pool     │  │ (circuit breaker)│  │               │
+│  │  └─────────────┘  └──────────────────┘  │               │
+│  └─────────────────────────────────────────┘               │
+│                                                             │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                    ┌──────┴──────┐
+                    │  Port 8080  │
+                    └──────┬──────┘
+                           │
+                      Clients
+```
+
+**Single-Process Startup Flow:**
+
+```
+main() ──────────────────────────────────────────────────────────────────────►
+
+    │
+    ├─► Parse CLI args (--port, --host, --backend, --strategy)
+    │
+    ├─► Create GPA (thread_safe=true for health thread)
+    │
+    ├─► Create shared ConnectionPool
+    │
+    ├─► Create BackendsList
+    │
+    ├─► Create WorkerState (circuit breaker, health)
+    │
+    ├─► Start health probe background thread
+    │
+    ├─► Create std.Io.Threaded runtime (internal thread pool)
+    │
+    ├─► Create Router with proxy handler
+    │
+    ├─► Socket.listen() (no SO_REUSEPORT needed)
+    │
+    └─► HTTP server.serve()
+```
+
+| Aspect | Multi-Process | Single-Process |
+|--------|---------------|----------------|
+| **Concurrency** | fork() per worker | std.Io thread pool |
+| **Isolation** | Full process isolation | Shared memory |
+| **macOS support** | Limited (SO_REUSEPORT) | Full support |
+| **Memory** | Higher (process duplication) | Lower footprint |
+| **Connection pool** | Per-worker (no atomics) | Shared (thread-safe GPA) |
+| **Crash handling** | Master restarts workers | Process dies |
+| **Best for** | Linux production | macOS, simple deployments |
+
+**CLI Options (Single-Process):**
+```
+--port, -p N         Listen port (default: 8080)
+--host, -h IP        Listen address (default: 0.0.0.0)
+--backend, -b H:P    Add backend server (can specify multiple)
+--strategy, -s NAME  Load balancing strategy: round_robin, random, weighted
+```
+
 ## Health Checking & Failover
 
 The multi-process load balancer includes a hybrid health checking system:
