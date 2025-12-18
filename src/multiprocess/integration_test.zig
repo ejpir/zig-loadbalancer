@@ -332,3 +332,264 @@ test "integration: findHealthyBackend for failover excludes current" {
     const failover3 = state.findHealthyBackend(0);
     try std.testing.expect(failover3 == null);
 }
+
+// ============================================================================
+// Unified Health Probe + Circuit Breaker Tests
+// ============================================================================
+
+test "integration: unified health - probe success recovers circuit-breaker-tripped backend" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+    try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    var state = WorkerState.init(&backends, &pool, .{
+        .unhealthy_threshold = 3,
+        .healthy_threshold = 2,
+    });
+
+    // Backend goes down due to request failures
+    state.recordFailure(0);
+    state.recordFailure(0);
+    state.recordFailure(0);
+    try std.testing.expect(!state.isHealthy(0));
+    try std.testing.expectEqual(@as(u32, 3), state.circuit_breaker.getFailureCount(0));
+
+    // Health probe detects recovery - simulating probe success
+    state.recordSuccess(0);
+    try std.testing.expect(!state.isHealthy(0));
+    try std.testing.expectEqual(@as(u32, 1), state.circuit_breaker.getSuccessCount(0));
+    try std.testing.expectEqual(@as(u32, 0), state.circuit_breaker.getFailureCount(0));
+
+    // Second probe success recovers backend
+    state.recordSuccess(0);
+    try std.testing.expect(state.isHealthy(0));
+    try std.testing.expectEqual(@as(u32, 0), state.circuit_breaker.getSuccessCount(0));
+
+    // Real requests now routed to recovered backend
+    const selected = state.selectBackend(.round_robin);
+    try std.testing.expect(selected != null);
+}
+
+test "integration: unified health - probe failure trips circuit breaker" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    var state = WorkerState.init(&backends, &pool, .{
+        .unhealthy_threshold = 3,
+    });
+
+    // Backend is healthy
+    try std.testing.expect(state.isHealthy(0));
+
+    // Health probe detects failures - simulating probe failures
+    state.recordFailure(0);
+    try std.testing.expect(state.isHealthy(0));
+    try std.testing.expectEqual(@as(u32, 1), state.circuit_breaker.getFailureCount(0));
+
+    state.recordFailure(0);
+    try std.testing.expect(state.isHealthy(0));
+    try std.testing.expectEqual(@as(u32, 2), state.circuit_breaker.getFailureCount(0));
+
+    // Third probe failure trips circuit breaker
+    state.recordFailure(0);
+    try std.testing.expect(!state.isHealthy(0));
+    try std.testing.expectEqual(@as(u32, 3), state.circuit_breaker.getFailureCount(0));
+
+    // No backends available for requests
+    const selected = state.selectBackend(.round_robin);
+    try std.testing.expect(selected == null);
+}
+
+test "integration: unified health - no state disagreement" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    var state = WorkerState.init(&backends, &pool, .{
+        .unhealthy_threshold = 2,
+        .healthy_threshold = 2,
+    });
+
+    // Request failures trip circuit breaker
+    state.recordFailure(0);
+    state.recordFailure(0);
+    try std.testing.expect(!state.isHealthy(0));
+
+    // Probe success counts toward recovery
+    state.recordSuccess(0);
+    try std.testing.expect(!state.isHealthy(0));
+    try std.testing.expectEqual(@as(u32, 1), state.circuit_breaker.getSuccessCount(0));
+
+    // Request success completes recovery (mixed probe+request)
+    state.recordSuccess(0);
+    try std.testing.expect(state.isHealthy(0));
+
+    // No disagreement - single source of truth
+    try std.testing.expectEqual(@as(u32, 0), state.circuit_breaker.getFailureCount(0));
+    try std.testing.expectEqual(@as(u32, 0), state.circuit_breaker.getSuccessCount(0));
+}
+
+test "integration: unified health - probe and request failures both count toward threshold" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    var state = WorkerState.init(&backends, &pool, .{
+        .unhealthy_threshold = 3,
+    });
+
+    // Mix of probe and request failures
+    state.recordFailure(0); // probe failure
+    try std.testing.expect(state.isHealthy(0));
+
+    state.recordFailure(0); // request failure
+    try std.testing.expect(state.isHealthy(0));
+
+    state.recordFailure(0); // probe failure
+    try std.testing.expect(!state.isHealthy(0));
+
+    // All failures counted equally, threshold reached
+    try std.testing.expectEqual(@as(u32, 3), state.circuit_breaker.getFailureCount(0));
+}
+
+test "integration: unified health - probe success during healthy doesn't affect counters" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    var state = WorkerState.init(&backends, &pool, .{});
+
+    // Backend starts healthy
+    try std.testing.expect(state.isHealthy(0));
+
+    // Probe successes on healthy backend don't accumulate success count
+    state.recordSuccess(0);
+    state.recordSuccess(0);
+    state.recordSuccess(0);
+
+    try std.testing.expect(state.isHealthy(0));
+    try std.testing.expectEqual(@as(u32, 0), state.circuit_breaker.getSuccessCount(0));
+    try std.testing.expectEqual(@as(u32, 0), state.circuit_breaker.getFailureCount(0));
+}
+
+test "integration: unified health - probe failure resets success progress" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    var state = WorkerState.init(&backends, &pool, .{
+        .unhealthy_threshold = 2,
+        .healthy_threshold = 3,
+    });
+
+    // Trip circuit breaker
+    state.recordFailure(0);
+    state.recordFailure(0);
+    try std.testing.expect(!state.isHealthy(0));
+
+    // Begin recovery with probe successes
+    state.recordSuccess(0);
+    state.recordSuccess(0);
+    try std.testing.expectEqual(@as(u32, 2), state.circuit_breaker.getSuccessCount(0));
+    try std.testing.expect(!state.isHealthy(0));
+
+    // Probe failure resets progress
+    state.recordFailure(0);
+    try std.testing.expectEqual(@as(u32, 0), state.circuit_breaker.getSuccessCount(0));
+    try std.testing.expectEqual(@as(u32, 1), state.circuit_breaker.getFailureCount(0));
+
+    // Must restart recovery from scratch
+    state.recordSuccess(0);
+    state.recordSuccess(0);
+    try std.testing.expect(!state.isHealthy(0));
+    state.recordSuccess(0);
+    try std.testing.expect(state.isHealthy(0));
+}
+
+test "integration: unified health - mixed probe and request recovery" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+    try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    pool.init();
+    defer pool.deinit();
+
+    var state = WorkerState.init(&backends, &pool, .{
+        .unhealthy_threshold = 3,
+        .healthy_threshold = 2,
+    });
+
+    // Backend 0 goes down via request failures
+    state.recordFailure(0);
+    state.recordFailure(0);
+    state.recordFailure(0);
+    try std.testing.expect(!state.isHealthy(0));
+
+    // All traffic goes to backend 1
+    for (0..5) |_| {
+        const selected = state.selectBackend(.round_robin);
+        try std.testing.expectEqual(@as(?usize, 1), selected);
+    }
+
+    // Probe detects backend 0 recovering
+    state.recordSuccess(0); // probe success
+    try std.testing.expect(!state.isHealthy(0));
+
+    // Real request completes recovery
+    state.recordSuccess(0); // request success
+    try std.testing.expect(state.isHealthy(0));
+
+    // Traffic now distributed across both backends
+    try std.testing.expectEqual(@as(?usize, 0), state.selectBackend(.round_robin));
+    try std.testing.expectEqual(@as(?usize, 1), state.selectBackend(.round_robin));
+    try std.testing.expectEqual(@as(?usize, 0), state.selectBackend(.round_robin));
+}

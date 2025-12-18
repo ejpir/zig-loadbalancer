@@ -8,6 +8,9 @@ const http = zzz.HTTP;
 const Context = http.Context;
 const Respond = http.Respond;
 
+/// Maximum backends supported (must match proxy MAX_BACKENDS)
+const MAX_BACKENDS: u32 = 64;
+
 /// Global metrics collector with atomic counters
 pub const MetricsCollector = struct {
     // === Request Metrics ===
@@ -48,6 +51,24 @@ pub const MetricsCollector = struct {
     /// Total bytes sent to clients
     bytes_to_client: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    // === Per-Backend Metrics ===
+    /// Total requests per backend
+    requests_per_backend: [MAX_BACKENDS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_BACKENDS,
+    /// Successful requests per backend (2xx)
+    success_per_backend: [MAX_BACKENDS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_BACKENDS,
+    /// Error responses per backend (4xx, 5xx) or failures
+    errors_per_backend: [MAX_BACKENDS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_BACKENDS,
+    /// Pool hits per backend
+    pool_hits_per_backend: [MAX_BACKENDS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_BACKENDS,
+    /// Pool misses per backend
+    pool_misses_per_backend: [MAX_BACKENDS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_BACKENDS,
+    /// Total latency per backend (milliseconds)
+    latency_total_ms_per_backend: [MAX_BACKENDS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_BACKENDS,
+    /// Total bytes sent to backend
+    bytes_to_backend: [MAX_BACKENDS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_BACKENDS,
+    /// Total bytes received from backend
+    bytes_from_backend_per_backend: [MAX_BACKENDS]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** MAX_BACKENDS,
+
     /// Record a completed request
     pub fn recordRequest(self: *MetricsCollector, duration_ms: i64, status_code: u16) void {
         _ = self.requests_total.fetchAdd(1, .monotonic);
@@ -61,6 +82,58 @@ pub const MetricsCollector = struct {
             _ = self.requests_client_error.fetchAdd(1, .monotonic);
         } else if (status_code >= 500) {
             _ = self.requests_server_error.fetchAdd(1, .monotonic);
+        }
+    }
+
+    /// Record a completed request for a specific backend
+    pub fn recordRequestForBackend(
+        self: *MetricsCollector,
+        backend_idx: u32,
+        duration_ms: i64,
+        status_code: u16,
+    ) void {
+        // Bounds check to prevent out-of-bounds access
+        if (backend_idx >= MAX_BACKENDS) return;
+
+        _ = self.requests_per_backend[backend_idx].fetchAdd(1, .monotonic);
+
+        if (duration_ms > 0) {
+            _ = self.latency_total_ms_per_backend[backend_idx].fetchAdd(@intCast(duration_ms), .monotonic);
+        }
+
+        if (status_code >= 200 and status_code < 300) {
+            _ = self.success_per_backend[backend_idx].fetchAdd(1, .monotonic);
+        } else if (status_code >= 400) {
+            _ = self.errors_per_backend[backend_idx].fetchAdd(1, .monotonic);
+        }
+    }
+
+    /// Record pool hit for specific backend
+    pub fn recordPoolHitForBackend(self: *MetricsCollector, backend_idx: u32) void {
+        if (backend_idx >= MAX_BACKENDS) return;
+        _ = self.pool_hits_per_backend[backend_idx].fetchAdd(1, .monotonic);
+    }
+
+    /// Record pool miss for specific backend
+    pub fn recordPoolMissForBackend(self: *MetricsCollector, backend_idx: u32) void {
+        if (backend_idx >= MAX_BACKENDS) return;
+        _ = self.pool_misses_per_backend[backend_idx].fetchAdd(1, .monotonic);
+    }
+
+    /// Record bytes transferred for specific backend
+    pub fn recordBytesForBackend(
+        self: *MetricsCollector,
+        backend_idx: u32,
+        to_backend: u64,
+        from_backend: u64,
+    ) void {
+        if (backend_idx >= MAX_BACKENDS) return;
+
+        if (to_backend > 0) {
+            _ = self.bytes_to_backend[backend_idx].fetchAdd(to_backend, .monotonic);
+        }
+        if (from_backend > 0) {
+            _ = self.bytes_from_backend_per_backend[backend_idx].fetchAdd(from_backend, .monotonic);
         }
     }
 
@@ -115,7 +188,10 @@ pub const MetricsCollector = struct {
         const snapshot = self.loadSnapshot();
         const derived = calculateDerivedMetrics(snapshot);
 
-        return std.fmt.bufPrint(buffer,
+        var pos: usize = 0;
+
+        // Global metrics
+        const global_metrics_text = try std.fmt.bufPrint(buffer[pos..],
             \\# HELP zzz_lb_requests_total Total requests processed
             \\# TYPE zzz_lb_requests_total counter
             \\zzz_lb_requests_total {d}
@@ -180,6 +256,7 @@ pub const MetricsCollector = struct {
             \\# TYPE zzz_lb_bytes_to_client counter
             \\zzz_lb_bytes_to_client {d}
             \\
+            \\
         , .{
             snapshot.requests_total,
             snapshot.requests_success,
@@ -198,6 +275,185 @@ pub const MetricsCollector = struct {
             snapshot.bytes_in,
             snapshot.bytes_out,
         });
+        pos += global_metrics_text.len;
+
+        // Per-backend metrics
+        const per_backend_start = try std.fmt.bufPrint(buffer[pos..],
+            \\# HELP zzz_lb_backend_requests_total Total requests per backend
+            \\# TYPE zzz_lb_backend_requests_total counter
+            \\
+        , .{});
+        pos += per_backend_start.len;
+
+        // Export metrics for each backend with data
+        var backend_idx: u32 = 0;
+        while (backend_idx < MAX_BACKENDS) : (backend_idx += 1) {
+            const requests = self.requests_per_backend[backend_idx].load(.acquire);
+            if (requests > 0) {
+                const line = try std.fmt.bufPrint(
+                    buffer[pos..],
+                    "zzz_lb_backend_requests_total{{backend=\"{d}\"}} {d}\n",
+                    .{ backend_idx, requests },
+                );
+                pos += line.len;
+            }
+        }
+
+        // Success per backend
+        const success_header = try std.fmt.bufPrint(buffer[pos..],
+            \\
+            \\# HELP zzz_lb_backend_requests_success Successful requests per backend
+            \\# TYPE zzz_lb_backend_requests_success counter
+            \\
+        , .{});
+        pos += success_header.len;
+
+        backend_idx = 0;
+        while (backend_idx < MAX_BACKENDS) : (backend_idx += 1) {
+            const success = self.success_per_backend[backend_idx].load(.acquire);
+            if (success > 0) {
+                const line = try std.fmt.bufPrint(
+                    buffer[pos..],
+                    "zzz_lb_backend_requests_success{{backend=\"{d}\"}} {d}\n",
+                    .{ backend_idx, success },
+                );
+                pos += line.len;
+            }
+        }
+
+        // Errors per backend
+        const errors_header = try std.fmt.bufPrint(buffer[pos..],
+            \\
+            \\# HELP zzz_lb_backend_requests_error Error requests per backend
+            \\# TYPE zzz_lb_backend_requests_error counter
+            \\
+        , .{});
+        pos += errors_header.len;
+
+        backend_idx = 0;
+        while (backend_idx < MAX_BACKENDS) : (backend_idx += 1) {
+            const errors = self.errors_per_backend[backend_idx].load(.acquire);
+            if (errors > 0) {
+                const line = try std.fmt.bufPrint(
+                    buffer[pos..],
+                    "zzz_lb_backend_requests_error{{backend=\"{d}\"}} {d}\n",
+                    .{ backend_idx, errors },
+                );
+                pos += line.len;
+            }
+        }
+
+        // Latency per backend
+        const latency_header = try std.fmt.bufPrint(buffer[pos..],
+            \\
+            \\# HELP zzz_lb_backend_latency_total_ms Total latency per backend
+            \\# TYPE zzz_lb_backend_latency_total_ms counter
+            \\
+        , .{});
+        pos += latency_header.len;
+
+        backend_idx = 0;
+        while (backend_idx < MAX_BACKENDS) : (backend_idx += 1) {
+            const latency = self.latency_total_ms_per_backend[backend_idx].load(.acquire);
+            if (latency > 0) {
+                const line = try std.fmt.bufPrint(
+                    buffer[pos..],
+                    "zzz_lb_backend_latency_total_ms{{backend=\"{d}\"}} {d}\n",
+                    .{ backend_idx, latency },
+                );
+                pos += line.len;
+            }
+        }
+
+        // Pool hits per backend
+        const pool_hits_header = try std.fmt.bufPrint(buffer[pos..],
+            \\
+            \\# HELP zzz_lb_backend_pool_hits Pool hits per backend
+            \\# TYPE zzz_lb_backend_pool_hits counter
+            \\
+        , .{});
+        pos += pool_hits_header.len;
+
+        backend_idx = 0;
+        while (backend_idx < MAX_BACKENDS) : (backend_idx += 1) {
+            const hits = self.pool_hits_per_backend[backend_idx].load(.acquire);
+            if (hits > 0) {
+                const line = try std.fmt.bufPrint(
+                    buffer[pos..],
+                    "zzz_lb_backend_pool_hits{{backend=\"{d}\"}} {d}\n",
+                    .{ backend_idx, hits },
+                );
+                pos += line.len;
+            }
+        }
+
+        // Pool misses per backend
+        const pool_misses_header = try std.fmt.bufPrint(buffer[pos..],
+            \\
+            \\# HELP zzz_lb_backend_pool_misses Pool misses per backend
+            \\# TYPE zzz_lb_backend_pool_misses counter
+            \\
+        , .{});
+        pos += pool_misses_header.len;
+
+        backend_idx = 0;
+        while (backend_idx < MAX_BACKENDS) : (backend_idx += 1) {
+            const misses = self.pool_misses_per_backend[backend_idx].load(.acquire);
+            if (misses > 0) {
+                const line = try std.fmt.bufPrint(
+                    buffer[pos..],
+                    "zzz_lb_backend_pool_misses{{backend=\"{d}\"}} {d}\n",
+                    .{ backend_idx, misses },
+                );
+                pos += line.len;
+            }
+        }
+
+        // Bytes to backend
+        const bytes_to_header = try std.fmt.bufPrint(buffer[pos..],
+            \\
+            \\# HELP zzz_lb_backend_bytes_sent Bytes sent to backend
+            \\# TYPE zzz_lb_backend_bytes_sent counter
+            \\
+        , .{});
+        pos += bytes_to_header.len;
+
+        backend_idx = 0;
+        while (backend_idx < MAX_BACKENDS) : (backend_idx += 1) {
+            const bytes = self.bytes_to_backend[backend_idx].load(.acquire);
+            if (bytes > 0) {
+                const line = try std.fmt.bufPrint(
+                    buffer[pos..],
+                    "zzz_lb_backend_bytes_sent{{backend=\"{d}\"}} {d}\n",
+                    .{ backend_idx, bytes },
+                );
+                pos += line.len;
+            }
+        }
+
+        // Bytes from backend
+        const bytes_from_header = try std.fmt.bufPrint(buffer[pos..],
+            \\
+            \\# HELP zzz_lb_backend_bytes_received Bytes received from backend
+            \\# TYPE zzz_lb_backend_bytes_received counter
+            \\
+        , .{});
+        pos += bytes_from_header.len;
+
+        backend_idx = 0;
+        while (backend_idx < MAX_BACKENDS) : (backend_idx += 1) {
+            const bytes = self.bytes_from_backend_per_backend[backend_idx].load(.acquire);
+            if (bytes > 0) {
+                const line = try std.fmt.bufPrint(
+                    buffer[pos..],
+                    "zzz_lb_backend_bytes_received{{backend=\"{d}\"}} {d}\n",
+                    .{ backend_idx, bytes },
+                );
+                pos += line.len;
+            }
+        }
+
+        return buffer[0..pos];
     }
 
     /// Atomic snapshot of all metrics values
@@ -272,7 +528,8 @@ pub const MetricsCollector = struct {
 pub var global_metrics = MetricsCollector{};
 
 /// Stack buffer for metrics output (zero allocation)
-threadlocal var metrics_buffer: [4096]u8 = undefined;
+/// Increased size to accommodate per-backend metrics (64 backends * ~200 bytes/backend)
+threadlocal var metrics_buffer: [16384]u8 = undefined;
 
 /// Metrics endpoint handler (zero allocation)
 pub fn metricsHandler(ctx: *const Context, data: void) !Respond {
@@ -291,4 +548,165 @@ pub fn metricsHandler(ctx: *const Context, data: void) !Respond {
         .mime = http.Mime.TEXT,
         .body = metrics_output,
     });
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "per-backend metrics initialization" {
+    var collector = MetricsCollector{};
+
+    // Verify all per-backend counters are initialized to 0
+    var idx: u32 = 0;
+    while (idx < MAX_BACKENDS) : (idx += 1) {
+        try std.testing.expectEqual(@as(u64, 0), collector.requests_per_backend[idx].load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), collector.success_per_backend[idx].load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), collector.errors_per_backend[idx].load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), collector.pool_hits_per_backend[idx].load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), collector.pool_misses_per_backend[idx].load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), collector.latency_total_ms_per_backend[idx].load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), collector.bytes_to_backend[idx].load(.acquire));
+        try std.testing.expectEqual(@as(u64, 0), collector.bytes_from_backend_per_backend[idx].load(.acquire));
+    }
+}
+
+test "per-backend request recording" {
+    var collector = MetricsCollector{};
+
+    // Record some requests for backend 0
+    collector.recordRequestForBackend(0, 100, 200);
+    collector.recordRequestForBackend(0, 150, 200);
+    collector.recordRequestForBackend(0, 200, 500);
+
+    // Verify backend 0 metrics
+    try std.testing.expectEqual(@as(u64, 3), collector.requests_per_backend[0].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), collector.success_per_backend[0].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), collector.errors_per_backend[0].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 450), collector.latency_total_ms_per_backend[0].load(.acquire));
+
+    // Verify other backends are still 0
+    try std.testing.expectEqual(@as(u64, 0), collector.requests_per_backend[1].load(.acquire));
+}
+
+test "per-backend pool metrics" {
+    var collector = MetricsCollector{};
+
+    // Record pool hits and misses for different backends
+    collector.recordPoolHitForBackend(0);
+    collector.recordPoolHitForBackend(0);
+    collector.recordPoolHitForBackend(0);
+    collector.recordPoolMissForBackend(0);
+
+    collector.recordPoolHitForBackend(1);
+    collector.recordPoolMissForBackend(1);
+    collector.recordPoolMissForBackend(1);
+
+    // Verify backend 0
+    try std.testing.expectEqual(@as(u64, 3), collector.pool_hits_per_backend[0].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), collector.pool_misses_per_backend[0].load(.acquire));
+
+    // Verify backend 1
+    try std.testing.expectEqual(@as(u64, 1), collector.pool_hits_per_backend[1].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 2), collector.pool_misses_per_backend[1].load(.acquire));
+
+    // Verify backend 2 is still 0
+    try std.testing.expectEqual(@as(u64, 0), collector.pool_hits_per_backend[2].load(.acquire));
+}
+
+test "per-backend bytes tracking" {
+    var collector = MetricsCollector{};
+
+    // Record bytes for different backends
+    collector.recordBytesForBackend(0, 1024, 2048);
+    collector.recordBytesForBackend(0, 512, 1024);
+    collector.recordBytesForBackend(1, 4096, 8192);
+
+    // Verify backend 0
+    try std.testing.expectEqual(@as(u64, 1536), collector.bytes_to_backend[0].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 3072), collector.bytes_from_backend_per_backend[0].load(.acquire));
+
+    // Verify backend 1
+    try std.testing.expectEqual(@as(u64, 4096), collector.bytes_to_backend[1].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 8192), collector.bytes_from_backend_per_backend[1].load(.acquire));
+}
+
+test "per-backend bounds checking" {
+    var collector = MetricsCollector{};
+
+    // Try to record metrics for out-of-bounds backend (should be ignored)
+    collector.recordRequestForBackend(MAX_BACKENDS, 100, 200);
+    collector.recordRequestForBackend(MAX_BACKENDS + 1, 100, 200);
+    collector.recordPoolHitForBackend(MAX_BACKENDS);
+    collector.recordPoolMissForBackend(MAX_BACKENDS + 10);
+    collector.recordBytesForBackend(MAX_BACKENDS, 1024, 2048);
+
+    // Verify no counters were incremented (all should still be 0)
+    var idx: u32 = 0;
+    while (idx < MAX_BACKENDS) : (idx += 1) {
+        try std.testing.expectEqual(@as(u64, 0), collector.requests_per_backend[idx].load(.acquire));
+    }
+}
+
+test "prometheus format includes per-backend metrics" {
+    var collector = MetricsCollector{};
+
+    // Record metrics for backends 0 and 1
+    collector.recordRequestForBackend(0, 100, 200);
+    collector.recordRequestForBackend(0, 150, 200);
+    collector.recordRequestForBackend(1, 200, 500);
+    collector.recordPoolHitForBackend(0);
+    collector.recordPoolMissForBackend(1);
+
+    // Generate Prometheus output
+    var buffer: [16384]u8 = undefined;
+    const output = try collector.toPrometheusFormat(&buffer);
+
+    // Verify per-backend metrics are present
+    try std.testing.expect(std.mem.indexOf(u8, output, "zzz_lb_backend_requests_total{backend=\"0\"} 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zzz_lb_backend_requests_total{backend=\"1\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zzz_lb_backend_requests_success{backend=\"0\"} 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zzz_lb_backend_requests_error{backend=\"1\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zzz_lb_backend_pool_hits{backend=\"0\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zzz_lb_backend_pool_misses{backend=\"1\"} 1") != null);
+}
+
+test "prometheus format only includes backends with data" {
+    var collector = MetricsCollector{};
+
+    // Only record metrics for backend 0
+    collector.recordRequestForBackend(0, 100, 200);
+
+    // Generate Prometheus output
+    var buffer: [16384]u8 = undefined;
+    const output = try collector.toPrometheusFormat(&buffer);
+
+    // Verify backend 0 is present
+    try std.testing.expect(std.mem.indexOf(u8, output, "backend=\"0\"") != null);
+
+    // Verify other backends are not present (except in global metrics)
+    try std.testing.expect(std.mem.indexOf(u8, output, "backend=\"1\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "backend=\"2\"") == null);
+}
+
+test "global and per-backend metrics work together" {
+    var collector = MetricsCollector{};
+
+    // Record both global and per-backend metrics
+    collector.recordRequest(100, 200);
+    collector.recordRequestForBackend(0, 100, 200);
+
+    collector.recordRequest(150, 500);
+    collector.recordRequestForBackend(1, 150, 500);
+
+    // Verify global metrics
+    try std.testing.expectEqual(@as(u64, 2), collector.requests_total.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), collector.requests_success.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), collector.requests_server_error.load(.acquire));
+
+    // Verify per-backend metrics
+    try std.testing.expectEqual(@as(u64, 1), collector.requests_per_backend[0].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), collector.success_per_backend[0].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), collector.requests_per_backend[1].load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), collector.errors_per_backend[1].load(.acquire));
 }

@@ -59,6 +59,19 @@ pub fn build(b: *std.Build) void {
     });
     const build_backend_proxy = b.addInstallArtifact(backend_proxy, .{});
 
+    // Test backend echo (echoes request details for integration tests)
+    const test_backend_echo_mod = b.createModule(.{
+        .root_source_file = b.path("test_backend_echo.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_backend_echo_mod.addImport("zzz", zzz_module);
+    const test_backend_echo = b.addExecutable(.{
+        .name = "test_backend_echo",
+        .root_module = test_backend_echo_mod,
+    });
+    const build_test_backend_echo = b.addInstallArtifact(test_backend_echo, .{});
+
     // Load balancer multi-process (nginx-style)
     const load_balancer_mp_mod = b.createModule(.{
         .root_source_file = b.path("main_multiprocess.zig"),
@@ -106,16 +119,38 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
+    // Integration tests
+    const integration_tests_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    integration_tests_mod.addImport("zzz", zzz_module);
+    integration_tests_mod.addImport("tls", tls_module);
+    const integration_tests = b.addTest(.{
+        .name = "integration_tests",
+        .root_module = integration_tests_mod,
+    });
+    const run_integration_tests = b.addRunArtifact(integration_tests);
+    // Integration tests need the binaries built first
+    run_integration_tests.step.dependOn(&build_test_backend_echo.step);
+    run_integration_tests.step.dependOn(&build_load_balancer_sp.step);
+
     // Steps
     const build_all = b.step("build-all", "Build backends and load balancer");
     build_all.dependOn(&build_backend1.step);
     build_all.dependOn(&build_backend2.step);
     build_all.dependOn(&build_backend_proxy.step);
+    build_all.dependOn(&build_test_backend_echo.step);
     build_all.dependOn(&build_load_balancer_mp.step);
     build_all.dependOn(&build_load_balancer_sp.step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    const integration_test_step = b.step("test-integration", "Run integration tests");
+    integration_test_step.dependOn(&run_integration_tests.step);
 
     const run_lb_mp_step = b.step("run-lb-mp", "Run load balancer (multi-process, nginx-style)");
     run_lb_mp_step.dependOn(&run_load_balancer_mp_cmd.step);

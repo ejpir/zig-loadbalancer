@@ -10,6 +10,7 @@ pub const circuit_breaker = @import("multiprocess/circuit_breaker.zig");
 pub const backend_selector = @import("multiprocess/backend_selector.zig");
 pub const worker_state = @import("multiprocess/worker_state.zig");
 pub const connection_reuse = @import("multiprocess/connection_reuse.zig");
+pub const proxy_test = @import("multiprocess/proxy_test.zig");
 
 // Multiprocess module tests (integration)
 pub const integration_test = @import("multiprocess/integration_test.zig");
@@ -31,6 +32,7 @@ comptime {
     _ = backend_selector;
     _ = worker_state;
     _ = connection_reuse;
+    _ = proxy_test;
     _ = simple_connection_pool;
     _ = http_utils;
     _ = simd_parse;
