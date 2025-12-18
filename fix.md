@@ -1184,3 +1184,37 @@ To go faster, you'd need to either:
   - getStreamReaderError() / getStreamWriterError() - Debug underlying I/O errors
 
   The load balancer can now proxy to HTTPS backends like httpbin.org:443.
+
+
+----
+⏺ This is more detailed. Updated audit:
+
+  | TigerStyle Rule                 | Our Code                  | Fix Needed        |
+  |---------------------------------|---------------------------|-------------------|
+  | 2 assertions/function avg       | ~0                        | ❌ Add assertions |
+  | 70 lines max per function       | streamingProxy ~500 lines | ❌ Split          |
+  | No usize (use u32)              | Using usize everywhere    | ❌ Fix types      |
+  | Units in names (_ms, _bytes)    | Mixed                     | ⚠️ Rename         |
+  | Prefix helpers with parent name | No                        | ⚠️ Rename         |
+  | State invariants positively     | Mostly good               | ✅                |
+  | Pass >16 bytes by *const        | Some by value             | ⚠️ Check          |
+  | Put limits on everything        | Missing bounds            | ❌ Add limits     |
+  | Zero dependencies               | zzz + tls vendored        | ✅                |
+  | Static allocation               | Done                      | ✅                |
+
+  Critical fixes needed:
+
+  1. Assertions - Add ~2 per function:
+  std.debug.assert(backend_idx < state.backends.items.len);
+  std.debug.assert(header_end <= header_buffer.len);
+
+  2. Split streamingProxy into:
+  streamingProxy (~40 lines, orchestrator)
+  ├── streamingProxy_sendRequest (~40 lines)
+  ├── streamingProxy_readHeaders (~40 lines)
+  ├── streamingProxy_forwardHeaders (~30 lines)
+  ├── streamingProxy_streamBody (~50 lines)
+  └── streamingProxy_finalize (~20 lines)
+
+  3. Replace usize with u32 for indices/counts
+  4. Add bounds to all loops

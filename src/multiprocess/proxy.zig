@@ -127,7 +127,7 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
     if (!from_pool) {
         metrics.global_metrics.recordPoolMiss();
         log.debug("[REQ {d}] POOL MISS backend={d}", .{ req_id, backend_idx });
-        sock = UltraSock.fromBackendServer(ctx.allocator, backend) catch return ProxyError.ConnectionFailed;
+        sock = UltraSock.fromBackendServer(backend);
         sock.connect(ctx.io) catch {
             sock.close_blocking();
             return ProxyError.BackendUnavailable;
@@ -207,7 +207,7 @@ inline fn streamingProxy(ctx: *const http.Context, backend: *const types.Backend
         sock.close_blocking();
 
         // Create fresh connection
-        sock = UltraSock.fromBackendServer(ctx.allocator, backend) catch return ProxyError.ConnectionFailed;
+        sock = UltraSock.fromBackendServer(backend);
         sock.connect(ctx.io) catch {
             sock.close_blocking();
             return ProxyError.BackendUnavailable;

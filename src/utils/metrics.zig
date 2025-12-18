@@ -110,8 +110,8 @@ pub const MetricsCollector = struct {
         self.backends_unhealthy.store(unhealthy, .release);
     }
 
-    /// Generate Prometheus format metrics
-    pub fn toPrometheusFormat(self: *MetricsCollector, allocator: std.mem.Allocator) ![]u8 {
+    /// Generate Prometheus format metrics into a fixed buffer (zero allocation)
+    pub fn toPrometheusFormat(self: *MetricsCollector, buffer: []u8) ![]u8 {
         const requests_total = self.requests_total.load(.acquire);
         const duration_total = self.request_duration_total_ms.load(.acquire);
         const requests_success = self.requests_success.load(.acquire);
@@ -140,7 +140,7 @@ pub const MetricsCollector = struct {
         else
             0.0;
 
-        return std.fmt.allocPrint(allocator,
+        return std.fmt.bufPrint(buffer,
             \\# HELP zzz_lb_requests_total Total requests processed
             \\# TYPE zzz_lb_requests_total counter
             \\zzz_lb_requests_total {d}
@@ -229,10 +229,13 @@ pub const MetricsCollector = struct {
 /// Global metrics instance
 pub var global_metrics = MetricsCollector{};
 
-/// Metrics endpoint handler
+/// Stack buffer for metrics output (zero allocation)
+threadlocal var metrics_buffer: [4096]u8 = undefined;
+
+/// Metrics endpoint handler (zero allocation)
 pub fn metricsHandler(ctx: *const Context, data: void) !Respond {
     _ = data;
-    const metrics_output = global_metrics.toPrometheusFormat(ctx.allocator) catch |err| {
+    const metrics_output = global_metrics.toPrometheusFormat(&metrics_buffer) catch |err| {
         log.err("Failed to generate metrics: {s}", .{@errorName(err)});
         return ctx.response.apply(.{
             .status = .@"Internal Server Error",
