@@ -162,7 +162,7 @@ pub const SimpleConnectionPool = struct {
 // ============================================================================
 
 // Helper to create a mock UltraSock for testing (no actual network)
-fn createMockSocket(allocator: std.mem.Allocator) UltraSock {
+fn createMockSocket() UltraSock {
     return UltraSock{
         .stream = null,
         .io = null,
@@ -170,7 +170,6 @@ fn createMockSocket(allocator: std.mem.Allocator) UltraSock {
         .host = "test",
         .port = 8080,
         .connected = false,
-        .allocator = allocator,
         .tls_options = TlsOptions.insecure(),
     };
 }
@@ -184,7 +183,7 @@ test "SimpleConnectionStack: initial state is empty" {
 
 test "SimpleConnectionStack: push and pop single item" {
     var stack = SimpleConnectionStack{};
-    const sock = createMockSocket(std.testing.allocator);
+    const sock = createMockSocket();
 
     const pushed = stack.push(sock);
     try std.testing.expect(pushed);
@@ -199,11 +198,11 @@ test "SimpleConnectionStack: LIFO order" {
     var stack = SimpleConnectionStack{};
 
     // Push sockets with different ports to identify them
-    var sock1 = createMockSocket(std.testing.allocator);
+    var sock1 = createMockSocket();
     sock1.port = 1001;
-    var sock2 = createMockSocket(std.testing.allocator);
+    var sock2 = createMockSocket();
     sock2.port = 1002;
-    var sock3 = createMockSocket(std.testing.allocator);
+    var sock3 = createMockSocket();
     sock3.port = 1003;
 
     _ = stack.push(sock1);
@@ -219,7 +218,7 @@ test "SimpleConnectionStack: LIFO order" {
 
 test "SimpleConnectionStack: push fails when full" {
     var stack = SimpleConnectionStack{};
-    const sock = createMockSocket(std.testing.allocator);
+    const sock = createMockSocket();
 
     // Fill the stack
     for (0..MAX_IDLE_CONNS) |_| {
@@ -236,7 +235,7 @@ test "SimpleConnectionStack: push fails when full" {
 
 test "SimpleConnectionStack: push after pop" {
     var stack = SimpleConnectionStack{};
-    const sock = createMockSocket(std.testing.allocator);
+    const sock = createMockSocket();
 
     _ = stack.push(sock);
     _ = stack.push(sock);
@@ -302,7 +301,7 @@ test "SimpleConnectionPool: returnConnection and getConnection round-trip" {
     defer pool.deinit();
     pool.addBackends(2);
 
-    var sock = createMockSocket(std.testing.allocator);
+    var sock = createMockSocket();
     sock.port = 9999;
 
     pool.returnConnection(0, sock);
@@ -321,11 +320,11 @@ test "SimpleConnectionPool: connections are per-backend" {
     defer pool.deinit();
     pool.addBackends(3);
 
-    var sock0 = createMockSocket(std.testing.allocator);
+    var sock0 = createMockSocket();
     sock0.port = 1000;
-    var sock1 = createMockSocket(std.testing.allocator);
+    var sock1 = createMockSocket();
     sock1.port = 1001;
-    var sock2 = createMockSocket(std.testing.allocator);
+    var sock2 = createMockSocket();
     sock2.port = 1002;
 
     pool.returnConnection(0, sock0);
@@ -344,7 +343,7 @@ test "SimpleConnectionPool: returnConnection to invalid backend is handled" {
     defer pool.deinit();
     pool.addBackends(1);
 
-    const sock = createMockSocket(std.testing.allocator);
+    const sock = createMockSocket();
 
     // Should not crash, socket is discarded
     pool.returnConnection(5, sock);
@@ -357,7 +356,7 @@ test "SimpleConnectionPool: getStats tracks pool sizes" {
     defer pool.deinit();
     pool.addBackends(3);
 
-    const sock = createMockSocket(std.testing.allocator);
+    const sock = createMockSocket();
 
     // Add connections to different backends
     pool.returnConnection(0, sock);
@@ -391,7 +390,7 @@ test "SimpleConnectionPool: multiple connections per backend" {
 
     // Add 5 connections to backend 0
     for (0..5) |i| {
-        var sock = createMockSocket(std.testing.allocator);
+        var sock = createMockSocket();
         sock.port = @intCast(3000 + i);
         pool.returnConnection(0, sock);
     }

@@ -62,39 +62,41 @@ pub const TlsOptions = struct {
 };
 
 /// UltraSock - A socket abstraction for HTTP/HTTPS connections
+/// Threadlocal TLS buffers (zero allocation - one active TLS handshake per worker)
+threadlocal var tls_input_buffer: [tls.input_buffer_len]u8 = undefined;
+threadlocal var tls_output_buffer: [tls.output_buffer_len]u8 = undefined;
+
+/// Global CA bundle (loaded once at startup)
+var global_ca_bundle: ?tls.config.cert.Bundle = null;
+var ca_bundle_loaded: bool = false;
+
 pub const UltraSock = struct {
     stream: ?Io.net.Stream = null,
     tls_conn: ?tls.Connection = null,
-    ca_bundle: ?tls.config.cert.Bundle = null,
     io: ?Io = null,
     protocol: Protocol,
     host: []const u8,
     port: u16,
     connected: bool = false,
-    allocator: std.mem.Allocator,
     tls_options: TlsOptions,
 
-    // I/O buffers for TLS (must remain valid for connection lifetime)
-    input_buf: ?[]u8 = null,
-    output_buf: ?[]u8 = null,
-
-    // Stream reader/writer - heap allocated for stable addresses
-    stream_reader: ?*Io.net.Stream.Reader = null,
-    stream_writer: ?*Io.net.Stream.Writer = null,
+    // Embedded stream reader/writer (stable addresses, zero allocation)
+    stream_reader: Io.net.Stream.Reader = undefined,
+    stream_writer: Io.net.Stream.Writer = undefined,
+    has_reader_writer: bool = false,
 
     /// Initialize a new UltraSock with default TLS options (production)
-    pub fn init(allocator: std.mem.Allocator, protocol: Protocol, host: []const u8, port: u16) !UltraSock {
-        return initWithTls(allocator, protocol, host, port, TlsOptions.production());
+    pub fn init(protocol: Protocol, host: []const u8, port: u16) UltraSock {
+        return initWithTls(protocol, host, port, TlsOptions.production());
     }
 
-    /// Initialize with explicit TLS options
+    /// Initialize with explicit TLS options (zero allocation)
     pub fn initWithTls(
-        allocator: std.mem.Allocator,
         protocol: Protocol,
         host: []const u8,
         port: u16,
         tls_options: TlsOptions,
-    ) !UltraSock {
+    ) UltraSock {
         if (protocol == .https and tls_options.isInsecure()) {
             log.warn("HTTPS connection with insecure TLS options - use only for local development", .{});
         }
@@ -102,7 +104,6 @@ pub const UltraSock = struct {
             .protocol = protocol,
             .host = host,
             .port = port,
-            .allocator = allocator,
             .tls_options = tls_options,
         };
     }
@@ -199,46 +200,28 @@ pub const UltraSock = struct {
         return error.UnsupportedAddressFamily;
     }
 
-    /// Perform TLS handshake using ianic/tls.zig
+    /// Perform TLS handshake using ianic/tls.zig (zero allocation)
     fn performTlsHandshake(self: *UltraSock, io: Io) !void {
         const stream = self.stream orelse return error.SocketNotInitialized;
 
-        // Allocate I/O buffers
-        self.input_buf = try self.allocator.alloc(u8, tls.input_buffer_len);
-        errdefer {
-            if (self.input_buf) |b| self.allocator.free(b);
-            self.input_buf = null;
-        }
+        // Use threadlocal buffers (zero allocation)
+        const input_buf = &tls_input_buffer;
+        const output_buf = &tls_output_buffer;
 
-        self.output_buf = try self.allocator.alloc(u8, tls.output_buffer_len);
-        errdefer {
-            if (self.output_buf) |b| self.allocator.free(b);
-            self.output_buf = null;
-        }
-
-        // Load system CA bundle if needed
-        if (self.tls_options.ca == .system) {
-            self.ca_bundle = tls.config.cert.fromSystem(self.allocator, io) catch |err| {
+        // Load global CA bundle once (lazy initialization)
+        if (self.tls_options.ca == .system and !ca_bundle_loaded) {
+            global_ca_bundle = tls.config.cert.fromSystem(std.heap.page_allocator, io) catch |err| {
                 log.err("Failed to load system CA bundle: {}", .{err});
                 return error.CaBundleLoadFailed;
             };
-            log.debug("Loaded {} certificates from system trust store", .{self.ca_bundle.?.map.count()});
+            ca_bundle_loaded = true;
+            log.info("Loaded {} certificates from system trust store (global)", .{global_ca_bundle.?.map.count()});
         }
 
-        // Heap-allocate stream reader/writer for stable addresses
-        self.stream_reader = try self.allocator.create(Io.net.Stream.Reader);
-        errdefer {
-            if (self.stream_reader) |r| self.allocator.destroy(r);
-            self.stream_reader = null;
-        }
-        self.stream_reader.?.* = stream.reader(io, self.input_buf.?);
-
-        self.stream_writer = try self.allocator.create(Io.net.Stream.Writer);
-        errdefer {
-            if (self.stream_writer) |w| self.allocator.destroy(w);
-            self.stream_writer = null;
-        }
-        self.stream_writer.?.* = stream.writer(io, self.output_buf.?);
+        // Use embedded reader/writer (stable addresses, zero allocation)
+        self.stream_reader = stream.reader(io, input_buf);
+        self.stream_writer = stream.writer(io, output_buf);
+        self.has_reader_writer = true;
 
         // Get current time for certificate validation
         const now = try Io.Clock.real.now(io);
@@ -254,7 +237,7 @@ pub const UltraSock = struct {
             },
             .root_ca = switch (self.tls_options.ca) {
                 .none => .{},
-                .system => self.ca_bundle.?,
+                .system => global_ca_bundle.?,
                 .custom => |bundle| bundle,
             },
             .insecure_skip_verify = self.tls_options.ca == .none,
@@ -263,8 +246,8 @@ pub const UltraSock = struct {
 
         // Perform TLS handshake
         self.tls_conn = tls.client(
-            &self.stream_reader.?.interface,
-            &self.stream_writer.?.interface,
+            &self.stream_reader.interface,
+            &self.stream_writer.interface,
             client_opts,
         ) catch |err| {
             log.err("TLS handshake failed: {}", .{err});
@@ -358,7 +341,7 @@ pub const UltraSock = struct {
         }
     }
 
-    /// Free TLS resources
+    /// Free TLS resources (zero deallocation - resources are threadlocal/global)
     fn freeTlsResources(self: *UltraSock) void {
         // Close TLS connection gracefully
         if (self.tls_conn) |*conn| {
@@ -366,31 +349,11 @@ pub const UltraSock = struct {
             self.tls_conn = null;
         }
 
-        // Free heap-allocated stream reader/writer
-        if (self.stream_reader) |r| {
-            self.allocator.destroy(r);
-            self.stream_reader = null;
-        }
-        if (self.stream_writer) |w| {
-            self.allocator.destroy(w);
-            self.stream_writer = null;
-        }
+        // Reset embedded reader/writer flag
+        self.has_reader_writer = false;
 
-        // Free CA bundle
-        if (self.ca_bundle) |*bundle| {
-            bundle.deinit(self.allocator);
-            self.ca_bundle = null;
-        }
-
-        // Free I/O buffers
-        if (self.input_buf) |buf| {
-            self.allocator.free(buf);
-            self.input_buf = null;
-        }
-        if (self.output_buf) |buf| {
-            self.allocator.free(buf);
-            self.output_buf = null;
-        }
+        // Note: CA bundle is global (never freed during runtime)
+        // Note: I/O buffers are threadlocal (never freed during runtime)
     }
 
     /// Close the socket directly via posix (safe for pooled connections)
@@ -560,13 +523,13 @@ pub const UltraSock = struct {
         return self.tls_conn != null;
     }
 
-    /// Create from backend config
-    pub fn fromBackendConfig(allocator: std.mem.Allocator, backend: anytype) !UltraSock {
-        return fromBackendConfigWithTls(allocator, backend, TlsOptions.production());
+    /// Create from backend config (zero allocation)
+    pub fn fromBackendConfig(backend: anytype) UltraSock {
+        return fromBackendConfigWithTls(backend, TlsOptions.production());
     }
 
-    /// Create from backend config with explicit TLS options
-    pub fn fromBackendConfigWithTls(allocator: std.mem.Allocator, backend: anytype, tls_options: TlsOptions) !UltraSock {
+    /// Create from backend config with explicit TLS options (zero allocation)
+    pub fn fromBackendConfigWithTls(backend: anytype, tls_options: TlsOptions) UltraSock {
         const use_https = backend.port == 443 or std.mem.startsWith(u8, backend.host, "https://");
         const protocol: Protocol = if (use_https) .https else .http;
 
@@ -577,17 +540,17 @@ pub const UltraSock = struct {
             host = host[7..];
         }
 
-        return try initWithTls(allocator, protocol, host, backend.port, tls_options);
+        return initWithTls(protocol, host, backend.port, tls_options);
     }
 
-    /// Create from BackendServer struct
-    pub fn fromBackendServer(allocator: std.mem.Allocator, backend: anytype) !UltraSock {
-        return fromBackendServerWithTls(allocator, backend, TlsOptions.production());
+    /// Create from BackendServer struct (zero allocation)
+    pub fn fromBackendServer(backend: anytype) UltraSock {
+        return fromBackendServerWithTls(backend, TlsOptions.production());
     }
 
-    /// Create from BackendServer struct with explicit TLS options
-    pub fn fromBackendServerWithTls(allocator: std.mem.Allocator, backend: anytype, tls_options: TlsOptions) !UltraSock {
+    /// Create from BackendServer struct with explicit TLS options (zero allocation)
+    pub fn fromBackendServerWithTls(backend: anytype, tls_options: TlsOptions) UltraSock {
         const protocol: Protocol = if (backend.isHttps()) .https else .http;
-        return try initWithTls(allocator, protocol, backend.getHost(), backend.port, tls_options);
+        return initWithTls(protocol, backend.getHost(), backend.port, tls_options);
     }
 };
