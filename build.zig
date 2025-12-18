@@ -72,12 +72,29 @@ pub fn build(b: *std.Build) void {
     });
     const build_test_backend_echo = b.addInstallArtifact(test_backend_echo, .{});
 
-    // Load balancer multi-process (nginx-style)
+    // Unified Load Balancer (main entry point)
+    const load_balancer_mod = b.createModule(.{
+        .root_source_file = b.path("main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // Required for DNS resolution (getaddrinfo)
+    });
+    load_balancer_mod.addImport("zzz", zzz_module);
+    load_balancer_mod.addImport("tls", tls_module);
+    const load_balancer = b.addExecutable(.{
+        .name = "load_balancer",
+        .root_module = load_balancer_mod,
+    });
+    const build_load_balancer = b.addInstallArtifact(load_balancer, .{});
+    const run_load_balancer_cmd = b.addRunArtifact(load_balancer);
+
+    // Legacy binaries (for backwards compatibility)
+    // These use the old separate entry points
     const load_balancer_mp_mod = b.createModule(.{
         .root_source_file = b.path("main_multiprocess.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true, // Required for DNS resolution (getaddrinfo)
+        .link_libc = true,
     });
     load_balancer_mp_mod.addImport("zzz", zzz_module);
     load_balancer_mp_mod.addImport("tls", tls_module);
@@ -88,12 +105,11 @@ pub fn build(b: *std.Build) void {
     const build_load_balancer_mp = b.addInstallArtifact(load_balancer_mp, .{});
     const run_load_balancer_mp_cmd = b.addRunArtifact(load_balancer_mp);
 
-    // Load balancer single-process (uses std.Io thread pool)
     const load_balancer_sp_mod = b.createModule(.{
         .root_source_file = b.path("main_singleprocess.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = true, // Required for DNS resolution (getaddrinfo)
+        .link_libc = true,
     });
     load_balancer_sp_mod.addImport("zzz", zzz_module);
     load_balancer_sp_mod.addImport("tls", tls_module);
@@ -135,7 +151,7 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     // Integration tests need the binaries built first
     run_integration_tests.step.dependOn(&build_test_backend_echo.step);
-    run_integration_tests.step.dependOn(&build_load_balancer_sp.step);
+    run_integration_tests.step.dependOn(&build_load_balancer.step);
 
     // Steps
     const build_all = b.step("build-all", "Build backends and load balancer");
@@ -143,6 +159,8 @@ pub fn build(b: *std.Build) void {
     build_all.dependOn(&build_backend2.step);
     build_all.dependOn(&build_backend_proxy.step);
     build_all.dependOn(&build_test_backend_echo.step);
+    build_all.dependOn(&build_load_balancer.step);
+    // Legacy binaries (optional)
     build_all.dependOn(&build_load_balancer_mp.step);
     build_all.dependOn(&build_load_balancer_sp.step);
 
@@ -152,10 +170,14 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
-    const run_lb_mp_step = b.step("run-lb-mp", "Run load balancer (multi-process, nginx-style)");
+    const run_lb_step = b.step("run", "Run load balancer (unified - use --mode mp|sp)");
+    run_lb_step.dependOn(&run_load_balancer_cmd.step);
+
+    // Legacy run steps
+    const run_lb_mp_step = b.step("run-lb-mp", "Run load balancer (legacy multi-process)");
     run_lb_mp_step.dependOn(&run_load_balancer_mp_cmd.step);
 
-    const run_lb_sp_step = b.step("run-lb-sp", "Run load balancer (single-process, threaded)");
+    const run_lb_sp_step = b.step("run-lb-sp", "Run load balancer (legacy single-process)");
     run_lb_sp_step.dependOn(&run_load_balancer_sp_cmd.step);
 
     const run_backend1_step = b.step("run-backend1", "Run backend server 1");

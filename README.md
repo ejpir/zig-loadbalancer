@@ -26,8 +26,11 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/backend1 &
 ./zig-out/bin/backend2 &
 
-# Run the load balancer
-./zig-out/bin/load_balancer_mp -w 4 -p 8080 -b 127.0.0.1:9001 -b 127.0.0.1:9002
+# Run the load balancer (auto-selects mode based on platform)
+./zig-out/bin/load_balancer -p 8080 -b 127.0.0.1:9001 -b 127.0.0.1:9002
+
+# Or explicitly choose a mode
+./zig-out/bin/load_balancer --mode mp -w 4 -p 8080 -b 127.0.0.1:9001 -b 127.0.0.1:9002
 
 # Test it
 curl http://localhost:8080
@@ -75,7 +78,7 @@ Two layers of protection:
 Port 443 automatically uses TLS:
 
 ```bash
-./zig-out/bin/load_balancer_mp -b httpbin.org:443 -p 8080
+./zig-out/bin/load_balancer -b httpbin.org:443 -p 8080
 curl http://localhost:8080/ip  # Proxied over TLS
 ```
 
@@ -84,20 +87,35 @@ Mix HTTP and HTTPS backends freely.
 ## Options
 
 ```
--w, --workers N      Worker count (default: CPU cores)
+-m, --mode MODE      Run mode: mp (multiprocess) or sp (singleprocess)
+                     Default: mp on Linux, sp on macOS
+-w, --workers N      Worker count for mp mode (default: CPU cores)
 -p, --port N         Listen port (default: 8080)
+-h, --host HOST      Listen host (default: 0.0.0.0)
 -b, --backend H:P    Backend server (repeat for multiple)
+-s, --strategy S     Load balancing: round_robin, weighted, random
+--help               Show help message
 ```
 
 ## Modes
 
-**Multi-process** (`load_balancer_mp`) — nginx-style fork() with SO_REUSEPORT. Best for Linux production.
+The unified `load_balancer` binary supports two execution modes:
 
-**Single-process** (`load_balancer_sp`) — One process, internal thread pool. Best for macOS or lower memory footprint.
+**Multi-process (mp)** — nginx-style fork() with SO_REUSEPORT. Each worker is a separate process with its own event loop, connection pool, and health state. Zero lock contention, crash isolation, best for Linux production.
 
 ```bash
-./zig-out/bin/load_balancer_sp -p 8080 -b localhost:9001
+./zig-out/bin/load_balancer --mode mp -w 4 -p 8080 -b localhost:9001
 ```
+
+**Single-process (sp)** — One process with internal thread pool. Shared connection pool, simpler architecture, lower memory footprint. Best for macOS or development.
+
+```bash
+./zig-out/bin/load_balancer --mode sp -p 8080 -b localhost:9001
+```
+
+The binary auto-selects the best mode for your platform if `--mode` is not specified.
+
+Legacy binaries `load_balancer_mp` and `load_balancer_sp` are still available for backwards compatibility.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for threading details.
 
