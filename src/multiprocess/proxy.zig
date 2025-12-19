@@ -126,7 +126,8 @@ pub fn generateHandler(
             const backend_count = state.getBackendCount();
             std.debug.assert(backend_count <= MAX_BACKENDS);
 
-            log.debug("Handler called: backends={d} healthy={d}", .{
+            log.debug("[W{d}] Handler called: backends={d} healthy={d}", .{
+                state.worker_id,
                 backend_count,
                 state.circuit_breaker.countHealthy(),
             });
@@ -140,7 +141,7 @@ pub fn generateHandler(
             }
 
             const backend_idx = state.selectBackend(strategy) orelse {
-                log.warn("selectBackend returned null", .{});
+                log.warn("[W{d}] selectBackend returned null", .{state.worker_id});
                 return ctx.response.apply(.{
                     .status = .@"Service Unavailable",
                     .mime = http.Mime.TEXT,
@@ -152,7 +153,7 @@ pub fn generateHandler(
             std.debug.assert(backend_idx < backend_count);
             std.debug.assert(backend_idx < MAX_BACKENDS);
 
-            log.debug("Selected backend {d}", .{backend_idx});
+            log.debug("[W{d}] Selected backend {d}", .{ state.worker_id, backend_idx });
             return proxyWithFailover(ctx, @intCast(backend_idx), state);
         }
     }.handle;
@@ -176,7 +177,7 @@ inline fn proxyWithFailover(
             return response;
         } else |err| {
             state.recordFailure(primary_idx);
-            log.warn("Backend {d} failed: {s}", .{ primary_idx + 1, @errorName(err) });
+            log.warn("[W{d}] Backend {d} failed: {s}", .{ state.worker_id, primary_idx + 1, @errorName(err) });
         }
     } else {
         // Fall back to local backends list
@@ -186,7 +187,7 @@ inline fn proxyWithFailover(
             return response;
         } else |err| {
             state.recordFailure(primary_idx);
-            log.warn("Backend {d} failed: {s}", .{ primary_idx + 1, @errorName(err) });
+            log.warn("[W{d}] Backend {d} failed: {s}", .{ state.worker_id, primary_idx + 1, @errorName(err) });
         }
     }
 
@@ -195,7 +196,7 @@ inline fn proxyWithFailover(
         // Prevent bitmap overflow in circuit breaker after failover selection.
         std.debug.assert(failover_idx < MAX_BACKENDS);
 
-        log.debug("Failing over to backend {d}", .{failover_idx + 1});
+        log.debug("[W{d}] Failing over to backend {d}", .{ state.worker_id, failover_idx + 1 });
         metrics.global_metrics.recordFailover();
 
         const failover_u32: u32 = @intCast(failover_idx);
@@ -207,7 +208,8 @@ inline fn proxyWithFailover(
             } else |failover_err| {
                 state.recordFailure(failover_idx);
                 const err_name = @errorName(failover_err);
-                log.warn("Failover to backend {d} failed: {s}", .{
+                log.warn("[W{d}] Failover to backend {d} failed: {s}", .{
+                    state.worker_id,
                     failover_idx + 1,
                     err_name,
                 });
@@ -221,7 +223,8 @@ inline fn proxyWithFailover(
             } else |failover_err| {
                 state.recordFailure(failover_idx);
                 const err_name = @errorName(failover_err);
-                log.warn("Failover to backend {d} failed: {s}", .{
+                log.warn("[W{d}] Failover to backend {d} failed: {s}", .{
+                    state.worker_id,
                     failover_idx + 1,
                     err_name,
                 });
@@ -268,7 +271,8 @@ inline fn streamingProxy(
     const start_ns = std.time.Instant.now() catch null;
     const req_id = getRequestId();
 
-    log.debug("[REQ {d}] START uri={s} method={s}", .{
+    log.debug("[W{d}][REQ {d}] START uri={s} method={s}", .{
+        state.worker_id,
         req_id,
         ctx.request.uri orelse "/",
         @tagName(ctx.request.method orelse .GET),
@@ -355,7 +359,8 @@ inline fn streamingProxyShared(
     const start_ns = std.time.Instant.now() catch null;
     const req_id = getRequestId();
 
-    log.debug("[REQ {d}] START (shared) uri={s} method={s} -> {s}:{d}", .{
+    log.debug("[W{d}][REQ {d}] START (shared) uri={s} method={s} -> {s}:{d}", .{
+        state.worker_id,
         req_id,
         ctx.request.uri orelse "/",
         @tagName(ctx.request.method orelse .GET),

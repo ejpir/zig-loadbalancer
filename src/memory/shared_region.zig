@@ -648,3 +648,136 @@ test "SharedRegion: fork inheritance" {
         try std.testing.expectEqual(@as(usize, 2), region.health.countHealthy());
     }
 }
+
+test "SharedBackend: isHttps detection" {
+    var backend = SharedBackend{};
+
+    // Default: not HTTPS
+    backend.setHost("example.com");
+    backend.port = 8080;
+    backend.use_tls = false;
+    try std.testing.expect(!backend.isHttps());
+
+    // Port 443 implies HTTPS
+    backend.port = 443;
+    try std.testing.expect(backend.isHttps());
+
+    // Explicit TLS flag
+    backend.port = 8443;
+    backend.use_tls = true;
+    try std.testing.expect(backend.isHttps());
+
+    // TLS on non-443 port
+    backend.port = 9000;
+    backend.use_tls = true;
+    try std.testing.expect(backend.isHttps());
+}
+
+test "SharedBackend: getFullHost returns same as getHost" {
+    var backend = SharedBackend{};
+    backend.setHost("api.example.com");
+    backend.port = 8080;
+
+    // getFullHost should be identical to getHost for SharedBackend
+    try std.testing.expectEqualStrings(backend.getHost(), backend.getFullHost());
+    try std.testing.expectEqualStrings("api.example.com", backend.getFullHost());
+}
+
+test "SharedHealthState: findFirstHealthy" {
+    var health = SharedHealthState{};
+
+    // All healthy - should find 0
+    health.resetAll(8);
+    try std.testing.expectEqual(@as(?usize, 0), health.findFirstHealthy(null));
+
+    // Exclude 0 - should find 1
+    try std.testing.expectEqual(@as(?usize, 1), health.findFirstHealthy(0));
+
+    // Mark 0,1,2 unhealthy - should find 3
+    health.markUnhealthy(0);
+    health.markUnhealthy(1);
+    health.markUnhealthy(2);
+    try std.testing.expectEqual(@as(?usize, 3), health.findFirstHealthy(null));
+
+    // Exclude 3 - should find 4
+    try std.testing.expectEqual(@as(?usize, 4), health.findFirstHealthy(3));
+
+    // All unhealthy - should return null
+    health.markAllUnhealthy();
+    try std.testing.expectEqual(@as(?usize, null), health.findFirstHealthy(null));
+}
+
+test "SharedHealthState: findNthHealthy" {
+    var health = SharedHealthState{};
+    health.resetAll(8);
+
+    // Find 0th healthy (first)
+    try std.testing.expectEqual(@as(?usize, 0), health.findNthHealthy(0));
+
+    // Find 3rd healthy
+    try std.testing.expectEqual(@as(?usize, 3), health.findNthHealthy(3));
+
+    // Find 7th healthy (last)
+    try std.testing.expectEqual(@as(?usize, 7), health.findNthHealthy(7));
+
+    // Beyond count - should return null
+    try std.testing.expectEqual(@as(?usize, null), health.findNthHealthy(8));
+
+    // With gaps: mark 1,3,5 unhealthy
+    health.markUnhealthy(1);
+    health.markUnhealthy(3);
+    health.markUnhealthy(5);
+
+    // Now healthy are: 0,2,4,6,7
+    try std.testing.expectEqual(@as(?usize, 0), health.findNthHealthy(0));
+    try std.testing.expectEqual(@as(?usize, 2), health.findNthHealthy(1));
+    try std.testing.expectEqual(@as(?usize, 4), health.findNthHealthy(2));
+    try std.testing.expectEqual(@as(?usize, 6), health.findNthHealthy(3));
+    try std.testing.expectEqual(@as(?usize, 7), health.findNthHealthy(4));
+    try std.testing.expectEqual(@as(?usize, null), health.findNthHealthy(5));
+}
+
+test "SharedBackend: empty host handling" {
+    var backend = SharedBackend{};
+
+    // Empty by default
+    try std.testing.expectEqual(@as(usize, 0), backend.getHost().len);
+    try std.testing.expect(!backend.isConfigured());
+
+    // Set empty string explicitly
+    backend.setHost("");
+    try std.testing.expectEqual(@as(usize, 0), backend.getHost().len);
+    try std.testing.expect(!backend.isConfigured());
+
+    // Port alone doesn't make it configured
+    backend.port = 8080;
+    try std.testing.expect(!backend.isConfigured());
+
+    // Both host and port required
+    backend.setHost("x");
+    try std.testing.expect(backend.isConfigured());
+}
+
+test "SharedRegion: getActiveBackends respects count" {
+    var region = SharedRegion{};
+
+    // Initially empty
+    try std.testing.expectEqual(@as(usize, 0), region.getActiveBackends().len);
+
+    // Add backends to inactive, switch
+    var inactive = region.getInactiveBackends();
+    inactive[0].setHost("a.com");
+    inactive[0].port = 80;
+    inactive[1].setHost("b.com");
+    inactive[1].port = 81;
+    inactive[2].setHost("c.com");
+    inactive[2].port = 82;
+
+    _ = region.control.switchActiveArray(2); // Only 2 backends
+
+    // Should only return 2, even though 3 are configured
+    const active = region.getActiveBackends();
+    try std.testing.expectEqual(@as(usize, 2), active.len);
+    try std.testing.expectEqualStrings("a.com", active[0].getHost());
+    try std.testing.expectEqualStrings("b.com", active[1].getHost());
+}

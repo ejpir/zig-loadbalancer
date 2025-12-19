@@ -7,7 +7,8 @@ Client ──► Load Balancer ──► Backend Servers
               │
               ├── Automatic failover
               ├── Health checking
-              └── TLS to HTTPS backends
+              ├── TLS to HTTPS backends
+              └── Hot reload (zero-downtime config)
 ```
 
 ## Why?
@@ -94,6 +95,7 @@ Mix HTTP and HTTPS backends freely.
 -h, --host HOST      Listen host (default: 0.0.0.0)
 -b, --backend H:P    Backend server (repeat for multiple)
 -s, --strategy S     Load balancing: round_robin, weighted, random
+-c, --config FILE    JSON config file for hot reload (watches for changes)
 --help               Show help message
 ```
 
@@ -119,6 +121,66 @@ Legacy binaries `load_balancer_mp` and `load_balancer_sp` are still available fo
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for threading details.
 
+## Hot Reload
+
+Change backends without restarting or dropping requests:
+
+```bash
+# Start with a config file
+./zig-out/bin/load_balancer --config backends.json -p 8080
+
+# Edit backends.json while running - changes apply instantly
+```
+
+**Config file format (`backends.json`):**
+
+```json
+{
+  "backends": [
+    {"host": "127.0.0.1", "port": 8001},
+    {"host": "127.0.0.1", "port": 8002, "weight": 2},
+    {"host": "secure.example.com", "port": 443, "tls": true}
+  ]
+}
+```
+
+**How it works:**
+- File watcher (kqueue on macOS, inotify on Linux) detects changes
+- New config written to inactive buffer, then atomically swapped
+- Workers see new backends on next request — no locks, no drops
+- Health state reset for new backend count
+
+You can still use `-b` flags alongside `--config`. The config file backends are used for hot reload, while `-b` backends are static.
+
+## Shared Memory Architecture
+
+The load balancer uses mmap'd shared memory for zero-downtime operations:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                 SharedRegion (mmap'd)                   │
+│         Inherited across fork(), visible to all         │
+├─────────────────────────────────────────────────────────┤
+│  ControlBlock     │ active_index, generation, count     │
+│  HealthState      │ 64-bit bitmap (1 = healthy)         │
+│  BackendArray[0]  │ ◄── active (workers read from here) │
+│  BackendArray[1]  │     inactive (config writes here)   │
+└─────────────────────────────────────────────────────────┘
+        ▲                    ▲                    ▲
+        │                    │                    │
+    Worker 0            Worker 1             Worker N
+```
+
+**Why shared memory?**
+- **No IPC overhead** — Workers read directly from mmap'd region
+- **Atomic updates** — Double-buffered arrays with pointer swap (RCU-style)
+- **No coordination** — Each worker independently reads `active_index`
+- **Cross-fork visibility** — Memory mapped before fork(), inherited by children
+
+**No pointers in shared memory** — Backend hostnames are inlined (max 253 bytes per RFC 1035) because pointers are process-local virtual addresses.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the complete memory layout and design rationale.
+
 ## Metrics
 
 ```bash
@@ -135,6 +197,7 @@ Prometheus format:
 See [ARCHITECTURE.md](ARCHITECTURE.md) for:
 - C4 diagrams
 - Component deep-dives
+- Shared memory hot reload design
 - Design decisions
 
 ## Building
@@ -142,7 +205,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for:
 ```bash
 zig build                        # Debug
 zig build -Doptimize=ReleaseFast # Release
-zig build test                   # 127 tests
+zig build test                   # 201 tests
 ```
 
 Requires Zig 0.16.0+
