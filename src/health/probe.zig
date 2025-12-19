@@ -1,7 +1,7 @@
 /// Multi-Process Health Probing
 ///
 /// Periodic health probes check backend availability in background thread.
-/// Uses blocking I/O since probes run independently of request handling.
+/// Uses UltraSock for full HTTP/HTTPS support including DNS and TLS.
 ///
 /// UNIFIED HEALTH MODEL:
 /// Health probes feed INTO the circuit breaker - they don't manipulate state directly.
@@ -16,17 +16,20 @@
 const std = @import("std");
 const log = std.log.scoped(.health);
 const posix = std.posix;
+const Io = std.Io;
 
 const types = @import("../core/types.zig");
+const config_mod = @import("../core/config.zig");
 const WorkerState = @import("../lb/worker.zig").WorkerState;
 const Config = @import("../lb/worker.zig").Config;
+const UltraSock = @import("../http/ultra_sock.zig").UltraSock;
 
 /// Start health probing in a background thread
 pub fn startHealthProbes(state: *WorkerState, worker_id: usize) !std.Thread {
     return try std.Thread.spawn(.{}, healthProbeLoop, .{ state, worker_id });
 }
 
-/// Health probe loop - runs in dedicated thread
+/// Health probe loop - runs in dedicated thread with its own Io runtime
 fn healthProbeLoop(state: *WorkerState, worker_id: usize) void {
     const backends = state.backends;
     const config = state.config;
@@ -36,12 +39,21 @@ fn healthProbeLoop(state: *WorkerState, worker_id: usize) void {
         .{ worker_id, config.probe_interval_ms },
     );
 
+    // Create Io runtime for this thread (handles DNS, TLS, etc.)
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var threaded: Io.Threaded = .init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     // Initial delay before first probe
     posix.nanosleep(1, 0);
 
     while (true) {
         for (backends.items, 0..) |*backend, idx| {
-            const probe_result = probeBackend(backend, config);
+            const probe_result = probeBackend(backend, config, io);
 
             // Feed probe results into circuit breaker
             // Circuit breaker handles all state transitions and logging
@@ -61,73 +73,56 @@ fn healthProbeLoop(state: *WorkerState, worker_id: usize) void {
     }
 }
 
-/// Probe a single backend using blocking TCP connection
-fn probeBackend(backend: *const types.BackendServer, config: Config) bool {
-    // Parse IP address directly using posix
-    const host = backend.getFullHost();
+/// Probe a single backend using UltraSock (handles HTTP/HTTPS, DNS, TLS)
+fn probeBackend(backend: *const types.BackendServer, config: Config, io: Io) bool {
+    const host = backend.getHost();
+    const is_https = backend.isHttps();
 
-    // Try to parse as IPv4
-    var addr: posix.sockaddr.in = .{
-        .family = posix.AF.INET,
-        .port = std.mem.nativeToBig(u16, backend.port),
-        .addr = 0,
+    log.debug("Probing {s}:{d} (https={})", .{ host, backend.port, is_https });
+
+    // Create UltraSock from backend (uses runtime TLS config for --insecure flag)
+    var sock = UltraSock.fromBackendServer(backend);
+    defer sock.close_blocking();
+
+    // Connect (handles DNS resolution and TLS handshake)
+    sock.connect(io) catch |err| {
+        log.debug("Probe connect failed for {s}:{d}: {}", .{ host, backend.port, err });
+        return false;
     };
 
-    // Parse dotted-decimal IP (IPv4 = 4 octets)
-    const MAX_IP_OCTETS = 4;
-    var parts: [MAX_IP_OCTETS]u8 = [_]u8{0} ** MAX_IP_OCTETS;
-    var iter = std.mem.splitScalar(u8, host, '.');
-    var i: usize = 0;
-    while (iter.next()) |part| : (i += 1) {
-        if (i >= MAX_IP_OCTETS) return false;
-        parts[i] = std.fmt.parseInt(u8, part, 10) catch return false;
-    }
-    if (i != MAX_IP_OCTETS) return false;
-
-    addr.addr = @as(u32, parts[0]) |
-        (@as(u32, parts[1]) << 8) |
-        (@as(u32, parts[2]) << 16) |
-        (@as(u32, parts[3]) << 24);
-
-    return probeAddressRaw(&addr, config);
-}
-
-fn probeAddressRaw(addr: *const posix.sockaddr.in, config: Config) bool {
-    // Create socket
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return false;
-    defer posix.close(sock);
-
-    // Set connect timeout
-    const timeout_us = @as(i64, @intCast(config.probe_timeout_ms)) * 1000;
-    const timeout = posix.timeval{
-        .sec = @intCast(@divTrunc(timeout_us, 1_000_000)),
-        .usec = @intCast(@mod(timeout_us, 1_000_000)),
-    };
-    const timeout_bytes = std.mem.asBytes(&timeout);
-    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.RCVTIMEO, timeout_bytes) catch {};
-    posix.setsockopt(sock, posix.SOL.SOCKET, posix.SO.SNDTIMEO, timeout_bytes) catch {};
-
-    // Connect
-    const addr_size = @sizeOf(posix.sockaddr.in);
-    posix.connect(sock, @ptrCast(addr), addr_size) catch return false;
-
-    // Send HTTP request
-    var request_buf: [256]u8 = [_]u8{0} ** 256;
-    const fmt_str = "GET {s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    // Send HTTP health check request
+    var request_buf: [512]u8 = undefined;
     const request = std.fmt.bufPrint(
         &request_buf,
-        fmt_str,
-        .{config.health_path},
+        "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
+        .{ config.health_path, host, backend.port },
     ) catch return false;
 
-    _ = posix.send(sock, request, 0) catch return false;
+    _ = sock.send_all(io, request) catch |err| {
+        log.debug("Probe send failed for {s}:{d}: {}", .{ host, backend.port, err });
+        return false;
+    };
 
     // Read response
-    var buffer: [512]u8 = [_]u8{0} ** 512;
-    const n = posix.recv(sock, &buffer, 0) catch return false;
+    var buffer: [512]u8 = undefined;
+    const n = sock.recv(io, &buffer) catch |err| {
+        log.debug("Probe recv failed for {s}:{d}: {}", .{ host, backend.port, err });
+        return false;
+    };
+
     if (n == 0) return false;
 
-    // Check for 200 OK
+    // Check for 2xx status
     const response = buffer[0..n];
-    return std.mem.indexOf(u8, response, "200") != null;
+    const is_healthy = std.mem.indexOf(u8, response, " 200 ") != null or
+        std.mem.indexOf(u8, response, " 201 ") != null or
+        std.mem.indexOf(u8, response, " 204 ") != null;
+
+    if (is_healthy) {
+        log.debug("Probe success for {s}:{d}", .{ host, backend.port });
+    } else {
+        log.debug("Probe failed for {s}:{d}: non-2xx response", .{ host, backend.port });
+    }
+
+    return is_healthy;
 }
