@@ -15,15 +15,15 @@ fn currentTimeMillis() i64 {
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
 const simple_pool = @import("../memory/simple_connection_pool.zig");
+const shared_region = @import("../memory/shared_region.zig");
 
-pub const health_state = @import("health_state.zig");
 pub const circuit_breaker = @import("circuit_breaker.zig");
 pub const backend_selector = @import("backend_selector.zig");
 
-pub const HealthState = health_state.HealthState;
+pub const SharedHealthState = shared_region.SharedHealthState;
 pub const CircuitBreaker = circuit_breaker.CircuitBreaker;
 pub const BackendSelector = backend_selector.BackendSelector;
-pub const MAX_BACKENDS = health_state.MAX_BACKENDS;
+pub const MAX_BACKENDS = shared_region.MAX_BACKENDS;
 
 /// Configuration for worker state
 pub const Config = struct {
@@ -55,10 +55,11 @@ pub const WorkerState = struct {
     // Random state for load balancing (seeded once at init)
     random_state: u64 = 0,
 
-    /// Initialize worker state with backends
+    /// Initialize worker state with backends and shared health state
     pub fn init(
         backends: *const types.BackendsList,
         pool: *simple_pool.SimpleConnectionPool,
+        health: *SharedHealthState,
         config: Config,
     ) WorkerState {
         // Seed random state from monotonic clock
@@ -76,6 +77,7 @@ pub const WorkerState = struct {
             .backends = backends,
             .connection_pool = pool,
             .circuit_breaker = .{
+                .health = health,
                 .config = .{
                     .unhealthy_threshold = config.unhealthy_threshold,
                     .healthy_threshold = config.healthy_threshold,
@@ -116,7 +118,7 @@ pub const WorkerState = struct {
         if (self.backends.items.len == 0) return null;
 
         var selector = BackendSelector{
-            .health = &self.circuit_breaker.health,
+            .health = self.circuit_breaker.health,
             .backend_count = self.backends.items.len,
             .rr_counter = self.rr_state,
             .random_state = self.random_state,
@@ -246,7 +248,9 @@ test "WorkerState: initialization marks all backends healthy" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    const state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    const state = WorkerState.init(&backends, &pool, &health, .{});
 
     try std.testing.expectEqual(@as(usize, 3), state.countHealthy());
     try std.testing.expect(state.isHealthy(0));
@@ -266,7 +270,9 @@ test "WorkerState: selectBackend round-robin" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
 
     try std.testing.expectEqual(@as(?usize, 0), state.selectBackend(.round_robin));
     try std.testing.expectEqual(@as(?usize, 1), state.selectBackend(.round_robin));
@@ -285,7 +291,9 @@ test "WorkerState: round-robin counter increments correctly" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
 
     // Counter starts at 0
     try std.testing.expectEqual(@as(usize, 0), state.getRequestCount());
@@ -321,7 +329,9 @@ test "WorkerState: selectBackend skips unhealthy" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
 
     // Force backend 1 unhealthy
     state.forceUnhealthy(1);
@@ -343,7 +353,9 @@ test "WorkerState: recordFailure trips circuit breaker" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{ .unhealthy_threshold = 2 });
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{ .unhealthy_threshold = 2 });
 
     try std.testing.expect(state.isHealthy(0));
 
@@ -365,7 +377,9 @@ test "WorkerState: recordSuccess recovers backend" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{ .healthy_threshold = 2 });
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{ .healthy_threshold = 2 });
     state.forceUnhealthy(0);
 
     try std.testing.expect(!state.isHealthy(0));
@@ -390,7 +404,9 @@ test "WorkerState: findHealthyBackend for failover" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
     state.forceUnhealthy(0);
 
     // Exclude 1, should find 2
@@ -414,7 +430,9 @@ test "WorkerState: getBackend bounds check" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    const state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    const state = WorkerState.init(&backends, &pool, &health, .{});
 
     try std.testing.expect(state.getBackend(0) != null);
     try std.testing.expect(state.getBackend(1) == null);
@@ -429,7 +447,9 @@ test "WorkerState: empty backends" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
 
     try std.testing.expect(state.selectBackend(.round_robin) == null);
     try std.testing.expectEqual(@as(usize, 0), state.countHealthy());
@@ -446,7 +466,9 @@ test "WorkerState: random_state initialized on init" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    const state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    const state = WorkerState.init(&backends, &pool, &health, .{});
 
     // Random state should be non-zero after init
     try std.testing.expect(state.random_state != 0);
@@ -465,7 +487,9 @@ test "WorkerState: random_state persists across selections" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
     const initial_state = state.random_state;
 
     // Make a random selection
@@ -498,7 +522,9 @@ test "WorkerState: random selection produces varied results" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
 
     // Run many selections and verify distribution
     var counts = [_]usize{0} ** 10;
@@ -527,8 +553,12 @@ test "WorkerState: different worker_ids produce different random sequences" {
     defer pool.deinit();
 
     // Create two workers with same initial seed but different IDs
-    var state1 = WorkerState.init(&backends, &pool, .{});
-    var state2 = WorkerState.init(&backends, &pool, .{});
+    var health1 = SharedHealthState{};
+    health1.markAllUnhealthy();
+    var health2 = SharedHealthState{};
+    health2.markAllUnhealthy();
+    var state1 = WorkerState.init(&backends, &pool, &health1, .{});
+    var state2 = WorkerState.init(&backends, &pool, &health2, .{});
 
     // Set different worker IDs
     state1.setWorkerId(1);

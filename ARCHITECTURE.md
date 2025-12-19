@@ -232,14 +232,153 @@ Counters:
 - `lb_backends_healthy`
 - `lb_backends_unhealthy`
 
+## Shared Memory Architecture (Hot Reload)
+
+The load balancer supports zero-downtime configuration changes and binary upgrades via shared memory.
+
+### Memory Layout
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         SharedRegion (mmap'd)                        │
+│                    Inherited across fork(), survives upgrades        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ Header (64 bytes, cache-aligned)                             │   │
+│  │   magic: 0x5A5A_4C42_5348_4152  ("ZZSHAR_LB")                │   │
+│  │   version: 1                                                 │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ ControlBlock (64 bytes, separate cache line)                 │   │
+│  │   active_index: atomic u64  ← Points to BackendArray[0|1]    │   │
+│  │   generation: atomic u64    ← ABA prevention counter         │   │
+│  │   backend_count: atomic u32 ← Number of configured backends  │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ SharedHealthState (64+ bytes, separate cache line)           │   │
+│  │   bitmap: atomic u64        ← Bit N = backend N healthy      │   │
+│  │   failure_counts[64]: u8    ← Per-backend failure counters   │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │ BackendArray[0] — Active or Inactive (double-buffered)       │   │
+│  │   backends[64]: SharedBackend                                │   │
+│  │     • host[254]: null-terminated (no pointers!)              │   │
+│  │     • port: u16                                              │   │
+│  │     • weight: u16                                            │   │
+│  │     • use_tls: bool                                          │   │
+│  ├──────────────────────────────────────────────────────────────┤   │
+│  │ BackendArray[1] — Inactive or Active                         │   │
+│  │   (same structure, used for atomic swap)                     │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+         ▲              ▲              ▲              ▲
+         │              │              │              │
+    ┌────┴────┐    ┌────┴────┐    ┌────┴────┐    ┌────┴────┐
+    │Worker 0 │    │Worker 1 │    │Worker 2 │    │Worker 3 │
+    └─────────┘    └─────────┘    └─────────┘    └─────────┘
+```
+
+### Key Design Decisions
+
+**Why no pointers in SharedBackend?**
+- Pointers are process-local virtual addresses
+- After fork(), parent and child have same addresses (copy-on-write)
+- But after exec() or socket passing to new binary, addresses differ
+- Solution: Inline the hostname string (max 253 bytes per RFC 1035)
+
+**Why double-buffered backend arrays?**
+- Enables atomic configuration updates without locks
+- Writer updates inactive array, then atomically swaps pointer
+- Readers always see consistent state (RCU-style)
+- No reader-writer coordination needed
+
+**Why cache-line alignment?**
+- ControlBlock and HealthState on separate 64-byte cache lines
+- Prevents false sharing between workers
+- Health bitmap updates don't invalidate backend config cache
+
+### Platform Support
+
+| Platform | Mechanism | FD Passing |
+|----------|-----------|------------|
+| Linux | `memfd_create()` + `mmap()` | Yes (for upgrades) |
+| macOS | `mmap(MAP_ANONYMOUS \| MAP_SHARED)` | Via fork() inheritance |
+| FreeBSD | `mmap(MAP_ANONYMOUS \| MAP_SHARED)` | Via fork() inheritance |
+
+### Hot Reload Flow
+
+```
+1. File watcher detects /etc/lb/backends.json changed
+2. Parse new config
+3. Write backends to INACTIVE array (BackendArray[1-active_index])
+4. Atomic: generation++, flip active_index, update backend_count
+5. Workers immediately see new backends on next request
+6. Reset health bitmap for new backends
+```
+
+### Hot Binary Upgrade Flow
+
+```
+1. New binary starts, creates Unix socket /tmp/lb.upgrade
+2. Old binary receives SIGUSR2
+3. Old binary sends listen_fd + shm_fd via SCM_RIGHTS
+4. New binary receives FDs, re-mmaps shared region
+5. New binary starts accepting on inherited socket
+6. Old binary stops accepting, drains connections, exits
+```
+
+### Components
+
+| File | Purpose |
+|------|---------|
+| `src/memory/shared_region.zig` | SharedRegion, ControlBlock, SharedHealthState, SharedBackend |
+| `src/memory/shared_region.zig` | SharedRegionAllocator (platform-aware mmap) |
+
+### Usage Example
+
+```zig
+const shared_region = @import("memory/shared_region.zig");
+
+// Parent process: create shared region
+var allocator = shared_region.SharedRegionAllocator{};
+const region = try allocator.init();
+
+// Configure backends (before fork)
+var inactive = region.getInactiveBackends();
+inactive[0].setHost("backend1.example.com");
+inactive[0].port = 8080;
+inactive[0].weight = 5;
+inactive[1].setHost("backend2.example.com");
+inactive[1].port = 8080;
+inactive[1].weight = 3;
+
+// Atomically activate
+_ = region.control.switchActiveArray(2);
+
+// Fork workers - they inherit the mmap'd region
+const pid = try posix.fork();
+if (pid == 0) {
+    // Child: region is already visible
+    const backends = region.getActiveBackends();
+    // Use backends...
+}
+```
+
 ## File Structure
 
 ```
-├── main_multiprocess.zig        # Entry: nginx-style fork()
-├── main_singleprocess.zig       # Entry: single process
+├── main.zig                     # Unified entry point (--mode mp|sp)
+├── main_multiprocess.zig        # Legacy: nginx-style fork()
+├── main_singleprocess.zig       # Legacy: single process
 ├── src/
 │   ├── core/
-│   │   └── types.zig            # BackendServer, LoadBalancerStrategy
+│   │   ├── types.zig            # BackendServer, LoadBalancerStrategy
+│   │   └── config.zig           # LoadBalancerConfig
 │   ├── multiprocess/
 │   │   ├── mod.zig              # Re-exports
 │   │   ├── proxy.zig            # Streaming proxy + failover
@@ -253,7 +392,8 @@ Counters:
 │   │   ├── ultra_sock.zig       # TCP/TLS socket
 │   │   └── http_utils.zig       # RFC 7230 framing
 │   ├── memory/
-│   │   └── simple_connection_pool.zig
+│   │   ├── simple_connection_pool.zig  # Per-worker connection pooling
+│   │   └── shared_region.zig    # Shared memory for hot reload
 │   ├── internal/
 │   │   └── simd_parse.zig       # Header boundary detection
 │   └── utils/

@@ -24,9 +24,12 @@ const Route = http.Route;
 const types = @import("src/core/types.zig");
 const config_mod = @import("src/core/config.zig");
 const simple_pool = @import("src/memory/simple_connection_pool.zig");
+const shared_region = @import("src/memory/shared_region.zig");
 const metrics = @import("src/utils/metrics.zig");
 const mp = @import("src/multiprocess/mod.zig");
 const health = @import("src/multiprocess/health.zig");
+
+const SharedHealthState = shared_region.SharedHealthState;
 
 pub const std_options: std.Options = .{
     .log_level = .warn,
@@ -255,21 +258,83 @@ fn runMultiProcess(allocator: std.mem.Allocator, config: LoadBalancerConfig) !vo
         mutable_config.worker_count = try std.Thread.getCpuCount();
     }
 
+    // Create shared memory region (visible to all forked workers)
+    var shared_allocator = shared_region.SharedRegionAllocator{};
+    const region = try shared_allocator.init();
+    defer shared_allocator.deinit();
+
+    // Initialize backends in shared region
+    initSharedBackends(region, mutable_config.backends);
+
     log.info("Workers: {d}", .{mutable_config.worker_count});
     for (mutable_config.backends, 0..) |b, idx| {
         log.info("  Backend {d}: {s}:{d}", .{ idx + 1, b.host, b.port });
     }
 
-    try spawnWorkers(allocator, mutable_config);
+    try spawnWorkers(allocator, &mutable_config, region);
+}
+
+/// Initialize backends in the shared region's double buffer
+fn initSharedBackends(region: *shared_region.SharedRegion, backends: []const BackendDef) void {
+    // Write to inactive buffer
+    var inactive = region.getInactiveBackends();
+    const count = @min(backends.len, shared_region.MAX_BACKENDS);
+
+    for (backends[0..count], 0..) |b, i| {
+        inactive[i].setHost(b.host);
+        inactive[i].port = b.port;
+        inactive[i].weight = b.weight;
+        inactive[i].use_tls = b.use_tls;
+    }
+
+    // Atomically switch to make them active
+    _ = region.control.switchActiveArray(@intCast(count));
+
+    // Initialize health state for all backends
+    region.health.markAllHealthy(count);
+
+    log.info("Initialized {d} backends in shared region", .{count});
+}
+
+/// Hot-reload backends atomically (for use by config watcher)
+/// Workers continue reading from the old buffer until the atomic switch
+pub fn reloadSharedBackends(region: *shared_region.SharedRegion, backends: []const BackendDef) void {
+    // Write new config to inactive buffer
+    var inactive = region.getInactiveBackends();
+    const count = @min(backends.len, shared_region.MAX_BACKENDS);
+
+    // Clear inactive buffer first (in case new config has fewer backends)
+    for (&inactive) |*b| {
+        b.* = .{};
+    }
+
+    for (backends[0..count], 0..) |b, i| {
+        inactive[i].setHost(b.host);
+        inactive[i].port = b.port;
+        inactive[i].weight = b.weight;
+        inactive[i].use_tls = b.use_tls;
+    }
+
+    // Atomically switch - workers immediately see new config
+    const gen = region.control.switchActiveArray(@intCast(count));
+
+    // Reset health for all backends (new backends start healthy)
+    region.health.markAllHealthy(count);
+
+    log.warn("Hot-reloaded {d} backends (generation {d})", .{ count, gen });
 }
 
 // Spawn worker processes and monitor for crashes
-fn spawnWorkers(allocator: std.mem.Allocator, config: LoadBalancerConfig) !void {
+fn spawnWorkers(
+    allocator: std.mem.Allocator,
+    config: *const LoadBalancerConfig,
+    region: *shared_region.SharedRegion,
+) !void {
     var worker_pids = try allocator.alloc(posix.pid_t, config.worker_count);
     defer allocator.free(worker_pids);
 
     for (0..config.worker_count) |worker_id| {
-        worker_pids[worker_id] = try forkWorker(&config, worker_id);
+        worker_pids[worker_id] = try forkWorker(config, region, worker_id);
         log.info("Spawned worker {d} (PID: {d})", .{
             worker_id,
             worker_pids[worker_id],
@@ -282,17 +347,21 @@ fn spawnWorkers(allocator: std.mem.Allocator, config: LoadBalancerConfig) !void 
     while (true) {
         const result = posix.waitpid(-1, 0);
         if (result.pid > 0) {
-            try restartWorker(&config, worker_pids, result.pid);
+            try restartWorker(config, region, worker_pids, result.pid);
         }
     }
 }
 
 // Fork a single worker process
-fn forkWorker(config: *const LoadBalancerConfig, worker_id: usize) !posix.pid_t {
+fn forkWorker(
+    config: *const LoadBalancerConfig,
+    region: *shared_region.SharedRegion,
+    worker_id: usize,
+) !posix.pid_t {
     const pid = try posix.fork();
     if (pid == 0) {
         // CPU affinity is set INSIDE workerMain, AFTER Io.Threaded.init
-        workerMain(config, worker_id) catch |err| {
+        workerMain(config, region, worker_id) catch |err| {
             log.err("Worker {d} fatal: {s}", .{
                 worker_id,
                 @errorName(err),
@@ -307,13 +376,14 @@ fn forkWorker(config: *const LoadBalancerConfig, worker_id: usize) !posix.pid_t 
 // Restart a crashed worker by finding it in the PID list
 fn restartWorker(
     config: *const LoadBalancerConfig,
+    region: *shared_region.SharedRegion,
     worker_pids: []posix.pid_t,
     crashed_pid: posix.pid_t,
 ) !void {
     for (worker_pids, 0..) |pid, worker_id| {
         if (pid == crashed_pid) {
             log.warn("Worker {d} died, restarting...", .{worker_id});
-            worker_pids[worker_id] = try forkWorker(config, worker_id);
+            worker_pids[worker_id] = try forkWorker(config, region, worker_id);
             break;
         }
     }
@@ -329,7 +399,11 @@ fn mpShutdown(_: std.c.SIG) callconv(.c) void {
     mp_server.stop();
 }
 
-fn workerMain(config: *const LoadBalancerConfig, worker_id: usize) !void {
+fn workerMain(
+    config: *const LoadBalancerConfig,
+    region: *shared_region.SharedRegion,
+    worker_id: usize,
+) !void {
     // Thread-safe allocator since health probes run in separate thread
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
@@ -339,7 +413,7 @@ fn workerMain(config: *const LoadBalancerConfig, worker_id: usize) !void {
     var connection_pool = simple_pool.SimpleConnectionPool{};
     defer connection_pool.deinit();
 
-    // Backends
+    // Backends (still using config for BackendServer list, but health is shared)
     var backends: types.BackendsList = .empty;
     defer backends.deinit(allocator);
 
@@ -348,8 +422,8 @@ fn workerMain(config: *const LoadBalancerConfig, worker_id: usize) !void {
     }
     connection_pool.addBackends(backends.items.len);
 
-    // Worker state
-    var worker_state = mp.WorkerState.init(&backends, &connection_pool, .{
+    // Use shared health state from mmap'd region
+    var worker_state = mp.WorkerState.init(&backends, &connection_pool, &region.health, .{
         .unhealthy_threshold = config.unhealthy_threshold,
         .healthy_threshold = config.healthy_threshold,
         .probe_interval_ms = config.probe_interval_ms,
@@ -358,7 +432,7 @@ fn workerMain(config: *const LoadBalancerConfig, worker_id: usize) !void {
     });
     worker_state.setWorkerId(worker_id);
 
-    log.info("Worker {d}: Starting with {d} backends", .{
+    log.info("Worker {d}: Starting with {d} backends (shared health)", .{
         worker_id,
         backends.items.len,
     });
@@ -455,8 +529,10 @@ fn runSingleProcess(_: std.mem.Allocator, config: LoadBalancerConfig) !void {
     }
     connection_pool.addBackends(backends.items.len);
 
-    // Worker state
-    var worker_state = mp.WorkerState.init(&backends, &connection_pool, .{
+    var health_state = SharedHealthState{};
+    health_state.markAllUnhealthy();
+
+    var worker_state = mp.WorkerState.init(&backends, &connection_pool, &health_state, .{
         .unhealthy_threshold = config.unhealthy_threshold,
         .healthy_threshold = config.healthy_threshold,
         .probe_interval_ms = config.probe_interval_ms,

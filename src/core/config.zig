@@ -24,6 +24,9 @@ pub const BackendDef = struct {
     /// Higher weights receive proportionally more traffic
     /// Default: 1 (all backends receive equal traffic)
     weight: u16 = 1,
+
+    /// Use TLS for this backend
+    use_tls: bool = false,
 };
 
 /// Complete Load Balancer Configuration

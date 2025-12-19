@@ -114,6 +114,13 @@ pub fn generateHandler(
             ctx: *const http.Context,
             state: *WorkerState,
         ) !http.Respond {
+            // Handle /metrics internally (router catch-all may match before specific routes)
+            if (ctx.request.uri) |uri| {
+                if (std.mem.eql(u8, uri, "/metrics")) {
+                    return metrics.metricsHandler(ctx, {});
+                }
+            }
+
             // Prevent bitmap overflow in circuit breaker health tracking.
             std.debug.assert(state.backends.items.len <= MAX_BACKENDS);
 
