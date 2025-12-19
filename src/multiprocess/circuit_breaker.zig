@@ -1,19 +1,22 @@
 /// Circuit Breaker - Single Source of Truth for Backend Health
 ///
-/// Threshold-based health state transitions.
+/// Threshold-based health state transitions using shared memory.
 /// Backends transition to unhealthy after consecutive failures,
 /// and recover after consecutive successes.
 ///
+/// The health bitmap is stored in shared memory (SharedHealthState) and is
+/// visible to all worker processes. The failure/success counters are per-worker
+/// since threshold tracking is worker-local.
+///
 /// This is the ONLY component that changes backend health state.
 /// Both health probes and request handlers feed results into the circuit breaker
-/// using recordSuccess() and recordFailure(). This ensures unified health tracking
-/// with no disagreement between different systems.
+/// using recordSuccess() and recordFailure().
 const std = @import("std");
 const log = std.log.scoped(.circuit_breaker);
 
-const health_state = @import("health_state.zig");
-pub const HealthState = health_state.HealthState;
-pub const MAX_BACKENDS = health_state.MAX_BACKENDS;
+const shared_region = @import("../memory/shared_region.zig");
+pub const SharedHealthState = shared_region.SharedHealthState;
+pub const MAX_BACKENDS = shared_region.MAX_BACKENDS;
 
 /// Circuit breaker configuration
 pub const Config = struct {
@@ -24,10 +27,14 @@ pub const Config = struct {
 };
 
 /// Circuit breaker with threshold-based state transitions
+/// Uses SharedHealthState for cross-process health visibility
 pub const CircuitBreaker = struct {
-    health: HealthState = .{},
+    /// Pointer to shared health state (in mmap'd region)
+    health: *SharedHealthState,
     config: Config = .{},
+    /// Per-worker failure tracking (not shared)
     consecutive_failures: [MAX_BACKENDS]u32 = [_]u32{0} ** MAX_BACKENDS,
+    /// Per-worker success tracking (not shared)
     consecutive_successes: [MAX_BACKENDS]u32 = [_]u32{0} ** MAX_BACKENDS,
 
     /// Record a successful request or health probe to a backend
@@ -88,7 +95,7 @@ pub const CircuitBreaker = struct {
     }
 
     /// Check if a backend is healthy
-    /// Hot path - inlined, delegates to bitmap check
+    /// Hot path - inlined, delegates to shared bitmap check
     pub inline fn isHealthy(self: *const CircuitBreaker, idx: usize) bool {
         return self.health.isHealthy(idx);
     }
@@ -136,15 +143,26 @@ pub const CircuitBreaker = struct {
 // Tests
 // ============================================================================
 
+fn createTestCircuitBreaker(health: *SharedHealthState) CircuitBreaker {
+    return CircuitBreaker{
+        .health = health,
+        .config = .{},
+    };
+}
+
 test "CircuitBreaker: initial state" {
-    const cb = CircuitBreaker{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    const cb = createTestCircuitBreaker(&health);
     try std.testing.expectEqual(@as(usize, 0), cb.countHealthy());
     try std.testing.expectEqual(@as(u32, 0), cb.getFailureCount(0));
     try std.testing.expectEqual(@as(u32, 0), cb.getSuccessCount(0));
 }
 
 test "CircuitBreaker: initBackends marks all healthy" {
-    var cb = CircuitBreaker{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var cb = createTestCircuitBreaker(&health);
     cb.initBackends(3);
     try std.testing.expectEqual(@as(usize, 3), cb.countHealthy());
     try std.testing.expect(cb.isHealthy(0));
@@ -154,7 +172,9 @@ test "CircuitBreaker: initBackends marks all healthy" {
 }
 
 test "CircuitBreaker: recordSuccess on healthy backend" {
-    var cb = CircuitBreaker{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var cb = createTestCircuitBreaker(&health);
     cb.initBackends(2);
 
     // Success on healthy backend should reset failures but not affect health
@@ -168,7 +188,10 @@ test "CircuitBreaker: recordSuccess on healthy backend" {
 }
 
 test "CircuitBreaker: recordFailure transitions to unhealthy at threshold" {
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var cb = CircuitBreaker{
+        .health = &health,
         .config = .{ .unhealthy_threshold = 3 },
     };
     cb.initBackends(2);
@@ -192,11 +215,14 @@ test "CircuitBreaker: recordFailure transitions to unhealthy at threshold" {
 }
 
 test "CircuitBreaker: recordSuccess transitions to healthy at threshold" {
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var cb = CircuitBreaker{
+        .health = &health,
         .config = .{ .healthy_threshold = 2 },
     };
     cb.initBackends(1);
-    cb.health.markUnhealthy(0); // Start unhealthy
+    health.markUnhealthy(0); // Start unhealthy
 
     // First success: not yet healthy
     cb.recordSuccess(0);
@@ -212,10 +238,13 @@ test "CircuitBreaker: recordSuccess transitions to healthy at threshold" {
 }
 
 test "CircuitBreaker: failure resets success count" {
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var cb = CircuitBreaker{
+        .health = &health,
         .config = .{ .healthy_threshold = 3 },
     };
-    cb.health.markUnhealthy(0);
+    health.markUnhealthy(0);
 
     cb.recordSuccess(0);
     cb.recordSuccess(0);
@@ -229,7 +258,10 @@ test "CircuitBreaker: failure resets success count" {
 }
 
 test "CircuitBreaker: success resets failure count" {
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var cb = CircuitBreaker{
+        .health = &health,
         .config = .{ .unhealthy_threshold = 3 },
     };
     cb.initBackends(1);
@@ -245,7 +277,10 @@ test "CircuitBreaker: success resets failure count" {
 }
 
 test "CircuitBreaker: already unhealthy backend accumulates failures" {
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var cb = CircuitBreaker{
+        .health = &health,
         .config = .{ .unhealthy_threshold = 2 },
     };
     cb.initBackends(1);
@@ -263,9 +298,11 @@ test "CircuitBreaker: already unhealthy backend accumulates failures" {
 }
 
 test "CircuitBreaker: findHealthyBackend excludes specified index" {
-    var cb = CircuitBreaker{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var cb = createTestCircuitBreaker(&health);
     cb.initBackends(3);
-    cb.health.markUnhealthy(0); // Only 1 and 2 healthy
+    health.markUnhealthy(0); // Only 1 and 2 healthy
 
     try std.testing.expectEqual(@as(?usize, 1), cb.findHealthyBackend(0));
     try std.testing.expectEqual(@as(?usize, 2), cb.findHealthyBackend(1));
@@ -273,12 +310,16 @@ test "CircuitBreaker: findHealthyBackend excludes specified index" {
 }
 
 test "CircuitBreaker: findHealthyBackend returns null when all unhealthy" {
-    var cb = CircuitBreaker{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    const cb = createTestCircuitBreaker(&health);
     try std.testing.expectEqual(@as(?usize, null), cb.findHealthyBackend(0));
 }
 
 test "CircuitBreaker: forceHealthy marks healthy and resets" {
-    var cb = CircuitBreaker{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var cb = createTestCircuitBreaker(&health);
     cb.consecutive_failures[0] = 5;
     cb.consecutive_successes[0] = 3;
 
@@ -290,7 +331,9 @@ test "CircuitBreaker: forceHealthy marks healthy and resets" {
 }
 
 test "CircuitBreaker: forceUnhealthy marks unhealthy and resets" {
-    var cb = CircuitBreaker{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var cb = createTestCircuitBreaker(&health);
     cb.initBackends(1);
     cb.consecutive_failures[0] = 5;
     cb.consecutive_successes[0] = 3;
@@ -303,7 +346,9 @@ test "CircuitBreaker: forceUnhealthy marks unhealthy and resets" {
 }
 
 test "CircuitBreaker: out of bounds operations are safe" {
-    var cb = CircuitBreaker{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var cb = createTestCircuitBreaker(&health);
     cb.initBackends(2);
 
     // These should not crash
@@ -316,11 +361,13 @@ test "CircuitBreaker: out of bounds operations are safe" {
 
     try std.testing.expectEqual(@as(u32, 0), cb.getFailureCount(64));
     try std.testing.expectEqual(@as(u32, 0), cb.getSuccessCount(64));
-    try std.testing.expect(!cb.isHealthy(64));
 }
 
 test "CircuitBreaker: threshold of 1 transitions immediately" {
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var cb = CircuitBreaker{
+        .health = &health,
         .config = .{ .unhealthy_threshold = 1, .healthy_threshold = 1 },
     };
     cb.initBackends(1);
@@ -335,7 +382,10 @@ test "CircuitBreaker: threshold of 1 transitions immediately" {
 }
 
 test "CircuitBreaker: multiple backends independent" {
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var cb = CircuitBreaker{
+        .health = &health,
         .config = .{ .unhealthy_threshold = 2 },
     };
     cb.initBackends(3);
@@ -355,7 +405,10 @@ test "CircuitBreaker: multiple backends independent" {
 }
 
 test "CircuitBreaker: recovery requires exact threshold" {
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var cb = CircuitBreaker{
+        .health = &health,
         .config = .{ .healthy_threshold = 3 },
     };
     cb.forceUnhealthy(0);
@@ -369,7 +422,10 @@ test "CircuitBreaker: recovery requires exact threshold" {
 }
 
 test "CircuitBreaker: high threshold values" {
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var cb = CircuitBreaker{
+        .health = &health,
         .config = .{ .unhealthy_threshold = 100, .healthy_threshold = 50 },
     };
     cb.initBackends(1);

@@ -6,7 +6,9 @@ const std = @import("std");
 
 const types = @import("../core/types.zig");
 const simple_pool = @import("../memory/simple_connection_pool.zig");
-const WorkerState = @import("worker_state.zig").WorkerState;
+const worker_state = @import("worker_state.zig");
+const WorkerState = worker_state.WorkerState;
+const SharedHealthState = worker_state.SharedHealthState;
 
 /// Simulates the proxy handler's request flow
 fn simulateRequest(state: *WorkerState, comptime strategy: types.LoadBalancerStrategy) ?usize {
@@ -34,7 +36,9 @@ test "integration: round-robin distributes requests evenly" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
 
     // Verify even distribution across all backends
     var counts = [_]usize{0} ** 3;
@@ -66,7 +70,9 @@ test "integration: failover redirects to healthy backend" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{ .unhealthy_threshold = 2 });
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{ .unhealthy_threshold = 2 });
 
     // Trigger circuit breaker with consecutive failures
     _ = state.selectBackend(.round_robin);
@@ -96,7 +102,9 @@ test "integration: recovery after consecutive successes" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 2,
         .healthy_threshold = 3,
     });
@@ -128,7 +136,9 @@ test "integration: request count tracks actual requests" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
 
     try std.testing.expectEqual(@as(usize, 0), state.getRequestCount());
 
@@ -152,7 +162,9 @@ test "integration: all backends unhealthy returns null" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{ .unhealthy_threshold = 1 });
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{ .unhealthy_threshold = 1 });
 
     // Trigger circuit breaker on all backends
     state.recordFailure(0);
@@ -180,7 +192,9 @@ test "integration: failure during recovery resets success counter" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 2,
         .healthy_threshold = 3,
     });
@@ -218,7 +232,9 @@ test "integration: single backend down and recovery" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 2,
         .healthy_threshold = 2,
     });
@@ -255,7 +271,9 @@ test "integration: mixed success/failure pattern" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 3,
         .healthy_threshold = 2,
     });
@@ -302,7 +320,9 @@ test "integration: findHealthyBackend for failover excludes current" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
 
     // Failover must skip the failed backend
     const failover1 = state.findHealthyBackend(0);
@@ -340,7 +360,9 @@ test "integration: unified health - probe success recovers circuit-breaker-tripp
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 3,
         .healthy_threshold = 2,
     });
@@ -379,7 +401,9 @@ test "integration: unified health - probe failure trips circuit breaker" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 3,
     });
 
@@ -416,7 +440,9 @@ test "integration: unified health - no state disagreement" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 2,
         .healthy_threshold = 2,
     });
@@ -451,7 +477,9 @@ test "integration: unified health - probe and request failures both count toward
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 3,
     });
 
@@ -480,7 +508,9 @@ test "integration: unified health - probe success during healthy doesn't affect 
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{});
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
 
     // Backend starts healthy
     try std.testing.expect(state.isHealthy(0));
@@ -506,7 +536,9 @@ test "integration: unified health - probe failure resets success progress" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 2,
         .healthy_threshold = 3,
     });
@@ -547,7 +579,9 @@ test "integration: unified health - mixed probe and request recovery" {
     var pool = simple_pool.SimpleConnectionPool{};
     defer pool.deinit();
 
-    var state = WorkerState.init(&backends, &pool, .{
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{
         .unhealthy_threshold = 3,
         .healthy_threshold = 2,
     });

@@ -2,18 +2,19 @@
 ///
 /// Load balancing strategies for selecting backends.
 /// Health-aware selection that skips unhealthy backends.
+/// Uses SharedHealthState from shared memory for cross-process visibility.
 const std = @import("std");
 
-const health_state = @import("health_state.zig");
-pub const HealthState = health_state.HealthState;
-pub const MAX_BACKENDS = health_state.MAX_BACKENDS;
+const shared_region = @import("../memory/shared_region.zig");
+pub const SharedHealthState = shared_region.SharedHealthState;
+pub const MAX_BACKENDS = shared_region.MAX_BACKENDS;
 
 const types = @import("../core/types.zig");
 pub const LoadBalancerStrategy = types.LoadBalancerStrategy;
 
 /// Backend selector with pluggable strategies
 pub const BackendSelector = struct {
-    health: *const HealthState,
+    health: *const SharedHealthState,
     backend_count: usize = 0,
     rr_counter: usize = 0,
     random_state: u64 = 0,
@@ -116,7 +117,8 @@ pub const BackendSelector = struct {
 // ============================================================================
 
 test "BackendSelector: select returns null for zero backends" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     var selector = BackendSelector{ .health = &health, .backend_count = 0 };
 
     try std.testing.expectEqual(@as(?usize, null), selector.select(.round_robin));
@@ -124,7 +126,8 @@ test "BackendSelector: select returns null for zero backends" {
 }
 
 test "BackendSelector: round-robin cycles through healthy backends" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markAllHealthy(3);
 
     var selector = BackendSelector{ .health = &health, .backend_count = 3 };
@@ -136,7 +139,8 @@ test "BackendSelector: round-robin cycles through healthy backends" {
 }
 
 test "BackendSelector: round-robin skips unhealthy backends" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markHealthy(0);
     health.markHealthy(2); // Skip 1
 
@@ -153,7 +157,8 @@ test "BackendSelector: round-robin skips unhealthy backends" {
 }
 
 test "BackendSelector: round-robin with single healthy backend" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markHealthy(2);
 
     var selector = BackendSelector{ .health = &health, .backend_count = 4 };
@@ -165,7 +170,8 @@ test "BackendSelector: round-robin with single healthy backend" {
 }
 
 test "BackendSelector: returns null when all unhealthy" {
-    var health = HealthState{}; // All unhealthy (bitmap = 0)
+    var health = SharedHealthState{};
+    health.markAllUnhealthy(); // All unhealthy
 
     var selector = BackendSelector{ .health = &health, .backend_count = 3 };
 
@@ -175,7 +181,8 @@ test "BackendSelector: returns null when all unhealthy" {
 }
 
 test "BackendSelector: random only selects healthy backends" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markHealthy(1);
     health.markHealthy(3);
 
@@ -190,7 +197,8 @@ test "BackendSelector: random only selects healthy backends" {
 }
 
 test "BackendSelector: random with single healthy backend" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markHealthy(4);
 
     var selector = BackendSelector{ .health = &health, .backend_count = 5 };
@@ -203,7 +211,8 @@ test "BackendSelector: random with single healthy backend" {
 }
 
 test "BackendSelector: random distribution is not constant" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markAllHealthy(10);
 
     var selector = BackendSelector{ .health = &health, .backend_count = 10 };
@@ -222,7 +231,8 @@ test "BackendSelector: random distribution is not constant" {
 }
 
 test "BackendSelector: sticky returns backend 0" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markAllHealthy(5);
 
     var selector = BackendSelector{ .health = &health, .backend_count = 5 };
@@ -233,7 +243,8 @@ test "BackendSelector: sticky returns backend 0" {
 }
 
 test "BackendSelector: weighted_round_robin respects weight ratios" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markAllHealthy(2);
 
     var selector = BackendSelector{
@@ -257,7 +268,8 @@ test "BackendSelector: weighted_round_robin respects weight ratios" {
 }
 
 test "BackendSelector: weighted_round_robin skips unhealthy backends" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markHealthy(0);
     health.markHealthy(2);
 
@@ -282,7 +294,8 @@ test "BackendSelector: weighted_round_robin skips unhealthy backends" {
 }
 
 test "BackendSelector: weighted_round_robin handles equal weights" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markAllHealthy(3);
 
     var selector = BackendSelector{
@@ -304,7 +317,8 @@ test "BackendSelector: weighted_round_robin handles equal weights" {
 }
 
 test "BackendSelector: weighted_round_robin single backend with high weight" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markHealthy(1);
 
     var selector = BackendSelector{
@@ -320,7 +334,8 @@ test "BackendSelector: weighted_round_robin single backend with high weight" {
 }
 
 test "BackendSelector: weighted_round_robin smooth distribution" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markAllHealthy(3);
 
     var selector = BackendSelector{
@@ -364,7 +379,8 @@ test "BackendSelector: weighted_round_robin smooth distribution" {
 }
 
 test "BackendSelector: rr_counter wraps around" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markAllHealthy(2);
 
     var selector = BackendSelector{
@@ -381,7 +397,8 @@ test "BackendSelector: rr_counter wraps around" {
 }
 
 test "BackendSelector: health state changes affect selection" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markAllHealthy(3);
 
     var selector = BackendSelector{ .health = &health, .backend_count = 3 };
@@ -399,7 +416,8 @@ test "BackendSelector: health state changes affect selection" {
 }
 
 test "BackendSelector: large backend count" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markAllHealthy(64);
 
     var selector = BackendSelector{ .health = &health, .backend_count = 64 };
@@ -413,7 +431,8 @@ test "BackendSelector: large backend count" {
 }
 
 test "BackendSelector: sparse healthy backends" {
-    var health = HealthState{};
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
     health.markHealthy(0);
     health.markHealthy(31);
     health.markHealthy(63);

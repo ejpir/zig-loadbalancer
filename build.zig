@@ -88,38 +88,6 @@ pub fn build(b: *std.Build) void {
     const build_load_balancer = b.addInstallArtifact(load_balancer, .{});
     const run_load_balancer_cmd = b.addRunArtifact(load_balancer);
 
-    // Legacy binaries (for backwards compatibility)
-    // These use the old separate entry points
-    const load_balancer_mp_mod = b.createModule(.{
-        .root_source_file = b.path("main_multiprocess.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    load_balancer_mp_mod.addImport("zzz", zzz_module);
-    load_balancer_mp_mod.addImport("tls", tls_module);
-    const load_balancer_mp = b.addExecutable(.{
-        .name = "load_balancer_mp",
-        .root_module = load_balancer_mp_mod,
-    });
-    const build_load_balancer_mp = b.addInstallArtifact(load_balancer_mp, .{});
-    const run_load_balancer_mp_cmd = b.addRunArtifact(load_balancer_mp);
-
-    const load_balancer_sp_mod = b.createModule(.{
-        .root_source_file = b.path("main_singleprocess.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    load_balancer_sp_mod.addImport("zzz", zzz_module);
-    load_balancer_sp_mod.addImport("tls", tls_module);
-    const load_balancer_sp = b.addExecutable(.{
-        .name = "load_balancer_sp",
-        .root_module = load_balancer_sp_mod,
-    });
-    const build_load_balancer_sp = b.addInstallArtifact(load_balancer_sp, .{});
-    const run_load_balancer_sp_cmd = b.addRunArtifact(load_balancer_sp);
-
     // Unit tests
     const unit_tests_mod = b.createModule(.{
         .root_source_file = b.path("src/test_load_balancer.zig"),
@@ -160,9 +128,6 @@ pub fn build(b: *std.Build) void {
     build_all.dependOn(&build_backend_proxy.step);
     build_all.dependOn(&build_test_backend_echo.step);
     build_all.dependOn(&build_load_balancer.step);
-    // Legacy binaries (optional)
-    build_all.dependOn(&build_load_balancer_mp.step);
-    build_all.dependOn(&build_load_balancer_sp.step);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
@@ -170,15 +135,8 @@ pub fn build(b: *std.Build) void {
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
 
-    const run_lb_step = b.step("run", "Run load balancer (unified - use --mode mp|sp)");
+    const run_lb_step = b.step("run", "Run load balancer (use --mode mp|sp)");
     run_lb_step.dependOn(&run_load_balancer_cmd.step);
-
-    // Legacy run steps
-    const run_lb_mp_step = b.step("run-lb-mp", "Run load balancer (legacy multi-process)");
-    run_lb_mp_step.dependOn(&run_load_balancer_mp_cmd.step);
-
-    const run_lb_sp_step = b.step("run-lb-sp", "Run load balancer (legacy single-process)");
-    run_lb_sp_step.dependOn(&run_load_balancer_sp_cmd.step);
 
     const run_backend1_step = b.step("run-backend1", "Run backend server 1");
     run_backend1_step.dependOn(&run_backend1.step);

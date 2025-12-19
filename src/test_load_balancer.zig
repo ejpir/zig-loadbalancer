@@ -17,6 +17,7 @@ pub const integration_test = @import("multiprocess/integration_test.zig");
 
 // Memory module tests
 pub const simple_connection_pool = @import("memory/simple_connection_pool.zig");
+pub const shared_region = @import("memory/shared_region.zig");
 
 // HTTP module tests
 pub const http_utils = @import("http/http_utils.zig");
@@ -38,6 +39,7 @@ comptime {
     _ = connection_reuse;
     _ = proxy_test;
     _ = simple_connection_pool;
+    _ = shared_region;
     _ = http_utils;
     _ = simd_parse;
     _ = config;
