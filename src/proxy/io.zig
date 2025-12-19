@@ -297,15 +297,15 @@ fn forwardHeaders_setMime(
     content_type_value: ?[]const u8,
 ) void {
     if (content_type_value) |ct| {
-        if (std.mem.startsWith(u8, ct, "text/html")) {
-            response.mime = http.Mime.HTML;
-        } else if (std.mem.startsWith(u8, ct, "text/plain")) {
-            response.mime = http.Mime.TEXT;
-        } else if (std.mem.startsWith(u8, ct, "application/json")) {
-            response.mime = http.Mime.JSON;
-        } else {
-            response.mime = http.Mime.BIN;
-        }
+        // Extract base content type (before any charset or parameters)
+        // e.g., "text/html; charset=utf-8" -> "text/html"
+        const base_type = if (std.mem.indexOf(u8, ct, ";")) |semi|
+            std.mem.trim(u8, ct[0..semi], " ")
+        else
+            ct;
+
+        // Use zzz's MIME lookup which handles all standard types
+        response.mime = http.Mime.from_content_type(base_type);
     } else {
         response.mime = http.Mime.BIN;
     }
