@@ -7,18 +7,18 @@ const std = @import("std");
 const posix = std.posix;
 
 const types = @import("../core/types.zig");
-const metrics = @import("../utils/metrics.zig");
+const metrics = @import("../metrics/mod.zig");
+const simple_pool = @import("../memory/pool.zig");
+const shared_region = @import("../memory/shared_region.zig");
+
+pub const circuit_breaker = @import("../health/circuit_breaker.zig");
+pub const backend_selector = @import("selector.zig");
 
 /// Get current time in milliseconds using monotonic clock
 fn currentTimeMillis() i64 {
     const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
     return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
 }
-const simple_pool = @import("../memory/simple_connection_pool.zig");
-const shared_region = @import("../memory/shared_region.zig");
-
-pub const circuit_breaker = @import("circuit_breaker.zig");
-pub const backend_selector = @import("backend_selector.zig");
 
 pub const SharedHealthState = shared_region.SharedHealthState;
 pub const CircuitBreaker = circuit_breaker.CircuitBreaker;

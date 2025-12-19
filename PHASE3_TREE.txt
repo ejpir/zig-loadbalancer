@@ -1,0 +1,93 @@
+# Phase 3: Test Organization Structure
+
+## Test File Organization
+
+```
+load_balancer/
+├── src/
+│   ├── core/
+│   │   ├── config.zig                          [inline tests]
+│   │   └── runmode_test.zig                    [inline tests]
+│   ├── multiprocess/
+│   │   ├── backend_selector.zig                [inline tests]
+│   │   ├── circuit_breaker.zig                 [inline tests]
+│   │   ├── worker_state.zig                    [inline tests]
+│   │   ├── connection_reuse.zig                [inline tests]
+│   │   ├── proxy_test.zig                      [SEPARATE: 520 lines - unit tests for proxy.zig]
+│   │   └── component_integration_test.zig      [SEPARATE: 613 lines - component integration]
+│   ├── memory/
+│   │   ├── simple_connection_pool.zig          [inline tests]
+│   │   └── shared_region.zig                   [inline tests]
+│   ├── http/
+│   │   └── http_utils.zig                      [inline tests]
+│   ├── internal/
+│   │   └── simd_parse.zig                      [inline tests]
+│   ├── config/
+│   │   └── config_watcher.zig                  [inline tests]
+│   └── test_load_balancer.zig                  [TEST AGGREGATOR - imports all tests]
+│
+└── tests/
+    ├── integration_test.zig                    [E2E: 553 lines - full system tests]
+    └── fixtures/
+        ├── backend1.zig                        [Test backend server]
+        ├── backend2.zig                        [Test backend server]
+        └── test_backend_echo.zig               [Echo server for tests]
+```
+
+## Test Hierarchy
+
+```
+Unit Tests (inline)
+    ↓ References via test_load_balancer.zig
+    ├── backend_selector.zig
+    ├── circuit_breaker.zig
+    ├── worker_state.zig
+    └── ... (all modules with inline tests)
+
+Component Tests (separate files in src/)
+    ↓ References via test_load_balancer.zig
+    ├── proxy_test.zig                     [tests proxy.zig functions]
+    └── component_integration_test.zig     [tests WorkerState + Selector + CircuitBreaker]
+
+E2E Tests (separate files in tests/)
+    ↓ Run via zig build test-integration
+    └── integration_test.zig               [spawns backends + LB, makes HTTP requests]
+```
+
+## Build Commands
+
+```bash
+# Unit and component tests (fast, no external deps)
+zig build test
+    → Runs src/test_load_balancer.zig
+    → Includes all inline tests + proxy_test + component_integration_test
+
+# End-to-end integration tests (requires building binaries)
+zig build test-integration
+    → Runs tests/integration_test.zig
+    → Spawns load_balancer and test backends
+    → Makes real HTTP requests
+```
+
+## Changes in Phase 3
+
+1. RENAMED: `src/multiprocess/integration_test.zig`
+        → `src/multiprocess/component_integration_test.zig`
+
+2. UPDATED: `src/test_load_balancer.zig`
+        → Changed import to use new name
+
+3. DOCUMENTED: Added clear header comments explaining test scope
+
+## Test Type Distinction
+
+| Test Type | Location | Imports Internal APIs | Spawns Processes | Example |
+|-----------|----------|----------------------|------------------|---------|
+| Unit | Inline in source files | Yes | No | `backend_selector.zig` tests |
+| Component Integration | src/*_test.zig | Yes | No | `component_integration_test.zig` |
+| E2E Integration | tests/*.zig | No | Yes | `integration_test.zig` |
+
+## Key Principle
+
+**Tests that need internal API access stay in src/**
+**Tests that spawn processes and test the system stay in tests/**

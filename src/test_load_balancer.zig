@@ -4,19 +4,21 @@
 
 const std = @import("std");
 
-// Multiprocess module tests (unit)
-pub const health_state = @import("multiprocess/health_state.zig");
-pub const circuit_breaker = @import("multiprocess/circuit_breaker.zig");
-pub const backend_selector = @import("multiprocess/backend_selector.zig");
-pub const worker_state = @import("multiprocess/worker_state.zig");
+// Health module tests
+pub const health_state = @import("health/state.zig");
+pub const circuit_breaker = @import("health/circuit_breaker.zig");
+
+// Load balancer module tests
+pub const backend_selector = @import("lb/selector.zig");
+pub const worker_state = @import("lb/worker.zig");
+
+// Multiprocess tests (remaining in multiprocess/)
 pub const connection_reuse = @import("multiprocess/connection_reuse.zig");
 pub const proxy_test = @import("multiprocess/proxy_test.zig");
-
-// Multiprocess module tests (integration)
-pub const integration_test = @import("multiprocess/integration_test.zig");
+pub const component_integration_test = @import("multiprocess/component_integration_test.zig");
 
 // Memory module tests
-pub const simple_connection_pool = @import("memory/simple_connection_pool.zig");
+pub const connection_pool = @import("memory/pool.zig");
 pub const shared_region = @import("memory/shared_region.zig");
 
 // HTTP module tests
@@ -27,30 +29,28 @@ pub const simd_parse = @import("internal/simd_parse.zig");
 
 // Core module tests
 pub const config = @import("core/config.zig");
-pub const runmode_test = @import("core/runmode_test.zig");
 
 // Config module tests
 pub const config_watcher = @import("config/config_watcher.zig");
 
 // Run all tests
 comptime {
-    // Unit tests
+    // Unit tests - reorganized modules
     _ = health_state;
     _ = circuit_breaker;
     _ = backend_selector;
     _ = worker_state;
     _ = connection_reuse;
     _ = proxy_test;
-    _ = simple_connection_pool;
+    _ = connection_pool;
     _ = shared_region;
     _ = http_utils;
     _ = simd_parse;
     _ = config;
-    _ = runmode_test;
     _ = config_watcher;
 
-    // Integration tests
-    _ = integration_test;
+    // Component integration tests
+    _ = component_integration_test;
 }
 
 test "test_load_balancer: all modules imported" {

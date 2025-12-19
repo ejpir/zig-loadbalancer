@@ -469,7 +469,6 @@ if (pid == 0) {
 │   │   ├── proxy.zig            # Streaming proxy + failover + SharedBackend support
 │   │   ├── worker_state.zig     # Per-worker state + SharedRegion integration
 │   │   ├── circuit_breaker.zig  # Health state machine
-│   │   ├── health_state.zig     # u64 bitmap
 │   │   ├── health.zig           # Background probes
 │   │   ├── backend_selector.zig # LB strategies
 │   │   └── connection_reuse.zig # Keep-alive detection

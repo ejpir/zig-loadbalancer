@@ -9,8 +9,8 @@
 const std = @import("std");
 const testing = std.testing;
 
-// Import the proxy module to test internal functions
-const proxy = @import("proxy.zig");
+// Import the proxy modules to test internal functions
+const proxy_request = @import("../proxy/request.zig");
 
 // Mock types for testing
 const types = @import("../core/types.zig");
@@ -53,7 +53,8 @@ test "buildRequestHeaders: GET request without body" {
 
     // Build headers
     var buffer: [8192]u8 = undefined;
-    const headers = try proxy.streamingProxy_buildRequestHeaders(
+    const headers = try proxy_request.buildRequestHeaders(
+        types.BackendServer,
         &mock_ctx,
         &backend,
         &buffer,
@@ -117,7 +118,8 @@ test "buildRequestHeaders: POST request with body" {
 
     // Build headers
     var buffer: [8192]u8 = undefined;
-    const headers = try proxy.streamingProxy_buildRequestHeaders(
+    const headers = try proxy_request.buildRequestHeaders(
+        types.BackendServer,
         &mock_ctx,
         &backend,
         &buffer,
@@ -187,7 +189,8 @@ test "buildRequestHeaders: hop-by-hop headers are filtered" {
 
     // Build headers
     var buffer: [8192]u8 = undefined;
-    const headers = try proxy.streamingProxy_buildRequestHeaders(
+    const headers = try proxy_request.buildRequestHeaders(
+        types.BackendServer,
         &mock_ctx,
         &backend,
         &buffer,
@@ -247,7 +250,8 @@ test "buildRequestHeaders: PUT request with body" {
 
     // Build headers
     var buffer: [8192]u8 = undefined;
-    const headers = try proxy.streamingProxy_buildRequestHeaders(
+    const headers = try proxy_request.buildRequestHeaders(
+        types.BackendServer,
         &mock_ctx,
         &backend,
         &buffer,
@@ -301,7 +305,8 @@ test "buildRequestHeaders: PATCH request with body" {
 
     // Build headers
     var buffer: [8192]u8 = undefined;
-    const headers = try proxy.streamingProxy_buildRequestHeaders(
+    const headers = try proxy_request.buildRequestHeaders(
+        types.BackendServer,
         &mock_ctx,
         &backend,
         &buffer,
@@ -348,7 +353,8 @@ test "buildRequestHeaders: DELETE request without body" {
 
     // Build headers
     var buffer: [8192]u8 = undefined;
-    const headers = try proxy.streamingProxy_buildRequestHeaders(
+    const headers = try proxy_request.buildRequestHeaders(
+        types.BackendServer,
         &mock_ctx,
         &backend,
         &buffer,
@@ -402,7 +408,8 @@ test "buildRequestHeaders: case insensitive header filtering" {
 
     // Build headers
     var buffer: [8192]u8 = undefined;
-    const headers = try proxy.streamingProxy_buildRequestHeaders(
+    const headers = try proxy_request.buildRequestHeaders(
+        types.BackendServer,
         &mock_ctx,
         &backend,
         &buffer,
@@ -453,7 +460,8 @@ test "buildRequestHeaders: empty body is treated as no body" {
 
     // Build headers
     var buffer: [8192]u8 = undefined;
-    const headers = try proxy.streamingProxy_buildRequestHeaders(
+    const headers = try proxy_request.buildRequestHeaders(
+        types.BackendServer,
         &mock_ctx,
         &backend,
         &buffer,

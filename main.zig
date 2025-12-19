@@ -23,12 +23,12 @@ const Route = http.Route;
 
 const types = @import("src/core/types.zig");
 const config_mod = @import("src/core/config.zig");
-const simple_pool = @import("src/memory/simple_connection_pool.zig");
+const simple_pool = @import("src/memory/pool.zig");
 const shared_region = @import("src/memory/shared_region.zig");
 const config_watcher = @import("src/config/config_watcher.zig");
-const metrics = @import("src/utils/metrics.zig");
+const metrics = @import("src/metrics/mod.zig");
 const mp = @import("src/multiprocess/mod.zig");
-const health = @import("src/multiprocess/health.zig");
+const health = @import("src/health/probe.zig");
 
 const SharedHealthState = shared_region.SharedHealthState;
 
