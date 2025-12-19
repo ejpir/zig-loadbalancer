@@ -25,6 +25,7 @@ const types = @import("src/core/types.zig");
 const config_mod = @import("src/core/config.zig");
 const simple_pool = @import("src/memory/simple_connection_pool.zig");
 const shared_region = @import("src/memory/shared_region.zig");
+const config_watcher = @import("src/config/config_watcher.zig");
 const metrics = @import("src/utils/metrics.zig");
 const mp = @import("src/multiprocess/mod.zig");
 const health = @import("src/multiprocess/health.zig");
@@ -32,7 +33,7 @@ const health = @import("src/multiprocess/health.zig");
 const SharedHealthState = shared_region.SharedHealthState;
 
 pub const std_options: std.Options = .{
-    .log_level = .warn,
+    .log_level = .debug,
 };
 
 // ============================================================================
@@ -76,6 +77,7 @@ pub const RunMode = enum {
 const Config = struct {
     mode: RunMode,
     lbConfig: LoadBalancerConfig,
+    config_path: ?[]const u8 = null, // Path to JSON config file for hot reload
 };
 
 // ============================================================================
@@ -97,11 +99,13 @@ fn printUsage() void {
         \\    -w, --workers <N>       Worker count, mp mode only (default: CPU count)
         \\    -b, --backend <H:P>     Backend server (can specify multiple)
         \\    -s, --strategy <S>      Load balancing strategy: round_robin, weighted, random
+        \\    -c, --config <PATH>     JSON config file for hot reload (mp mode only)
         \\    --help                  Show this help
         \\
         \\EXAMPLES:
         \\    load_balancer --mode mp --port 8080 --backend 127.0.0.1:9001
         \\    load_balancer -m sp -p 8080 -b 127.0.0.1:9001 -b 127.0.0.1:9002
+        \\    load_balancer -m mp -c backends.json  # Hot reload on file change
         \\
     , .{});
 }
@@ -115,6 +119,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     var port: u16 = 8080;
     var host: ?[]const u8 = null;
     var strategy: types.LoadBalancerStrategy = .round_robin;
+    var config_path: ?[]const u8 = null;
 
     var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
     errdefer backend_list.deinit(allocator);
@@ -182,11 +187,37 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 }
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "--config") or
+                   std.mem.eql(u8, arg, "-c")) {
+            if (i + 1 < args.len) {
+                config_path = try allocator.dupe(u8, args[i + 1]);
+                i += 1;
+            }
         }
     }
 
     // Use default mode if not specified
     const final_mode = mode orelse RunMode.default();
+
+    // Load backends from config file if provided
+    if (config_path) |path| {
+        var parsed = config_watcher.parseConfigFile(allocator, path) catch |err| {
+            std.debug.print("Failed to parse config file '{s}': {s}\n", .{ path, @errorName(err) });
+            return error.ConfigParseError;
+        };
+        defer parsed.deinit();
+
+        // Copy backends from parsed config
+        for (parsed.backends) |b| {
+            const h = try allocator.dupe(u8, b.host);
+            try backend_list.append(allocator, .{
+                .host = h,
+                .port = b.port,
+                .weight = b.weight,
+                .use_tls = b.use_tls,
+            });
+        }
+    }
 
     // Provide defaults when user doesn't specify backends
     if (backend_list.items.len == 0) {
@@ -202,6 +233,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
 
     return .{
         .mode = final_mode,
+        .config_path = config_path,
         .lbConfig = .{
             .worker_count = worker_count,
             .port = port,
@@ -241,7 +273,7 @@ pub fn main() !void {
 
     // Dispatch to appropriate mode
     switch (config.mode) {
-        .multiprocess => try runMultiProcess(allocator, config.lbConfig),
+        .multiprocess => try runMultiProcess(allocator, config),
         .singleprocess => try runSingleProcess(allocator, config.lbConfig),
     }
 }
@@ -250,12 +282,12 @@ pub fn main() !void {
 // Multi-Process Mode
 // ============================================================================
 
-fn runMultiProcess(allocator: std.mem.Allocator, config: LoadBalancerConfig) !void {
-    var mutable_config = config;
+fn runMultiProcess(allocator: std.mem.Allocator, config: Config) !void {
+    var mutable_lb_config = config.lbConfig;
 
     // Auto-detect worker count if not specified
-    if (mutable_config.worker_count == 0) {
-        mutable_config.worker_count = try std.Thread.getCpuCount();
+    if (mutable_lb_config.worker_count == 0) {
+        mutable_lb_config.worker_count = try std.Thread.getCpuCount();
     }
 
     // Create shared memory region (visible to all forked workers)
@@ -264,14 +296,21 @@ fn runMultiProcess(allocator: std.mem.Allocator, config: LoadBalancerConfig) !vo
     defer shared_allocator.deinit();
 
     // Initialize backends in shared region
-    initSharedBackends(region, mutable_config.backends);
+    initSharedBackends(region, mutable_lb_config.backends);
 
-    log.info("Workers: {d}", .{mutable_config.worker_count});
-    for (mutable_config.backends, 0..) |b, idx| {
+    log.info("Workers: {d}", .{mutable_lb_config.worker_count});
+    for (mutable_lb_config.backends, 0..) |b, idx| {
         log.info("  Backend {d}: {s}:{d}", .{ idx + 1, b.host, b.port });
     }
 
-    try spawnWorkers(allocator, &mutable_config, region);
+    // Start config file watcher for hot reload (if config file provided)
+    if (config.config_path) |path| {
+        const watcher_thread = try config_watcher.startConfigWatcher(region, path, allocator, reloadSharedBackends);
+        _ = watcher_thread; // Thread runs until process exits
+        log.info("Config watcher started: {s}", .{path});
+    }
+
+    try spawnWorkers(allocator, &mutable_lb_config, region);
 }
 
 /// Initialize backends in the shared region's double buffer
@@ -304,7 +343,7 @@ pub fn reloadSharedBackends(region: *shared_region.SharedRegion, backends: []con
     const count = @min(backends.len, shared_region.MAX_BACKENDS);
 
     // Clear inactive buffer first (in case new config has fewer backends)
-    for (&inactive) |*b| {
+    for (inactive) |*b| {
         b.* = .{};
     }
 
@@ -431,6 +470,7 @@ fn workerMain(
         .health_path = config.health_path,
     });
     worker_state.setWorkerId(worker_id);
+    worker_state.setSharedRegion(region);
 
     log.info("Worker {d}: Starting with {d} backends (shared health)", .{
         worker_id,

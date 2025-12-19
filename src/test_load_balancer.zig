@@ -29,6 +29,9 @@ pub const simd_parse = @import("internal/simd_parse.zig");
 pub const config = @import("core/config.zig");
 pub const runmode_test = @import("core/runmode_test.zig");
 
+// Config module tests
+pub const config_watcher = @import("config/config_watcher.zig");
+
 // Run all tests
 comptime {
     // Unit tests
@@ -44,6 +47,7 @@ comptime {
     _ = simd_parse;
     _ = config;
     _ = runmode_test;
+    _ = config_watcher;
 
     // Integration tests
     _ = integration_test;
