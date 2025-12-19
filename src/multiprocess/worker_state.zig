@@ -622,3 +622,92 @@ test "WorkerState: different worker_ids produce different random sequences" {
     // Expect at least some differences
     try std.testing.expect(differences > 0);
 }
+
+test "WorkerState: getBackendCount uses shared region when set" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    // Local backends: 2
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+    try backends.append(allocator, types.BackendServer.init(host, 8002, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    defer pool.deinit();
+
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
+
+    // Without shared region, uses local backends count
+    try std.testing.expectEqual(@as(usize, 2), state.getBackendCount());
+
+    // Set up shared region with 3 backends
+    var region = shared_region.SharedRegion{};
+    var inactive = region.getInactiveBackends();
+    inactive[0].setHost("a.com");
+    inactive[0].port = 80;
+    inactive[1].setHost("b.com");
+    inactive[1].port = 81;
+    inactive[2].setHost("c.com");
+    inactive[2].port = 82;
+    _ = region.control.switchActiveArray(3);
+
+    // With shared region, uses shared region count
+    state.setSharedRegion(&region);
+    try std.testing.expectEqual(@as(usize, 3), state.getBackendCount());
+}
+
+test "WorkerState: getSharedBackend returns null without shared region" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    defer pool.deinit();
+
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    const state = WorkerState.init(&backends, &pool, &health, .{});
+
+    // Without shared region, getSharedBackend returns null
+    try std.testing.expectEqual(@as(?*const shared_region.SharedBackend, null), state.getSharedBackend(0));
+}
+
+test "WorkerState: getSharedBackend returns backend from shared region" {
+    const allocator = std.testing.allocator;
+    var backends: types.BackendsList = .empty;
+    defer backends.deinit(allocator);
+
+    const host = "localhost";
+    try backends.append(allocator, types.BackendServer.init(host, 8001, 1));
+
+    var pool = simple_pool.SimpleConnectionPool{};
+    defer pool.deinit();
+
+    var health = SharedHealthState{};
+    health.markAllUnhealthy();
+    var state = WorkerState.init(&backends, &pool, &health, .{});
+
+    // Set up shared region
+    var region = shared_region.SharedRegion{};
+    var inactive = region.getInactiveBackends();
+    inactive[0].setHost("shared-backend.com");
+    inactive[0].port = 9000;
+    _ = region.control.switchActiveArray(1);
+
+    state.setSharedRegion(&region);
+
+    // Should return shared backend
+    const backend = state.getSharedBackend(0);
+    try std.testing.expect(backend != null);
+    try std.testing.expectEqualStrings("shared-backend.com", backend.?.getHost());
+    try std.testing.expectEqual(@as(u16, 9000), backend.?.port);
+
+    // Out of bounds returns null
+    try std.testing.expectEqual(@as(?*const shared_region.SharedBackend, null), state.getSharedBackend(1));
+}

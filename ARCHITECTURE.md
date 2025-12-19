@@ -213,14 +213,20 @@ RFC 7230 compliance:
 Combines all per-worker state:
 ```zig
 pub const WorkerState = struct {
-    backends: *const BackendsList,
+    backends: *const BackendsList,        // Local backends (fallback)
+    shared_region: ?*SharedRegion,        // Shared memory for hot reload
     connection_pool: *SimpleConnectionPool,
     circuit_breaker: CircuitBreaker,
     config: Config,
-    rr_state: usize,           // Round-robin counter
+    rr_state: usize,                      // Round-robin counter
     total_requests: usize,
 };
 ```
+
+Key methods for hot reload:
+- `setSharedRegion(region)` — Enable shared memory backend source
+- `getBackendCount()` — Returns count from SharedRegion if available
+- `getSharedBackend(idx)` — Returns backend from SharedRegion for routing
 
 ### `metrics.zig` — Prometheus Metrics
 
@@ -312,14 +318,60 @@ The load balancer supports zero-downtime configuration changes and binary upgrad
 
 ### Hot Reload Flow
 
+The config watcher runs in a dedicated thread in the master process, using platform-specific file monitoring:
+
 ```
-1. File watcher detects /etc/lb/backends.json changed
-2. Parse new config
-3. Write backends to INACTIVE array (BackendArray[1-active_index])
-4. Atomic: generation++, flip active_index, update backend_count
-5. Workers immediately see new backends on next request
-6. Reset health bitmap for new backends
+┌─────────────────────────────────────────────────────────────────────────┐
+│ MASTER PROCESS                                                          │
+│  ┌────────────────────┐     ┌─────────────────────────────────────────┐ │
+│  │ Config Watcher     │     │ SharedRegion (mmap'd)                   │ │
+│  │ Thread             │────►│                                         │ │
+│  │                    │     │  BackendArray[0] ◄── active_index = 0   │ │
+│  │ kqueue (macOS)     │     │  BackendArray[1]     (inactive)         │ │
+│  │ inotify (Linux)    │     │                                         │ │
+│  └────────────────────┘     └─────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
+         │                              ▲
+         │ watches                      │ workers read via
+         ▼                              │ getSharedBackend()
+┌─────────────────┐            ┌────────┴────────┐
+│ backends.json   │            │ Worker Processes │
+└─────────────────┘            └─────────────────┘
 ```
+
+**Detailed flow:**
+
+```
+1. Config watcher (kqueue/inotify) detects backends.json modified
+2. Parse JSON config:
+   {
+     "backends": [
+       {"host": "backend1.local", "port": 8001, "weight": 5},
+       {"host": "backend2.local", "port": 8002, "weight": 3, "tls": true}
+     ]
+   }
+3. Write backends to INACTIVE array (BackendArray[1 - active_index])
+4. Atomic swap: generation++, flip active_index, update backend_count
+5. Reset health bitmap for new backend count
+6. Workers see new backends on next request via getSharedBackend()
+```
+
+**Config file format (`backends.json`):**
+
+```json
+{
+  "backends": [
+    {"host": "127.0.0.1", "port": 8001},
+    {"host": "127.0.0.1", "port": 8002, "weight": 2},
+    {"host": "secure.example.com", "port": 443, "tls": true}
+  ]
+}
+```
+
+**Zero-downtime guarantees:**
+- No locks — workers read atomically via `active_index`
+- No request drops — old backends serve until next request reads new config
+- No coordination — each worker independently reads from SharedRegion
 
 ### Hot Binary Upgrade Flow
 
@@ -337,7 +389,7 @@ The load balancer supports zero-downtime configuration changes and binary upgrad
 | File | Purpose |
 |------|---------|
 | `src/memory/shared_region.zig` | SharedRegion, ControlBlock, SharedHealthState, SharedBackend |
-| `src/memory/shared_region.zig` | SharedRegionAllocator (platform-aware mmap) |
+| `src/config/config_watcher.zig` | JSON config parser, kqueue/inotify file watcher |
 
 ### Usage Example
 
@@ -375,21 +427,24 @@ if (pid == 0) {
 ├── main.zig                     # Unified entry point (--mode mp|sp)
 ├── main_multiprocess.zig        # Legacy: nginx-style fork()
 ├── main_singleprocess.zig       # Legacy: single process
+├── backends.json                # Example config for hot reload
 ├── src/
 │   ├── core/
 │   │   ├── types.zig            # BackendServer, LoadBalancerStrategy
 │   │   └── config.zig           # LoadBalancerConfig
+│   ├── config/
+│   │   └── config_watcher.zig   # JSON parser + file watcher (kqueue/inotify)
 │   ├── multiprocess/
 │   │   ├── mod.zig              # Re-exports
-│   │   ├── proxy.zig            # Streaming proxy + failover
-│   │   ├── worker_state.zig     # Per-worker state
+│   │   ├── proxy.zig            # Streaming proxy + failover + SharedBackend support
+│   │   ├── worker_state.zig     # Per-worker state + SharedRegion integration
 │   │   ├── circuit_breaker.zig  # Health state machine
 │   │   ├── health_state.zig     # u64 bitmap
 │   │   ├── health.zig           # Background probes
 │   │   ├── backend_selector.zig # LB strategies
 │   │   └── connection_reuse.zig # Keep-alive detection
 │   ├── http/
-│   │   ├── ultra_sock.zig       # TCP/TLS socket
+│   │   ├── ultra_sock.zig       # TCP/TLS socket (duck-typed for SharedBackend)
 │   │   └── http_utils.zig       # RFC 7230 framing
 │   ├── memory/
 │   │   ├── simple_connection_pool.zig  # Per-worker connection pooling
