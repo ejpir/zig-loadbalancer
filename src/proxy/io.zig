@@ -122,6 +122,11 @@ pub fn readHeaders(
         msg_len.length,
     });
 
+    // Trace: dump response headers (inline check avoids function call overhead)
+    if (config.isTraceEnabled()) {
+        config.hexDump("RESPONSE HEADERS FROM BACKEND", header_buffer[0..header_end.*]);
+    }
+
     return msg_len;
 }
 
@@ -213,6 +218,11 @@ pub fn forwardHeaders(
         body_already_read;
 
     if (body_to_write > 0) {
+        // Trace: dump body data that arrived with headers
+        if (config.isTraceEnabled()) {
+            config.hexDump("RESPONSE BODY (with headers)", header_buffer[header_end..][0..body_to_write]);
+        }
+
         client_writer.writeAll(header_buffer[header_end..][0..body_to_write]) catch {
             return ProxyError.SendFailed;
         };
@@ -399,6 +409,11 @@ fn streamBody_contentLength(
             break;
         }
 
+        // Trace: dump body chunk (inline check avoids function call overhead)
+        if (config.isTraceEnabled()) {
+            config.hexDump("RESPONSE BODY CHUNK", body_buf[0..n]);
+        }
+
         client_writer.writeAll(body_buf[0..n]) catch {
             proxy_state.client_write_error = true;
             break;
@@ -444,6 +459,11 @@ fn streamBody_chunked(
             proxy_state.body_had_error = true;
             proxy_state.sock.connected = false;
             break;
+        }
+
+        // Trace: dump body chunk (inline check avoids function call overhead)
+        if (config.isTraceEnabled()) {
+            config.hexDump("RESPONSE BODY CHUNK", body_buf[0..n]);
         }
 
         client_writer.writeAll(body_buf[0..n]) catch {

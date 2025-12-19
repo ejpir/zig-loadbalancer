@@ -95,6 +95,7 @@ const Config = struct {
     config_path: ?[]const u8 = null, // Path to JSON config file for hot reload
     upgrade_fd: ?posix.fd_t = null, // Inherited socket fd for binary hot reload
     insecure_tls: bool = false, // Skip TLS verification (for testing only)
+    trace: bool = false, // Enable hex/ASCII payload tracing
 };
 
 // ============================================================================
@@ -119,6 +120,7 @@ fn printUsage() void {
         \\    -c, --config <PATH>     JSON config file for hot reload
         \\    -l, --loglevel <LEVEL>  Log level: err, warn, info, debug (default: info)
         \\    -k, --insecure          Skip TLS certificate verification (testing only)
+        \\    -t, --trace             Dump raw request/response payloads (hex + ASCII)
         \\    --upgrade-fd <FD>       Inherit socket fd for binary hot reload (internal)
         \\    --help                  Show this help
         \\
@@ -146,6 +148,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     var config_path: ?[]const u8 = null;
     var upgrade_fd: ?posix.fd_t = null;
     var insecure_tls: bool = false;
+    var trace: bool = false;
 
     var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
     errdefer backend_list.deinit(allocator);
@@ -240,6 +243,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         } else if (std.mem.eql(u8, arg, "--insecure") or
                    std.mem.eql(u8, arg, "-k")) {
             insecure_tls = true;
+        } else if (std.mem.eql(u8, arg, "--trace") or
+                   std.mem.eql(u8, arg, "-t")) {
+            trace = true;
         } else if (std.mem.eql(u8, arg, "--upgrade-fd")) {
             if (i + 1 < args.len) {
                 upgrade_fd = try std.fmt.parseInt(posix.fd_t, args[i + 1], 10);
@@ -251,6 +257,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     // Warn if insecure TLS is enabled
     if (insecure_tls) {
         std.debug.print("WARNING: TLS certificate verification disabled. Do not use in production!\n", .{});
+    }
+
+    // Notify if trace mode is enabled
+    if (trace) {
+        std.debug.print("TRACE: Payload hex/ASCII dumps enabled (may impact performance)\n", .{});
     }
 
     // Use default mode if not specified
@@ -293,6 +304,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         .config_path = config_path,
         .upgrade_fd = upgrade_fd,
         .insecure_tls = insecure_tls,
+        .trace = trace,
         .lbConfig = .{
             .worker_count = worker_count,
             .port = port,
@@ -325,6 +337,9 @@ pub fn main() !void {
 
     // Set runtime TLS mode (before spawning workers)
     config_mod.setInsecureTls(config.insecure_tls);
+
+    // Set runtime trace mode
+    config_mod.setTraceEnabled(config.trace);
 
     // Validate configuration
     try config.lbConfig.validate();

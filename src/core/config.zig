@@ -99,8 +99,83 @@ pub fn setInsecureTls(insecure: bool) void {
 }
 
 /// Check if TLS verification should be skipped
-pub fn isInsecureTls() bool {
+/// Inline to guarantee zero function call overhead
+pub inline fn isInsecureTls() bool {
     return runtime_insecure_tls;
+}
+
+// ============================================================================
+// Runtime Trace Configuration
+// ============================================================================
+
+/// Global runtime trace setting for hex/ASCII payload dumps
+pub var runtime_trace_enabled: bool = false;
+
+/// Enable payload tracing (call once at startup)
+pub fn setTraceEnabled(enabled: bool) void {
+    runtime_trace_enabled = enabled;
+}
+
+/// Check if payload tracing is enabled
+/// Inline to guarantee zero function call overhead in hot paths
+pub inline fn isTraceEnabled() bool {
+    return runtime_trace_enabled;
+}
+
+/// Dump data as hex + ASCII (like hexdump -C)
+pub fn hexDump(label: []const u8, data: []const u8) void {
+    if (!runtime_trace_enabled) return;
+
+    const log = std.log.scoped(.trace);
+    log.info("=== {s} ({d} bytes) ===", .{ label, data.len });
+
+    const BYTES_PER_LINE = 16;
+    var offset: usize = 0;
+
+    while (offset < data.len) {
+        const end = @min(offset + BYTES_PER_LINE, data.len);
+        const line = data[offset..end];
+
+        // Format: "00000000  48 54 54 50 2f 31 2e 31  20 32 30 30 20 4f 4b 0d  |HTTP/1.1 200 OK.|"
+        var hex_buf: [BYTES_PER_LINE * 3 + 1]u8 = undefined;
+        var ascii_buf: [BYTES_PER_LINE + 2]u8 = undefined;
+
+        // Build hex part
+        var hex_pos: usize = 0;
+        for (line, 0..) |byte, i| {
+            const hex_chars = "0123456789abcdef";
+            hex_buf[hex_pos] = hex_chars[byte >> 4];
+            hex_buf[hex_pos + 1] = hex_chars[byte & 0x0f];
+            hex_buf[hex_pos + 2] = ' ';
+            hex_pos += 3;
+
+            // Extra space at midpoint
+            if (i == 7) {
+                hex_buf[hex_pos] = ' ';
+                hex_pos += 1;
+            }
+        }
+
+        // Pad remaining hex space
+        while (hex_pos < BYTES_PER_LINE * 3 + 1) : (hex_pos += 1) {
+            hex_buf[hex_pos] = ' ';
+        }
+
+        // Build ASCII part
+        ascii_buf[0] = '|';
+        for (line, 0..) |byte, i| {
+            ascii_buf[i + 1] = if (byte >= 0x20 and byte < 0x7f) byte else '.';
+        }
+        ascii_buf[line.len + 1] = '|';
+
+        log.info("{x:0>8}  {s} {s}", .{
+            offset,
+            hex_buf[0..hex_pos],
+            ascii_buf[0 .. line.len + 2],
+        });
+
+        offset = end;
+    }
 }
 
 // ============================================================================

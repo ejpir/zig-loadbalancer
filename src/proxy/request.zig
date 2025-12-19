@@ -165,6 +165,14 @@ pub fn sendRequest(
         request_data[0..@min(request_data.len, 60)],
     });
 
+    // Trace: dump outgoing request (inline check avoids function call overhead)
+    if (config.isTraceEnabled()) {
+        config.hexDump("REQUEST TO BACKEND", request_data);
+        if (ctx.request.body) |body| {
+            config.hexDump("REQUEST BODY", body);
+        }
+    }
+
     // TigerStyle: smallest scope - only create writer when needed.
     var send_ok = false;
     if (proxy_state.is_tls) {
