@@ -730,3 +730,35 @@ test "DNS helpers: makePortString formats port correctly" {
     const port_443 = try UltraSock.makePortString(443);
     try std.testing.expectEqualStrings("443", std.mem.span(port_443));
 }
+
+test "TlsOptions: fromRuntime returns production when not insecure" {
+    // Save original state
+    const original = config_mod.runtime_insecure_tls;
+    defer config_mod.runtime_insecure_tls = original;
+
+    // Set to secure mode
+    config_mod.runtime_insecure_tls = false;
+
+    // Get options from runtime
+    const opts = TlsOptions.fromRuntime();
+
+    // Verify CA verification is system (production)
+    try std.testing.expectEqual(@as(TlsOptions.CaVerification, .system), opts.ca);
+    try std.testing.expectEqual(@as(TlsOptions.HostVerification, .from_connection), opts.host);
+}
+
+test "TlsOptions: fromRuntime returns insecure when flag is set" {
+    // Save original state
+    const original = config_mod.runtime_insecure_tls;
+    defer config_mod.runtime_insecure_tls = original;
+
+    // Set to insecure mode
+    config_mod.runtime_insecure_tls = true;
+
+    // Get options from runtime
+    const opts = TlsOptions.fromRuntime();
+
+    // Verify CA verification is none (insecure)
+    try std.testing.expectEqual(@as(TlsOptions.CaVerification, .none), opts.ca);
+    try std.testing.expectEqual(@as(TlsOptions.HostVerification, .none), opts.host);
+}

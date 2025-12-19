@@ -99,6 +99,7 @@ Mix HTTP and HTTPS backends freely.
 -l, --loglevel LVL   Log level: err, warn, info, debug (default: info)
 -k, --insecure       Skip TLS certificate verification (testing only!)
 -t, --trace          Dump raw request/response payloads (hex + ASCII)
+--tls-trace          Show detailed TLS handshake info (cipher, version, CA)
 --help               Show help message
 ```
 
@@ -300,11 +301,25 @@ kill -USR2 $(pgrep -f load_balancer)
 ```
 
 **What happens:**
+```
+┌─────────────────┐     SIGUSR2      ┌─────────────────┐
+│  Old Process    │ ───────────────► │  New Process    │
+│  (listening)    │                  │  (inherits fd)  │
+│                 │  fork+exec       │                 │
+│  fd=3 :8080     │ ───────────────► │  --upgrade-fd 3 │
+└─────────────────┘                  └─────────────────┘
+         │                                    │
+         ▼                                    ▼
+    drains conns                      starts accepting
+    then exits                        new connections
+```
+
 1. Old process receives SIGUSR2
-2. Forks and execs new binary (same arguments)
-3. New process starts, binds with SO_REUSEPORT
-4. Old process waits 1 second, then drains connections and exits
-5. New process takes over seamlessly
+2. Forks and execs new binary with `--upgrade-fd <fd>` (internal flag)
+3. New process inherits the listening socket file descriptor
+4. New process starts accepting connections immediately
+5. Old process drains existing connections and exits gracefully
+6. Zero dropped connections, zero downtime
 
 Works in both `mp` and `sp` modes on Linux and macOS.
 
