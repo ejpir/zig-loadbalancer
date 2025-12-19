@@ -94,6 +94,7 @@ const Config = struct {
     lbConfig: LoadBalancerConfig,
     config_path: ?[]const u8 = null, // Path to JSON config file for hot reload
     upgrade_fd: ?posix.fd_t = null, // Inherited socket fd for binary hot reload
+    insecure_tls: bool = false, // Skip TLS verification (for testing only)
 };
 
 // ============================================================================
@@ -117,6 +118,7 @@ fn printUsage() void {
         \\    -s, --strategy <S>      Load balancing strategy: round_robin, weighted, random
         \\    -c, --config <PATH>     JSON config file for hot reload
         \\    -l, --loglevel <LEVEL>  Log level: err, warn, info, debug (default: info)
+        \\    -k, --insecure          Skip TLS certificate verification (testing only)
         \\    --upgrade-fd <FD>       Inherit socket fd for binary hot reload (internal)
         \\    --help                  Show this help
         \\
@@ -143,6 +145,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     var strategy: types.LoadBalancerStrategy = .round_robin;
     var config_path: ?[]const u8 = null;
     var upgrade_fd: ?posix.fd_t = null;
+    var insecure_tls: bool = false;
 
     var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
     errdefer backend_list.deinit(allocator);
@@ -234,12 +237,20 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 }
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "--insecure") or
+                   std.mem.eql(u8, arg, "-k")) {
+            insecure_tls = true;
         } else if (std.mem.eql(u8, arg, "--upgrade-fd")) {
             if (i + 1 < args.len) {
                 upgrade_fd = try std.fmt.parseInt(posix.fd_t, args[i + 1], 10);
                 i += 1;
             }
         }
+    }
+
+    // Warn if insecure TLS is enabled
+    if (insecure_tls) {
+        std.debug.print("WARNING: TLS certificate verification disabled. Do not use in production!\n", .{});
     }
 
     // Use default mode if not specified
@@ -281,6 +292,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         .mode = final_mode,
         .config_path = config_path,
         .upgrade_fd = upgrade_fd,
+        .insecure_tls = insecure_tls,
         .lbConfig = .{
             .worker_count = worker_count,
             .port = port,
@@ -310,6 +322,9 @@ pub fn main() !void {
 
     const config = try parseArgs(allocator);
     defer freeConfig(allocator, config);
+
+    // Set runtime TLS mode (before spawning workers)
+    config_mod.setInsecureTls(config.insecure_tls);
 
     // Validate configuration
     try config.lbConfig.validate();
