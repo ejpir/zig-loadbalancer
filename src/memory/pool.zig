@@ -18,7 +18,7 @@ const TlsOptions = ultra_sock.TlsOptions;
 pub const MAX_IDLE_CONNS: usize = 128;
 
 /// Maximum number of backends.
-/// Must match health_state.MAX_BACKENDS (limited by u64 bitmap).
+/// Must match shared_region.MAX_BACKENDS (limited by u64 bitmap).
 pub const MAX_BACKENDS: usize = 64;
 
 /// Simple stack for connection pooling (no atomics)

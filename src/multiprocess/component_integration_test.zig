@@ -1,12 +1,17 @@
-/// Integration Tests
+/// Component Integration Tests
 ///
-/// Tests that verify components work correctly together,
-/// simulating real usage patterns rather than isolated unit behavior.
+/// Tests that verify multiprocess components work correctly together:
+/// - WorkerState + BackendSelector + CircuitBreaker interactions
+/// - Health probing + circuit breaker coordination
+/// - Request distribution across multiple backends
+///
+/// These tests simulate real usage patterns without requiring actual backends.
+/// For full end-to-end tests with real HTTP, see tests/integration_test.zig
 const std = @import("std");
 
 const types = @import("../core/types.zig");
-const simple_pool = @import("../memory/simple_connection_pool.zig");
-const worker_state = @import("worker_state.zig");
+const simple_pool = @import("../memory/pool.zig");
+const worker_state = @import("../lb/worker.zig");
 const WorkerState = worker_state.WorkerState;
 const SharedHealthState = worker_state.SharedHealthState;
 

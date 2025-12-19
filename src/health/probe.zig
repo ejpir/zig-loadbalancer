@@ -18,8 +18,8 @@ const log = std.log.scoped(.health);
 const posix = std.posix;
 
 const types = @import("../core/types.zig");
-const WorkerState = @import("worker_state.zig").WorkerState;
-const Config = @import("worker_state.zig").Config;
+const WorkerState = @import("../lb/worker.zig").WorkerState;
+const Config = @import("../lb/worker.zig").Config;
 
 /// Start health probing in a background thread
 pub fn startHealthProbes(state: *WorkerState, worker_id: usize) !std.Thread {

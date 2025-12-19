@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
 
     // Backend 1
     const backend1_mod = b.createModule(.{
-        .root_source_file = b.path("backend1.zig"),
+        .root_source_file = b.path("tests/fixtures/backend1.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
 
     // Backend 2
     const backend2_mod = b.createModule(.{
-        .root_source_file = b.path("backend2.zig"),
+        .root_source_file = b.path("tests/fixtures/backend2.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
 
     // Test backend echo (echoes request details for integration tests)
     const test_backend_echo_mod = b.createModule(.{
-        .root_source_file = b.path("test_backend_echo.zig"),
+        .root_source_file = b.path("tests/fixtures/test_backend_echo.zig"),
         .target = target,
         .optimize = optimize,
     });
