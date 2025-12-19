@@ -8,6 +8,8 @@ const log = std.log.scoped(.ultra_sock);
 const Io = std.Io;
 const tls = @import("tls");
 
+const config_mod = @import("../core/config.zig");
+
 /// Protocol type
 pub const Protocol = enum {
     http,
@@ -20,7 +22,7 @@ pub const TlsOptions = struct {
     pub const CaVerification = union(enum) {
         /// No CA verification - INSECURE, for local dev only
         none,
-        /// Use system trust store (default)
+        /// Use system trust store (default when DEFAULT_TLS_VERIFY_CA = true)
         system,
         /// Use custom certificate bundle
         custom: tls.config.cert.Bundle,
@@ -30,7 +32,7 @@ pub const TlsOptions = struct {
     pub const HostVerification = union(enum) {
         /// No hostname verification - INSECURE
         none,
-        /// Verify against connection host (default)
+        /// Verify against connection host (default when DEFAULT_TLS_VERIFY_HOST = true)
         from_connection,
         /// Verify against explicit hostname
         explicit: []const u8,
@@ -38,6 +40,15 @@ pub const TlsOptions = struct {
 
     ca: CaVerification = .system,
     host: HostVerification = .from_connection,
+
+    /// Create TlsOptions from config.zig defaults
+    /// Uses DEFAULT_TLS_VERIFY_CA and DEFAULT_TLS_VERIFY_HOST
+    pub fn fromDefaults() TlsOptions {
+        return .{
+            .ca = if (config_mod.DEFAULT_TLS_VERIFY_CA) .system else .none,
+            .host = if (config_mod.DEFAULT_TLS_VERIFY_HOST) .from_connection else .none,
+        };
+    }
 
     /// Production preset: full verification with system trust store
     pub fn production() TlsOptions {

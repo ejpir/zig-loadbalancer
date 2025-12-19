@@ -15,6 +15,7 @@ const log = std.log.scoped(.mp);
 const zzz = @import("zzz");
 const http = zzz.HTTP;
 
+const config = @import("../core/config.zig");
 const ultra_sock_mod = @import("../http/ultra_sock.zig");
 const UltraSock = ultra_sock_mod.UltraSock;
 const metrics = @import("../metrics/mod.zig");
@@ -24,8 +25,7 @@ const WorkerState = @import("../lb/worker.zig").WorkerState;
 pub const ProxyState = @import("handler.zig").ProxyState;
 pub const ProxyError = @import("handler.zig").ProxyError;
 
-/// Maximum backends supported (must match shared_region.MAX_BACKENDS).
-const MAX_BACKENDS: u32 = 64;
+const MAX_BACKENDS = config.MAX_BACKENDS;
 
 // ============================================================================
 // Generic Connection Acquisition

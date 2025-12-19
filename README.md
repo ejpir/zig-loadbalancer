@@ -100,6 +100,96 @@ Mix HTTP and HTTPS backends freely.
 --help               Show help message
 ```
 
+## Configuration Reference
+
+All configuration options with defaults from `src/core/config.zig`:
+
+### Server Settings
+
+| Option | CLI Flag | Default | Description |
+|--------|----------|---------|-------------|
+| `host` | `-h, --host` | `0.0.0.0` | Listen address. Use `127.0.0.1` for localhost only |
+| `port` | `-p, --port` | `8080` | Listen port |
+| `worker_count` | `-w, --workers` | `0` (auto) | Worker processes. 0 = auto-detect CPU cores |
+
+### Backend Settings
+
+| Option | CLI Flag | Default | Description |
+|--------|----------|---------|-------------|
+| `backends` | `-b, --backend` | (required) | Backend servers as `host:port` |
+| `strategy` | `-s, --strategy` | `round_robin` | Load balancing algorithm |
+
+**Strategies:**
+- `round_robin` — Cycle through backends sequentially (fairest)
+- `weighted_round_robin` — Distribute based on backend weights
+- `random` — Random selection (good for stateless services)
+
+### Health Check Settings
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `unhealthy_threshold` | `3` | Consecutive failures before marking unhealthy |
+| `healthy_threshold` | `2` | Consecutive successes before marking healthy |
+| `probe_interval_ms` | `5000` | Milliseconds between active health probes |
+| `probe_timeout_ms` | `2000` | Timeout for health probe requests |
+| `health_path` | `/` | HTTP path for health checks (expects 2xx) |
+
+### TLS Settings
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `DEFAULT_TLS_VERIFY_CA` | `true` | Verify CA certificates using system trust store |
+| `DEFAULT_TLS_VERIFY_HOST` | `true` | Verify hostname matches certificate |
+
+TLS is automatically enabled for port 443. To disable verification (local dev only):
+
+```zig
+// In code - not recommended for production
+const opts = TlsOptions.insecure();
+```
+
+### Compile-Time Constants
+
+These cannot be changed at runtime (defined in `src/core/config.zig`):
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `MAX_BACKENDS` | `64` | Maximum backends (limited by u64 health bitmap) |
+| `MAX_HOST_LEN` | `253` | Maximum hostname length (RFC 1035) |
+| `MAX_HEADER_BYTES` | `8192` | Maximum HTTP header size |
+| `MAX_BODY_CHUNK_BYTES` | `8192` | Maximum body chunk size for streaming |
+| `MAX_HEADER_LINES` | `256` | Maximum header lines per request/response |
+| `MAX_IDLE_CONNS` | `128` | Idle connections per backend in pool |
+| `MAX_HEADER_READ_ITERATIONS` | `1024` | Max iterations reading headers (prevents infinite loops) |
+| `MAX_BODY_READ_ITERATIONS` | `1000000` | Max iterations reading body |
+| `MAX_CONFIG_SIZE` | `64KB` | Maximum config file size |
+| `PAGE_SIZE` | system | Memory page size for alignment |
+| `VECTOR_SIZE` | `32` | SIMD vector size for parsing |
+| `SIMD_THRESHOLD` | `64` | Minimum buffer size before using SIMD |
+| `NS_PER_MS` | `1000000` | Nanoseconds per millisecond |
+
+### JSON Config File
+
+Use `-c, --config` for hot-reloadable backends:
+
+```json
+{
+  "backends": [
+    {"host": "127.0.0.1", "port": 9001},
+    {"host": "127.0.0.1", "port": 9002, "weight": 2},
+    {"host": "api.example.com", "port": 443, "tls": true}
+  ]
+}
+```
+
+**Backend fields:**
+- `host` (required) — Hostname or IP address
+- `port` (required) — Port number
+- `weight` (default: 1) — Weight for weighted_round_robin strategy
+- `tls` (default: false) — Enable TLS for this backend
+
+The file is watched for changes and reloaded automatically (zero downtime).
+
 ## Modes
 
 The unified `load_balancer` binary supports two execution modes:
@@ -129,22 +219,10 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for threading details.
 Change backends without restarting or dropping requests:
 
 ```bash
-# Start with a config file
+# Start with a config file (see JSON Config File section above)
 ./zig-out/bin/load_balancer -m sp -c backends.json -p 8080
 
 # Edit backends.json while running - changes apply instantly
-```
-
-**Config file format (`backends.json`):**
-
-```json
-{
-  "backends": [
-    {"host": "127.0.0.1", "port": 8001},
-    {"host": "127.0.0.1", "port": 8002, "weight": 2},
-    {"host": "secure.example.com", "port": 443, "tls": true}
-  ]
-}
 ```
 
 **How it works:**
@@ -229,7 +307,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for:
 ```bash
 zig build                        # Debug
 zig build -Doptimize=ReleaseFast # Release
-zig build test                   # 201 tests
+zig build test                   # 180 tests
 ```
 
 Requires Zig 0.16.0+

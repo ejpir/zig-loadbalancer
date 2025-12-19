@@ -12,7 +12,7 @@ pub const circuit_breaker = @import("health/circuit_breaker.zig");
 pub const backend_selector = @import("lb/selector.zig");
 pub const worker_state = @import("lb/worker.zig");
 
-// Multiprocess tests (remaining in multiprocess/)
+// Multiprocess tests
 pub const connection_reuse = @import("multiprocess/connection_reuse.zig");
 pub const proxy_test = @import("multiprocess/proxy_test.zig");
 pub const component_integration_test = @import("multiprocess/component_integration_test.zig");
@@ -48,8 +48,6 @@ comptime {
     _ = simd_parse;
     _ = config;
     _ = config_watcher;
-
-    // Component integration tests
     _ = component_integration_test;
 }
 

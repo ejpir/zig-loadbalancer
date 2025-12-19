@@ -14,6 +14,7 @@ const log = std.log.scoped(.mp);
 const zzz = @import("zzz");
 const http = zzz.HTTP;
 
+const config = @import("../core/config.zig");
 const http_utils = @import("../http/http_utils.zig");
 const simd_parse = @import("../internal/simd_parse.zig");
 const metrics = @import("../metrics/mod.zig");
@@ -22,16 +23,11 @@ const metrics = @import("../metrics/mod.zig");
 pub const ProxyState = @import("handler.zig").ProxyState;
 pub const ProxyError = @import("handler.zig").ProxyError;
 
-/// Maximum header buffer size in bytes.
-const MAX_HEADER_BYTES: u32 = 8192;
-/// Maximum body chunk buffer size in bytes.
-const MAX_BODY_CHUNK_BYTES: u32 = 8192;
-/// Maximum header parsing iterations (prevents infinite loops).
-const MAX_HEADER_READ_ITERATIONS: u32 = 1024;
-/// Maximum body streaming iterations (prevents infinite loops).
-const MAX_BODY_READ_ITERATIONS: u32 = 1_000_000;
-/// Maximum header lines to parse.
-const MAX_HEADER_LINES: u32 = 256;
+const MAX_HEADER_BYTES = config.MAX_HEADER_BYTES;
+const MAX_BODY_CHUNK_BYTES = config.MAX_BODY_CHUNK_BYTES;
+const MAX_HEADER_READ_ITERATIONS = config.MAX_HEADER_READ_ITERATIONS;
+const MAX_BODY_READ_ITERATIONS = config.MAX_BODY_READ_ITERATIONS;
+const MAX_HEADER_LINES = config.MAX_HEADER_LINES;
 
 // ============================================================================
 // Phase 3: Read Headers

@@ -10,16 +10,13 @@
 /// - Cache-friendly linear access
 const std = @import("std");
 const log = std.log.scoped(.simple_pool);
+const config = @import("../core/config.zig");
 const ultra_sock = @import("../http/ultra_sock.zig");
 const UltraSock = ultra_sock.UltraSock;
 const TlsOptions = ultra_sock.TlsOptions;
 
-/// Maximum idle connections per backend
-pub const MAX_IDLE_CONNS: usize = 128;
-
-/// Maximum number of backends.
-/// Must match shared_region.MAX_BACKENDS (limited by u64 bitmap).
-pub const MAX_BACKENDS: usize = 64;
+pub const MAX_IDLE_CONNS = config.MAX_IDLE_CONNS;
+pub const MAX_BACKENDS = config.MAX_BACKENDS;
 
 /// Simple stack for connection pooling (no atomics)
 pub const SimpleConnectionStack = struct {

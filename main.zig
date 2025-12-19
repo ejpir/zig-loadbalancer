@@ -514,8 +514,10 @@ fn workerMain(
 
     // Use shared health state from mmap'd region
     var worker_state = mp.WorkerState.init(&backends, &connection_pool, &region.health, .{
-        .unhealthy_threshold = config.unhealthy_threshold,
-        .healthy_threshold = config.healthy_threshold,
+        .circuit_breaker_config = .{
+            .unhealthy_threshold = config.unhealthy_threshold,
+            .healthy_threshold = config.healthy_threshold,
+        },
         .probe_interval_ms = config.probe_interval_ms,
         .probe_timeout_ms = config.probe_timeout_ms,
         .health_path = config.health_path,
@@ -674,8 +676,10 @@ fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
     connection_pool.addBackends(backends.items.len);
 
     var worker_state = mp.WorkerState.init(&backends, &connection_pool, &region.health, .{
-        .unhealthy_threshold = lb_config.unhealthy_threshold,
-        .healthy_threshold = lb_config.healthy_threshold,
+        .circuit_breaker_config = .{
+            .unhealthy_threshold = lb_config.unhealthy_threshold,
+            .healthy_threshold = lb_config.healthy_threshold,
+        },
         .probe_interval_ms = lb_config.probe_interval_ms,
         .probe_timeout_ms = lb_config.probe_timeout_ms,
         .health_path = lb_config.health_path,

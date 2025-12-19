@@ -11,6 +11,84 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+// ============================================================================
+// Global Constants (Single Source of Truth)
+// ============================================================================
+
+/// Maximum backends supported (limited by u64 bitmap for health state)
+pub const MAX_BACKENDS: u32 = 64;
+
+/// Maximum hostname length per RFC 1035
+pub const MAX_HOST_LEN: usize = 253;
+
+/// Maximum HTTP header size in bytes
+pub const MAX_HEADER_BYTES: u32 = 8192;
+
+/// Maximum body chunk size for streaming
+pub const MAX_BODY_CHUNK_BYTES: u32 = 8192;
+
+/// Maximum header lines in a request/response
+pub const MAX_HEADER_LINES: u32 = 256;
+
+/// Maximum idle connections per backend in pool
+pub const MAX_IDLE_CONNS: usize = 128;
+
+/// Maximum iterations when reading headers (prevents infinite loops)
+pub const MAX_HEADER_READ_ITERATIONS: u32 = 1024;
+
+/// Maximum iterations when reading body (prevents infinite loops)
+pub const MAX_BODY_READ_ITERATIONS: u32 = 1_000_000;
+
+/// Maximum config file size in bytes
+pub const MAX_CONFIG_SIZE: usize = 64 * 1024;
+
+/// Page size for memory alignment
+pub const PAGE_SIZE = std.heap.page_size_min;
+
+/// SIMD vector size for parsing
+pub const VECTOR_SIZE: u32 = 32;
+
+/// Minimum buffer size before using SIMD
+pub const SIMD_THRESHOLD: u32 = 64;
+
+/// Nanoseconds per millisecond
+pub const NS_PER_MS: u64 = 1_000_000;
+
+// ============================================================================
+// Health Check Defaults
+// ============================================================================
+
+/// Default consecutive failures before marking unhealthy
+pub const DEFAULT_UNHEALTHY_THRESHOLD: u32 = 3;
+
+/// Default consecutive successes before marking healthy
+pub const DEFAULT_HEALTHY_THRESHOLD: u32 = 2;
+
+/// Default health probe interval in milliseconds
+pub const DEFAULT_PROBE_INTERVAL_MS: u64 = 5000;
+
+/// Default health probe timeout in milliseconds
+pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 2000;
+
+/// Default health check path
+pub const DEFAULT_HEALTH_PATH: []const u8 = "/";
+
+// ============================================================================
+// TLS Defaults
+// ============================================================================
+
+/// Default: verify CA certificates using system trust store
+/// Set to false only for local development with self-signed certs
+pub const DEFAULT_TLS_VERIFY_CA: bool = true;
+
+/// Default: verify hostname matches certificate
+/// Set to false only for local development
+pub const DEFAULT_TLS_VERIFY_HOST: bool = true;
+
+// ============================================================================
+// Configuration Types
+// ============================================================================
+
 /// Backend server definition for configuration
 /// This is the config-time representation of a backend.
 pub const BackendDef = struct {
@@ -89,30 +167,25 @@ pub const LoadBalancerConfig = struct {
     /// Number of consecutive failures before marking backend unhealthy
     /// Higher values = more tolerant of transient failures
     /// Lower values = faster failure detection
-    /// Default: 3 (balanced between false positives and quick detection)
-    unhealthy_threshold: u32 = 3,
+    unhealthy_threshold: u32 = DEFAULT_UNHEALTHY_THRESHOLD,
 
     /// Number of consecutive successes before marking backend healthy again
     /// Higher values = more cautious recovery
     /// Lower values = faster recovery
-    /// Default: 2 (quick recovery once backend responds)
-    healthy_threshold: u32 = 2,
+    healthy_threshold: u32 = DEFAULT_HEALTHY_THRESHOLD,
 
     /// Interval between active health probes in milliseconds
     /// Lower values = faster detection but more overhead
     /// Higher values = less overhead but slower detection
-    /// Default: 5000ms (5 seconds - standard health check interval)
-    probe_interval_ms: u64 = 5000,
+    probe_interval_ms: u64 = DEFAULT_PROBE_INTERVAL_MS,
 
     /// Timeout for health probe requests in milliseconds
     /// Should be much less than probe_interval_ms
-    /// Default: 2000ms (2 seconds - allows time for slow backends)
-    probe_timeout_ms: u64 = 2000,
+    probe_timeout_ms: u64 = DEFAULT_PROBE_TIMEOUT_MS,
 
     /// HTTP path to use for health checks
     /// Backends should return 2xx status for this endpoint when healthy
-    /// Default: "/" (root path - most services support this)
-    health_path: []const u8 = "/",
+    health_path: []const u8 = DEFAULT_HEALTH_PATH,
 
     // ========================================================================
     // Validation

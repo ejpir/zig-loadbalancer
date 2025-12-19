@@ -103,7 +103,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    // Integration tests
+    // E2E Integration tests
     const integration_tests_mod = b.createModule(.{
         .root_source_file = b.path("tests/integration_test.zig"),
         .target = target,

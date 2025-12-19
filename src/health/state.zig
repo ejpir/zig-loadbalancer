@@ -9,9 +9,10 @@
 /// - Optimized bit manipulation using CPU intrinsics (ctz, popcount)
 /// - Cache-line aligned to prevent false sharing
 const std = @import("std");
+const config = @import("../core/config.zig");
 
-/// Maximum backends supported (fits in 64-bit bitmap)
-pub const MAX_BACKENDS = 64;
+/// Re-export from config (single source of truth)
+pub const MAX_BACKENDS = config.MAX_BACKENDS;
 
 /// Shared health state for all backends
 /// Aligned to separate cache line to prevent false sharing

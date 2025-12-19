@@ -6,6 +6,7 @@
 const std = @import("std");
 const posix = std.posix;
 
+const config_mod = @import("../core/config.zig");
 const types = @import("../core/types.zig");
 const metrics = @import("../metrics/mod.zig");
 const simple_pool = @import("../memory/pool.zig");
@@ -25,18 +26,19 @@ pub const CircuitBreaker = circuit_breaker.CircuitBreaker;
 pub const BackendSelector = backend_selector.BackendSelector;
 pub const MAX_BACKENDS = shared_region.MAX_BACKENDS;
 
-/// Configuration for worker state
+/// Configuration for worker state (uses defaults from config.zig)
 pub const Config = struct {
-    /// Consecutive failures before marking unhealthy
-    unhealthy_threshold: u32 = 3,
-    /// Consecutive successes before marking healthy
-    healthy_threshold: u32 = 2,
-    /// Health probe interval in milliseconds
-    probe_interval_ms: u64 = 5000,
-    /// Health probe timeout in milliseconds
-    probe_timeout_ms: u64 = 2000,
-    /// Health check path
-    health_path: []const u8 = "/",
+    circuit_breaker_config: circuit_breaker.Config = .{},
+    probe_interval_ms: u64 = config_mod.DEFAULT_PROBE_INTERVAL_MS,
+    probe_timeout_ms: u64 = config_mod.DEFAULT_PROBE_TIMEOUT_MS,
+    health_path: []const u8 = config_mod.DEFAULT_HEALTH_PATH,
+
+    pub fn unhealthy_threshold(self: Config) u32 {
+        return self.circuit_breaker_config.unhealthy_threshold;
+    }
+    pub fn healthy_threshold(self: Config) u32 {
+        return self.circuit_breaker_config.healthy_threshold;
+    }
 };
 
 /// Complete worker state for request handling
@@ -81,10 +83,7 @@ pub const WorkerState = struct {
             .connection_pool = pool,
             .circuit_breaker = .{
                 .health = health,
-                .config = .{
-                    .unhealthy_threshold = config.unhealthy_threshold,
-                    .healthy_threshold = config.healthy_threshold,
-                },
+                .config = config.circuit_breaker_config,
             },
             .config = config,
             .random_state = if (seed == 0) 1 else seed,
@@ -399,7 +398,7 @@ test "WorkerState: recordFailure trips circuit breaker" {
 
     var health = SharedHealthState{};
     health.markAllUnhealthy();
-    var state = WorkerState.init(&backends, &pool, &health, .{ .unhealthy_threshold = 2 });
+    var state = WorkerState.init(&backends, &pool, &health, .{ .circuit_breaker_config = .{ .unhealthy_threshold = 2 } });
 
     try std.testing.expect(state.isHealthy(0));
 
@@ -423,7 +422,7 @@ test "WorkerState: recordSuccess recovers backend" {
 
     var health = SharedHealthState{};
     health.markAllUnhealthy();
-    var state = WorkerState.init(&backends, &pool, &health, .{ .healthy_threshold = 2 });
+    var state = WorkerState.init(&backends, &pool, &health, .{ .circuit_breaker_config = .{ .healthy_threshold = 2 } });
     state.forceUnhealthy(0);
 
     try std.testing.expect(!state.isHealthy(0));
