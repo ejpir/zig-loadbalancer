@@ -7,6 +7,7 @@ const std = @import("std");
 // Health module tests
 pub const health_state = @import("health/state.zig");
 pub const circuit_breaker = @import("health/circuit_breaker.zig");
+pub const health_probe = @import("health/probe.zig");
 
 // Load balancer module tests
 pub const backend_selector = @import("lb/selector.zig");
@@ -23,6 +24,7 @@ pub const shared_region = @import("memory/shared_region.zig");
 
 // HTTP module tests
 pub const http_utils = @import("http/http_utils.zig");
+pub const ultra_sock = @import("http/ultra_sock.zig");
 
 // Internal module tests
 pub const simd_parse = @import("internal/simd_parse.zig");
@@ -33,11 +35,18 @@ pub const config = @import("core/config.zig");
 // Config module tests
 pub const config_watcher = @import("config/config_watcher.zig");
 
+// Proxy module tests
+pub const proxy_io = @import("proxy/io.zig");
+
+// CLI module tests
+pub const args_test = @import("cli/args_test.zig");
+
 // Run all tests
 comptime {
     // Unit tests - reorganized modules
     _ = health_state;
     _ = circuit_breaker;
+    _ = health_probe;
     _ = backend_selector;
     _ = worker_state;
     _ = connection_reuse;
@@ -45,10 +54,13 @@ comptime {
     _ = connection_pool;
     _ = shared_region;
     _ = http_utils;
+    _ = ultra_sock;
     _ = simd_parse;
     _ = config;
     _ = config_watcher;
     _ = component_integration_test;
+    _ = proxy_io;
+    _ = args_test;
 }
 
 test "test_load_balancer: all modules imported" {

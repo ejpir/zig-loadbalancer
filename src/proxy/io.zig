@@ -505,3 +505,162 @@ fn streamBody_read(
         return try reader.interface.readVec(&bufs);
     }
 }
+
+// ============================================================================
+// Unit Tests
+// ============================================================================
+
+test "forwardHeaders_setMime: text/css maps to CSS" {
+    const testing = std.testing;
+
+    // Setup mock response
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.BIN; // Start with BIN to verify it changes
+
+    const content_type_value: ?[]const u8 = "text/css";
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.CSS, response.mime);
+}
+
+test "forwardHeaders_setMime: application/javascript maps to JS" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.BIN;
+
+    const content_type_value: ?[]const u8 = "application/javascript";
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.JS, response.mime);
+}
+
+test "forwardHeaders_setMime: text/html with charset maps to HTML" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.BIN;
+
+    // Verify charset suffix is stripped and base type is used
+    const content_type_value: ?[]const u8 = "text/html; charset=utf-8";
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.HTML, response.mime);
+}
+
+test "forwardHeaders_setMime: image/png maps to PNG" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.BIN;
+
+    const content_type_value: ?[]const u8 = "image/png";
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.PNG, response.mime);
+}
+
+test "forwardHeaders_setMime: font/woff2 maps to WOFF2" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.BIN;
+
+    const content_type_value: ?[]const u8 = "font/woff2";
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.WOFF2, response.mime);
+}
+
+test "forwardHeaders_setMime: unknown type maps to BIN" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.HTML; // Start with non-BIN to verify change
+
+    const content_type_value: ?[]const u8 = "application/x-custom";
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.BIN, response.mime);
+}
+
+test "forwardHeaders_setMime: null content type maps to BIN" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.HTML; // Start with non-BIN to verify change
+
+    const content_type_value: ?[]const u8 = null;
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.BIN, response.mime);
+}
+
+test "forwardHeaders_setMime: text/javascript maps to JS" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.BIN;
+
+    // text/javascript is an alternative content type for JS
+    const content_type_value: ?[]const u8 = "text/javascript";
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.JS, response.mime);
+}
+
+test "forwardHeaders_setMime: content type with multiple parameters" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.BIN;
+
+    // Verify multiple parameters are stripped correctly
+    const content_type_value: ?[]const u8 = "text/html; charset=utf-8; boundary=something";
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.HTML, response.mime);
+}
+
+test "forwardHeaders_setMime: content type with spaces around semicolon" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var response = http.Response.init(arena.allocator());
+    response.mime = http.Mime.BIN;
+
+    // Verify trimming works correctly with spaces
+    const content_type_value: ?[]const u8 = "application/json ; charset=utf-8";
+    forwardHeaders_setMime(&response, content_type_value);
+
+    try testing.expectEqual(http.Mime.JSON, response.mime);
+}
