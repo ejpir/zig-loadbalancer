@@ -50,6 +50,12 @@ pub const TlsOptions = struct {
         };
     }
 
+    /// Get TLS options based on runtime config
+    /// Returns insecure() if --insecure flag was used, otherwise production()
+    pub fn fromRuntime() TlsOptions {
+        return if (config_mod.isInsecureTls()) insecure() else production();
+    }
+
     /// Production preset: full verification with system trust store
     pub fn production() TlsOptions {
         return .{
@@ -98,7 +104,7 @@ pub const UltraSock = struct {
 
     /// Initialize a new UltraSock with default TLS options (production)
     pub fn init(protocol: Protocol, host: []const u8, port: u16) UltraSock {
-        return initWithTls(protocol, host, port, TlsOptions.production());
+        return initWithTls(protocol, host, port, TlsOptions.fromRuntime());
     }
 
     /// Initialize with explicit TLS options (zero allocation)
@@ -601,7 +607,7 @@ pub const UltraSock = struct {
 
     /// Create from backend config (zero allocation)
     pub fn fromBackendConfig(backend: anytype) UltraSock {
-        return fromBackendConfigWithTls(backend, TlsOptions.production());
+        return fromBackendConfigWithTls(backend, TlsOptions.fromRuntime());
     }
 
     /// Create from backend config with explicit TLS options (zero allocation)
@@ -621,7 +627,7 @@ pub const UltraSock = struct {
 
     /// Create from BackendServer struct (zero allocation)
     pub fn fromBackendServer(backend: anytype) UltraSock {
-        return fromBackendServerWithTls(backend, TlsOptions.production());
+        return fromBackendServerWithTls(backend, TlsOptions.fromRuntime());
     }
 
     /// Create from BackendServer struct with explicit TLS options (zero allocation)

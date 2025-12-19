@@ -97,6 +97,7 @@ Mix HTTP and HTTPS backends freely.
 -s, --strategy S     Load balancing: round_robin, weighted, random
 -c, --config FILE    JSON config file for hot reload (watches for changes)
 -l, --loglevel LVL   Log level: err, warn, info, debug (default: info)
+-k, --insecure       Skip TLS certificate verification (testing only!)
 --help               Show help message
 ```
 
@@ -136,16 +137,19 @@ All configuration options with defaults from `src/core/config.zig`:
 
 ### TLS Settings
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `DEFAULT_TLS_VERIFY_CA` | `true` | Verify CA certificates using system trust store |
-| `DEFAULT_TLS_VERIFY_HOST` | `true` | Verify hostname matches certificate |
+| Option | CLI Flag | Default | Description |
+|--------|----------|---------|-------------|
+| `insecure_tls` | `-k, --insecure` | `false` | Skip TLS verification (testing only) |
+| `DEFAULT_TLS_VERIFY_CA` | — | `true` | Verify CA certificates using system trust store |
+| `DEFAULT_TLS_VERIFY_HOST` | — | `true` | Verify hostname matches certificate |
 
-TLS is automatically enabled for port 443. To disable verification (local dev only):
+TLS is automatically enabled for port 443. To disable verification for testing:
 
-```zig
-// In code - not recommended for production
-const opts = TlsOptions.insecure();
+```bash
+# Skip TLS verification (self-signed certs, local dev)
+./zig-out/bin/load_balancer -k -b localhost:8443
+
+# WARNING: Do not use --insecure in production!
 ```
 
 ### Compile-Time Constants

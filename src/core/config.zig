@@ -86,6 +86,24 @@ pub const DEFAULT_TLS_VERIFY_CA: bool = true;
 pub const DEFAULT_TLS_VERIFY_HOST: bool = true;
 
 // ============================================================================
+// Runtime TLS Configuration
+// ============================================================================
+
+/// Global runtime TLS settings (can be changed at startup via CLI)
+/// Thread-safe: set once at startup before spawning workers
+pub var runtime_insecure_tls: bool = false;
+
+/// Set insecure TLS mode (call once at startup)
+pub fn setInsecureTls(insecure: bool) void {
+    runtime_insecure_tls = insecure;
+}
+
+/// Check if TLS verification should be skipped
+pub fn isInsecureTls() bool {
+    return runtime_insecure_tls;
+}
+
+// ============================================================================
 // Configuration Types
 // ============================================================================
 
