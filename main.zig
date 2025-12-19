@@ -263,7 +263,7 @@ pub fn main() !void {
     // Validate configuration
     try config.lbConfig.validate();
 
-    log.info("=== Load Balancer ({s} mode) ===", .{config.mode.toString()});
+    std.debug.print("=== Load Balancer ({s} mode) ===\n", .{config.mode.toString()});
     log.info("Listen: {s}:{d}, Backends: {d}, Strategy: {s}", .{
         config.lbConfig.host,
         config.lbConfig.port,
@@ -274,7 +274,7 @@ pub fn main() !void {
     // Dispatch to appropriate mode
     switch (config.mode) {
         .multiprocess => try runMultiProcess(allocator, config),
-        .singleprocess => try runSingleProcess(allocator, config.lbConfig),
+        .singleprocess => try runSingleProcess(allocator, config),
     }
 }
 
@@ -546,14 +546,31 @@ fn spShutdown(_: std.c.SIG) callconv(.c) void {
     sp_server.stop();
 }
 
-fn runSingleProcess(_: std.mem.Allocator, config: LoadBalancerConfig) !void {
+fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
     // Thread-safe allocator since health probes run in separate thread
     var gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    for (config.backends, 0..) |b, idx| {
+    const lb_config = config.lbConfig;
+
+    for (lb_config.backends, 0..) |b, idx| {
         log.info("  Backend {d}: {s}:{d}", .{ idx + 1, b.host, b.port });
+    }
+
+    // Shared region (same as mp mode - enables hot reload and shared RR counter)
+    var shared_allocator = shared_region.SharedRegionAllocator{};
+    const region = try shared_allocator.init();
+    defer shared_allocator.deinit();
+
+    // Initialize backends in shared region
+    initSharedBackends(region, lb_config.backends);
+
+    // Start config file watcher for hot reload (if config file provided)
+    if (config.config_path) |path| {
+        const watcher_thread = try config_watcher.startConfigWatcher(region, path, parent_allocator, reloadSharedBackends);
+        _ = watcher_thread; // Thread runs until process exits
+        log.info("Config watcher started: {s}", .{path});
     }
 
     // Connection pool
@@ -564,22 +581,20 @@ fn runSingleProcess(_: std.mem.Allocator, config: LoadBalancerConfig) !void {
     var backends: types.BackendsList = .empty;
     defer backends.deinit(allocator);
 
-    for (config.backends) |b| {
+    for (lb_config.backends) |b| {
         try backends.append(allocator, types.BackendServer.init(b.host, b.port, b.weight));
     }
     connection_pool.addBackends(backends.items.len);
 
-    var health_state = SharedHealthState{};
-    health_state.markAllUnhealthy();
-
-    var worker_state = mp.WorkerState.init(&backends, &connection_pool, &health_state, .{
-        .unhealthy_threshold = config.unhealthy_threshold,
-        .healthy_threshold = config.healthy_threshold,
-        .probe_interval_ms = config.probe_interval_ms,
-        .probe_timeout_ms = config.probe_timeout_ms,
-        .health_path = config.health_path,
+    var worker_state = mp.WorkerState.init(&backends, &connection_pool, &region.health, .{
+        .unhealthy_threshold = lb_config.unhealthy_threshold,
+        .healthy_threshold = lb_config.healthy_threshold,
+        .probe_interval_ms = lb_config.probe_interval_ms,
+        .probe_timeout_ms = lb_config.probe_timeout_ms,
+        .health_path = lb_config.health_path,
     });
     worker_state.setWorkerId(0);
+    worker_state.setSharedRegion(region);
 
     // Start health probe thread
     const health_thread = health.startHealthProbes(&worker_state, 0) catch |err| {
@@ -597,20 +612,20 @@ fn runSingleProcess(_: std.mem.Allocator, config: LoadBalancerConfig) !void {
     const io = threaded.io();
 
     // Router
-    var router = switch (config.strategy) {
+    var router = switch (lb_config.strategy) {
         inline else => |s| try createRouter(allocator, &worker_state, s),
     };
     defer router.deinit(allocator);
 
     // No SO_REUSEPORT needed for single process
-    const addr = try Io.net.IpAddress.parse(config.host, config.port);
+    const addr = try Io.net.IpAddress.parse(lb_config.host, lb_config.port);
     var socket = try addr.listen(io, .{
         .kernel_backlog = 4096,
         .reuse_address = true,
     });
     defer socket.deinit(io);
 
-    log.info("Listening on {s}:{d}", .{ config.host, config.port });
+    log.info("Listening on {s}:{d}", .{ lb_config.host, lb_config.port });
 
     // Server
     sp_server = try Server.init(allocator, .{
