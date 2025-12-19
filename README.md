@@ -158,8 +158,11 @@ TLS is automatically enabled for port 443. To disable verification for testing:
 | Option | CLI Flag | Default | Description |
 |--------|----------|---------|-------------|
 | `trace` | `-t, --trace` | `false` | Dump raw payloads as hex + ASCII |
+| `tls_trace` | `--tls-trace` | `false` | Show detailed TLS handshake info |
 
-Enable payload tracing to see exactly what's being sent/received:
+#### Payload Tracing (`--trace`)
+
+See exactly what's being sent/received:
 
 ```bash
 ./zig-out/bin/load_balancer -t -b httpbin.org:443 -p 8080
@@ -171,16 +174,33 @@ info(trace): === REQUEST TO BACKEND (104 bytes) ===
 info(trace): 00000000  47 45 54 20 2f 69 70 20  48 54 54 50 2f 31 2e 31  |GET /ip HTTP/1.1|
 info(trace): 00000010  0d 0a 48 6f 73 74 3a 20  68 74 74 70 62 69 6e 2e  |..Host: httpbin.|
 ...
-info(trace): === RESPONSE BODY (with headers) (33 bytes) ===
-info(trace): 00000000  7b 0a 20 20 22 6f 72 69  67 69 6e 22 3a 20 22 ...  |{.  "origin": "...|
 ```
 
-Traces include:
-- `REQUEST TO BACKEND` — outgoing HTTP headers
-- `REQUEST BODY` — outgoing body data (if present)
-- `RESPONSE HEADERS FROM BACKEND` — incoming HTTP headers
-- `RESPONSE BODY (with headers)` — body received with headers
-- `RESPONSE BODY CHUNK` — body received in subsequent reads
+#### TLS Tracing (`--tls-trace`)
+
+See detailed TLS handshake information:
+
+```bash
+./zig-out/bin/load_balancer --tls-trace -b httpbin.org:443 -p 8080
+```
+
+Output:
+```
+info(tls_trace): === TLS Handshake Complete ===
+info(tls_trace):   Host: httpbin.org:443
+info(tls_trace):   Version: TLS 1.3
+info(tls_trace):   Cipher Suite: AES_256_GCM_SHA384
+info(tls_trace):   CA Verification: system trust store
+info(tls_trace):   Host Verification: enabled
+info(tls_trace):   CA Certificates: 165 loaded
+```
+
+TLS trace shows:
+- TLS protocol version (1.2 or 1.3)
+- Negotiated cipher suite
+- CA verification mode (none/system/custom)
+- Hostname verification mode
+- Number of CA certificates loaded
 
 **Performance:** Zero overhead when disabled (inline boolean check, branch prediction).
 
