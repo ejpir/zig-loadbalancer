@@ -93,6 +93,7 @@ const Config = struct {
     mode: RunMode,
     lbConfig: LoadBalancerConfig,
     config_path: ?[]const u8 = null, // Path to JSON config file for hot reload
+    upgrade_fd: ?posix.fd_t = null, // Inherited socket fd for binary hot reload
 };
 
 // ============================================================================
@@ -116,7 +117,12 @@ fn printUsage() void {
         \\    -s, --strategy <S>      Load balancing strategy: round_robin, weighted, random
         \\    -c, --config <PATH>     JSON config file for hot reload
         \\    -l, --loglevel <LEVEL>  Log level: err, warn, info, debug (default: info)
+        \\    --upgrade-fd <FD>       Inherit socket fd for binary hot reload (internal)
         \\    --help                  Show this help
+        \\
+        \\HOT RELOAD:
+        \\    Send SIGUSR2 to trigger binary upgrade without dropping connections.
+        \\    kill -USR2 <pid>
         \\
         \\EXAMPLES:
         \\    load_balancer --mode mp --port 8080 --backend 127.0.0.1:9001
@@ -136,6 +142,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     var host: ?[]const u8 = null;
     var strategy: types.LoadBalancerStrategy = .round_robin;
     var config_path: ?[]const u8 = null;
+    var upgrade_fd: ?posix.fd_t = null;
 
     var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
     errdefer backend_list.deinit(allocator);
@@ -227,6 +234,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 }
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "--upgrade-fd")) {
+            if (i + 1 < args.len) {
+                upgrade_fd = try std.fmt.parseInt(posix.fd_t, args[i + 1], 10);
+                i += 1;
+            }
         }
     }
 
@@ -268,6 +280,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     return .{
         .mode = final_mode,
         .config_path = config_path,
+        .upgrade_fd = upgrade_fd,
         .lbConfig = .{
             .worker_count = worker_count,
             .port = port,
@@ -287,6 +300,10 @@ fn freeConfig(allocator: std.mem.Allocator, config: Config) void {
 // ============================================================================
 
 pub fn main() !void {
+    // Store argv for binary hot reload
+    upgrade_argv = std.os.argv[0..];
+    upgrade_exe_path = std.os.argv[0];
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
@@ -576,8 +593,44 @@ fn workerMain(
 
 var sp_server: Server = undefined;
 
+/// Stored argv for binary upgrade re-exec
+var upgrade_argv: ?[][*:0]u8 = null;
+var upgrade_exe_path: ?[*:0]u8 = null;
+
 fn spShutdown(_: std.c.SIG) callconv(.c) void {
     sp_server.stop();
+}
+
+fn spUpgrade(_: std.c.SIG) callconv(.c) void {
+    const my_pid = std.c.getpid();
+    std.debug.print("[PID {d}] SIGUSR2 received, forking...\n", .{my_pid});
+
+    // Fork and exec new binary
+    const pid = posix.fork() catch |err| {
+        std.debug.print("[PID {d}] Fork failed: {s}\n", .{ my_pid, @errorName(err) });
+        return;
+    };
+
+    if (pid == 0) {
+        // Child: exec new binary
+        const child_pid = std.c.getpid();
+        std.debug.print("[PID {d}] Child started, execing new binary...\n", .{child_pid});
+        if (upgrade_exe_path) |exe| {
+            if (upgrade_argv) |argv| {
+                const env: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+                const result = posix.execvpeZ(exe, @ptrCast(argv.ptr), env);
+                std.debug.print("[PID {d}] Exec failed: {s}\n", .{ child_pid, @errorName(result) });
+            }
+        }
+        posix.exit(1);
+    } else {
+        // Parent: stop accepting, drain connections
+        std.debug.print("[PID {d}] Spawned child PID {d}. Waiting 1s for new process...\n", .{ my_pid, pid });
+        // Wait for new process to start listening
+        posix.nanosleep(1, 0); // 1 second
+        std.debug.print("[PID {d}] Draining connections and exiting...\n", .{my_pid});
+        sp_server.stop();
+    }
 }
 
 fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
@@ -680,6 +733,11 @@ fn setupSignalHandlers() void {
     }, null);
     posix.sigaction(posix.SIG.INT, &.{
         .handler = .{ .handler = spShutdown },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    }, null);
+    posix.sigaction(posix.SIG.USR2, &.{
+        .handler = .{ .handler = spUpgrade },
         .mask = posix.sigemptyset(),
         .flags = 0,
     }, null);

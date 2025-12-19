@@ -105,20 +105,29 @@ main()
   └─► waitpid() loop                 # Restart crashed workers
 ```
 
-### Single-Process (`main_singleprocess.zig`)
+### Single-Process (`runSingleProcess()`)
 ```
 main()
   ├─► parseArgs()                    # CLI: --port, --backend, --strategy
   ├─► GPA (thread_safe=true)
-  ├─► SimpleConnectionPool (shared)
+  ├─► SharedRegionAllocator.init()   # Shared memory (same as mp mode)
+  ├─► initSharedBackends()           # Load backends into shared region
+  ├─► startConfigWatcher()           # Hot reload thread (if -c provided)
+  ├─► SimpleConnectionPool
   ├─► BackendsList
-  ├─► WorkerState
+  ├─► WorkerState + setSharedRegion()
   ├─► health.startHealthProbes()     # Background thread
+  ├─► setupSignalHandlers()          # SIGTERM, SIGINT, SIGUSR2
   ├─► Io.Threaded.init()
   ├─► Router + proxy handler
   ├─► socket.listen()
   └─► server.serve()
 ```
+
+**Key difference from old sp mode:** Now uses SharedRegion like mp mode, enabling:
+- Config hot reload (`-c backends.json`)
+- Shared round-robin counter
+- Binary hot reload (SIGUSR2)
 
 ## Components
 
@@ -218,7 +227,7 @@ pub const WorkerState = struct {
     connection_pool: *SimpleConnectionPool,
     circuit_breaker: CircuitBreaker,
     config: Config,
-    rr_state: usize,                      // Round-robin counter
+    rr_state: usize,                      // Local round-robin counter (fallback)
     total_requests: usize,
 };
 ```
@@ -227,6 +236,9 @@ Key methods for hot reload:
 - `setSharedRegion(region)` — Enable shared memory backend source
 - `getBackendCount()` — Returns count from SharedRegion if available
 - `getSharedBackend(idx)` — Returns backend from SharedRegion for routing
+- `selectBackend(strategy)` — Uses shared `rr_counter` when SharedRegion available
+
+**Shared round-robin:** When SharedRegion is set, round-robin selection uses the atomic `rr_counter` in ControlBlock instead of local `rr_state`. This ensures even distribution across all workers, not just within each worker.
 
 ### `metrics.zig` — Prometheus Metrics
 
@@ -261,6 +273,7 @@ The load balancer supports zero-downtime configuration changes and binary upgrad
 │  │   active_index: atomic u64  ← Points to BackendArray[0|1]    │   │
 │  │   generation: atomic u64    ← ABA prevention counter         │   │
 │  │   backend_count: atomic u32 ← Number of configured backends  │   │
+│  │   rr_counter: atomic u32    ← Shared round-robin counter     │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐   │
@@ -375,14 +388,31 @@ The config watcher runs in a dedicated thread in the master process, using platf
 
 ### Hot Binary Upgrade Flow
 
+Binary hot reload allows upgrading the load balancer without dropping connections:
+
+```bash
+# Trigger upgrade
+kill -USR2 $(pgrep -f load_balancer)
 ```
-1. New binary starts, creates Unix socket /tmp/lb.upgrade
-2. Old binary receives SIGUSR2
-3. Old binary sends listen_fd + shm_fd via SCM_RIGHTS
-4. New binary receives FDs, re-mmaps shared region
-5. New binary starts accepting on inherited socket
-6. Old binary stops accepting, drains connections, exits
+
+**Flow:**
+
 ```
+1. Old process receives SIGUSR2
+2. Old process forks
+3. Child execs new binary (same argv)
+4. New binary starts, binds with SO_REUSEPORT (shares port)
+5. Old process waits 1 second for new process to be ready
+6. Old process stops accepting, drains existing connections
+7. Old process exits cleanly
+8. New process continues serving
+```
+
+**Key design points:**
+- Uses SO_REUSEPORT for seamless port sharing during transition
+- Fork+exec preserves original arguments
+- 1 second delay ensures new process is listening before old stops
+- Works in both mp and sp modes
 
 ### Components
 
@@ -425,9 +455,9 @@ if (pid == 0) {
 
 ```
 ├── main.zig                     # Unified entry point (--mode mp|sp)
-├── main_multiprocess.zig        # Legacy: nginx-style fork()
-├── main_singleprocess.zig       # Legacy: single process
 ├── backends.json                # Example config for hot reload
+├── backend_9001.py              # Test backend server
+├── backend_9002.py              # Test backend server
 ├── src/
 │   ├── core/
 │   │   ├── types.zig            # BackendServer, LoadBalancerStrategy
@@ -521,3 +551,16 @@ This is Zig's async I/O runtime which may use internal threads for I/O operation
    - Simpler deployment
 
 For production on Linux, prefer multi-process mode for full isolation.
+
+### Runtime log level
+
+The `--loglevel` flag allows changing verbosity without recompiling:
+
+```bash
+./zig-out/bin/load_balancer -l debug  # All logs
+./zig-out/bin/load_balancer -l info   # Default
+./zig-out/bin/load_balancer -l warn   # Warnings and errors only
+./zig-out/bin/load_balancer -l err    # Errors only
+```
+
+Implemented via custom `std_options.logFn` that checks a runtime variable before delegating to `std.log.defaultLog`.
