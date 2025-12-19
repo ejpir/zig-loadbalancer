@@ -32,9 +32,24 @@ const health = @import("src/multiprocess/health.zig");
 
 const SharedHealthState = shared_region.SharedHealthState;
 
+/// Runtime log level (can be changed via --loglevel)
+var runtime_log_level: std.log.Level = .info;
+
 pub const std_options: std.Options = .{
-    .log_level = .debug,
+    .log_level = .debug, // Compile-time max level (allows all)
+    .logFn = runtimeLogFn, // Custom log function respects runtime level
 };
+
+/// Custom log function that respects runtime log level
+fn runtimeLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (@intFromEnum(level) > @intFromEnum(runtime_log_level)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
 
 // ============================================================================
 // Configuration
@@ -99,7 +114,8 @@ fn printUsage() void {
         \\    -w, --workers <N>       Worker count, mp mode only (default: CPU count)
         \\    -b, --backend <H:P>     Backend server (can specify multiple)
         \\    -s, --strategy <S>      Load balancing strategy: round_robin, weighted, random
-        \\    -c, --config <PATH>     JSON config file for hot reload (mp mode only)
+        \\    -c, --config <PATH>     JSON config file for hot reload
+        \\    -l, --loglevel <LEVEL>  Log level: err, warn, info, debug (default: info)
         \\    --help                  Show this help
         \\
         \\EXAMPLES:
@@ -191,6 +207,24 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                    std.mem.eql(u8, arg, "-c")) {
             if (i + 1 < args.len) {
                 config_path = try allocator.dupe(u8, args[i + 1]);
+                i += 1;
+            }
+        } else if (std.mem.eql(u8, arg, "--loglevel") or
+                   std.mem.eql(u8, arg, "-l")) {
+            if (i + 1 < args.len) {
+                const level_str = args[i + 1];
+                if (std.mem.eql(u8, level_str, "err") or std.mem.eql(u8, level_str, "error")) {
+                    runtime_log_level = .err;
+                } else if (std.mem.eql(u8, level_str, "warn") or std.mem.eql(u8, level_str, "warning")) {
+                    runtime_log_level = .warn;
+                } else if (std.mem.eql(u8, level_str, "info")) {
+                    runtime_log_level = .info;
+                } else if (std.mem.eql(u8, level_str, "debug")) {
+                    runtime_log_level = .debug;
+                } else {
+                    std.debug.print("Invalid log level: {s}. Use: err, warn, info, debug\n", .{level_str});
+                    return error.InvalidLogLevel;
+                }
                 i += 1;
             }
         }
