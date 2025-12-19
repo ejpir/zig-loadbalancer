@@ -96,6 +96,7 @@ Mix HTTP and HTTPS backends freely.
 -b, --backend H:P    Backend server (repeat for multiple)
 -s, --strategy S     Load balancing: round_robin, weighted, random
 -c, --config FILE    JSON config file for hot reload (watches for changes)
+-l, --loglevel LVL   Log level: err, warn, info, debug (default: info)
 --help               Show help message
 ```
 
@@ -109,13 +110,13 @@ The unified `load_balancer` binary supports two execution modes:
 ./zig-out/bin/load_balancer --mode mp -w 4 -p 8080 -b localhost:9001
 ```
 
-**Single-process (sp)** — One process with internal thread pool. Shared connection pool, simpler architecture, lower memory footprint. Best for macOS or development.
+**Single-process (sp)** — One process with internal thread pool. Uses shared memory region for config hot reload and shared round-robin counter. Best for macOS (where SO_REUSEPORT doesn't load-balance) or development.
 
 ```bash
 ./zig-out/bin/load_balancer --mode sp -p 8080 -b localhost:9001
 ```
 
-The binary auto-selects the best mode for your platform if `--mode` is not specified.
+Both modes support hot reload (`-c`) and binary upgrades (SIGUSR2). The binary auto-selects the best mode for your platform if `--mode` is not specified.
 
 Legacy binaries `load_balancer_mp` and `load_balancer_sp` are still available for backwards compatibility.
 
@@ -123,11 +124,13 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for threading details.
 
 ## Hot Reload
 
+### Config Hot Reload
+
 Change backends without restarting or dropping requests:
 
 ```bash
 # Start with a config file
-./zig-out/bin/load_balancer --config backends.json -p 8080
+./zig-out/bin/load_balancer -m sp -c backends.json -p 8080
 
 # Edit backends.json while running - changes apply instantly
 ```
@@ -150,7 +153,26 @@ Change backends without restarting or dropping requests:
 - Workers see new backends on next request — no locks, no drops
 - Health state reset for new backend count
 
-You can still use `-b` flags alongside `--config`. The config file backends are used for hot reload, while `-b` backends are static.
+### Binary Hot Reload
+
+Upgrade the load balancer binary without dropping connections:
+
+```bash
+# Rebuild with changes
+zig build
+
+# Signal the running process to upgrade
+kill -USR2 $(pgrep -f load_balancer)
+```
+
+**What happens:**
+1. Old process receives SIGUSR2
+2. Forks and execs new binary (same arguments)
+3. New process starts, binds with SO_REUSEPORT
+4. Old process waits 1 second, then drains connections and exits
+5. New process takes over seamlessly
+
+Works in both `mp` and `sp` modes on Linux and macOS.
 
 ## Shared Memory Architecture
 
@@ -161,7 +183,8 @@ The load balancer uses mmap'd shared memory for zero-downtime operations:
 │                 SharedRegion (mmap'd)                   │
 │         Inherited across fork(), visible to all         │
 ├─────────────────────────────────────────────────────────┤
-│  ControlBlock     │ active_index, generation, count     │
+│  ControlBlock     │ active_index, generation, count,    │
+│                   │ rr_counter (shared round-robin)     │
 │  HealthState      │ 64-bit bitmap (1 = healthy)         │
 │  BackendArray[0]  │ ◄── active (workers read from here) │
 │  BackendArray[1]  │     inactive (config writes here)   │
@@ -176,6 +199,7 @@ The load balancer uses mmap'd shared memory for zero-downtime operations:
 - **Atomic updates** — Double-buffered arrays with pointer swap (RCU-style)
 - **No coordination** — Each worker independently reads `active_index`
 - **Cross-fork visibility** — Memory mapped before fork(), inherited by children
+- **Shared round-robin** — Atomic counter ensures even distribution across all workers
 
 **No pointers in shared memory** — Backend hostnames are inlined (max 253 bytes per RFC 1035) because pointers are process-local virtual addresses.
 
