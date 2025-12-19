@@ -7,15 +7,11 @@
 /// Based on Wojciech Muła's SIMD-friendly substring search algorithm:
 /// http://0x80.pl/articles/simd-strfind.html
 const std = @import("std");
+const config = @import("../core/config.zig");
 
-/// Vector size for SIMD operations.
-/// 32 bytes = AVX2 (256-bit), supported by all x86 CPUs since ~2013
-/// Falls back gracefully on platforms without SIMD support
-const VECTOR_SIZE = 32;
+const VECTOR_SIZE = config.VECTOR_SIZE;
 const Vec = @Vector(VECTOR_SIZE, u8);
-
-/// Minimum buffer size to use SIMD (below this, scalar is faster)
-const SIMD_THRESHOLD = 64;
+const SIMD_THRESHOLD = config.SIMD_THRESHOLD;
 
 /// Find the position of "\r\n\r\n" (HTTP header end marker) using SIMD.
 ///

@@ -14,16 +14,15 @@
 const std = @import("std");
 const log = std.log.scoped(.circuit_breaker);
 
+const config_mod = @import("../core/config.zig");
 const shared_region = @import("../memory/shared_region.zig");
 pub const SharedHealthState = shared_region.SharedHealthState;
 pub const MAX_BACKENDS = shared_region.MAX_BACKENDS;
 
-/// Circuit breaker configuration
+/// Circuit breaker configuration (uses defaults from config.zig)
 pub const Config = struct {
-    /// Consecutive failures before marking unhealthy
-    unhealthy_threshold: u32 = 3,
-    /// Consecutive successes before marking healthy
-    healthy_threshold: u32 = 2,
+    unhealthy_threshold: u32 = config_mod.DEFAULT_UNHEALTHY_THRESHOLD,
+    healthy_threshold: u32 = config_mod.DEFAULT_HEALTHY_THRESHOLD,
 };
 
 /// Circuit breaker with threshold-based state transitions

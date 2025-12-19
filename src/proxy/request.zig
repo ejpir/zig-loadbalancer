@@ -15,6 +15,7 @@ const log = std.log.scoped(.mp);
 const zzz = @import("zzz");
 const http = zzz.HTTP;
 
+const config = @import("../core/config.zig");
 const ultra_sock_mod = @import("../http/ultra_sock.zig");
 const UltraSock = ultra_sock_mod.UltraSock;
 const metrics = @import("../metrics/mod.zig");
@@ -23,12 +24,9 @@ const metrics = @import("../metrics/mod.zig");
 pub const ProxyState = @import("handler.zig").ProxyState;
 pub const ProxyError = @import("handler.zig").ProxyError;
 
-/// Maximum request header buffer size in bytes (excludes body).
-const MAX_REQUEST_HEADER_BYTES: u32 = 8192;
-/// Maximum header lines to parse.
-const MAX_HEADER_LINES: u32 = 256;
-/// Maximum body chunk buffer size in bytes.
-const MAX_BODY_CHUNK_BYTES: u32 = 8192;
+const MAX_REQUEST_HEADER_BYTES = config.MAX_HEADER_BYTES;
+const MAX_HEADER_LINES = config.MAX_HEADER_LINES;
+const MAX_BODY_CHUNK_BYTES = config.MAX_BODY_CHUNK_BYTES;
 
 // ============================================================================
 // Generic Request Building

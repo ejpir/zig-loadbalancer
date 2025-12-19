@@ -17,6 +17,7 @@ const log = std.log.scoped(.mp);
 const zzz = @import("zzz");
 const http = zzz.HTTP;
 
+const config = @import("../core/config.zig");
 const types = @import("../core/types.zig");
 const ultra_sock_mod = @import("../http/ultra_sock.zig");
 const UltraSock = ultra_sock_mod.UltraSock;
@@ -31,18 +32,10 @@ const proxy_connection = @import("connection.zig");
 const proxy_request = @import("request.zig");
 const proxy_io = @import("io.zig");
 
-// ============================================================================
-// Constants (TigerStyle: explicit bounds, units in names)
-// ============================================================================
-
-/// Maximum backends supported (must match shared_region.MAX_BACKENDS).
-const MAX_BACKENDS: u32 = 64;
-/// Maximum header buffer size in bytes.
-const MAX_HEADER_BYTES: u32 = 8192;
-/// Maximum body chunk buffer size in bytes.
-const MAX_BODY_CHUNK_BYTES: u32 = 8192;
-/// Nanoseconds per millisecond for time conversion.
-const NS_PER_MS: u64 = 1_000_000;
+const MAX_BACKENDS = config.MAX_BACKENDS;
+const MAX_HEADER_BYTES = config.MAX_HEADER_BYTES;
+const MAX_BODY_CHUNK_BYTES = config.MAX_BODY_CHUNK_BYTES;
+const NS_PER_MS = config.NS_PER_MS;
 
 // ============================================================================
 // Error Types

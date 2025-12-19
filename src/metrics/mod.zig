@@ -3,13 +3,13 @@
 /// Thread-safe metrics collection using atomic counters for high-performance monitoring.
 const std = @import("std");
 const log = std.log.scoped(.metrics);
+const config = @import("../core/config.zig");
 const zzz = @import("zzz");
 const http = zzz.HTTP;
 const Context = http.Context;
 const Respond = http.Respond;
 
-/// Maximum backends supported (must match proxy MAX_BACKENDS)
-const MAX_BACKENDS: u32 = 64;
+const MAX_BACKENDS = config.MAX_BACKENDS;
 
 /// Global metrics collector with atomic counters
 pub const MetricsCollector = struct {

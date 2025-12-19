@@ -21,11 +21,8 @@ const config_mod = @import("../core/config.zig");
 const BackendDef = config_mod.BackendDef;
 const shared_region = @import("../memory/shared_region.zig");
 
-/// Maximum backends in config file
-const MAX_BACKENDS: usize = shared_region.MAX_BACKENDS;
-
-/// Maximum config file size (64KB)
-const MAX_CONFIG_SIZE: usize = 64 * 1024;
+const MAX_BACKENDS = config_mod.MAX_BACKENDS;
+const MAX_CONFIG_SIZE = config_mod.MAX_CONFIG_SIZE;
 
 /// Parsed config from JSON file
 pub const ParsedConfig = struct {

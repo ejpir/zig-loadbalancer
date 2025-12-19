@@ -13,21 +13,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
+const config = @import("../core/config.zig");
 const health_state = @import("../health/state.zig");
 
 const log = std.log.scoped(.shared_region);
 
-/// Maximum backends supported (fits in 64-bit bitmap)
-pub const MAX_BACKENDS = health_state.MAX_BACKENDS;
-
-/// Re-export SharedHealthState from health module
+pub const MAX_BACKENDS = config.MAX_BACKENDS;
+pub const MAX_HOST_LEN = config.MAX_HOST_LEN;
+pub const PAGE_SIZE = config.PAGE_SIZE;
 pub const SharedHealthState = health_state.SharedHealthState;
-
-/// Maximum hostname length (per RFC 1035)
-pub const MAX_HOST_LEN = 253;
-
-/// Page size for alignment
-pub const PAGE_SIZE = std.heap.page_size_min;
 
 /// Shared backend definition - self-contained, no pointers
 /// Sized to fit nicely in cache lines

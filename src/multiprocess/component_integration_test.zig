@@ -77,7 +77,7 @@ test "integration: failover redirects to healthy backend" {
 
     var health = SharedHealthState{};
     health.markAllUnhealthy();
-    var state = WorkerState.init(&backends, &pool, &health, .{ .unhealthy_threshold = 2 });
+    var state = WorkerState.init(&backends, &pool, &health, .{ .circuit_breaker_config = .{ .unhealthy_threshold = 2 } });
 
     // Trigger circuit breaker with consecutive failures
     _ = state.selectBackend(.round_robin);
@@ -110,8 +110,7 @@ test "integration: recovery after consecutive successes" {
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 2,
-        .healthy_threshold = 3,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 2, .healthy_threshold = 3 },
     });
 
     // Trigger circuit breaker with consecutive failures
@@ -169,7 +168,7 @@ test "integration: all backends unhealthy returns null" {
 
     var health = SharedHealthState{};
     health.markAllUnhealthy();
-    var state = WorkerState.init(&backends, &pool, &health, .{ .unhealthy_threshold = 1 });
+    var state = WorkerState.init(&backends, &pool, &health, .{ .circuit_breaker_config = .{ .unhealthy_threshold = 1 } });
 
     // Trigger circuit breaker on all backends
     state.recordFailure(0);
@@ -200,8 +199,7 @@ test "integration: failure during recovery resets success counter" {
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 2,
-        .healthy_threshold = 3,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 2, .healthy_threshold = 3 },
     });
 
     // Trigger circuit breaker with consecutive failures
@@ -240,8 +238,7 @@ test "integration: single backend down and recovery" {
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 2,
-        .healthy_threshold = 2,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 2, .healthy_threshold = 2 },
     });
 
     // Verify initial healthy state
@@ -279,8 +276,7 @@ test "integration: mixed success/failure pattern" {
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 3,
-        .healthy_threshold = 2,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 3, .healthy_threshold = 2 },
     });
 
     // Simulate realistic pattern: mostly successes with occasional failures
@@ -368,8 +364,7 @@ test "integration: unified health - probe success recovers circuit-breaker-tripp
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 3,
-        .healthy_threshold = 2,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 3, .healthy_threshold = 2 },
     });
 
     // Backend goes down due to request failures
@@ -409,7 +404,7 @@ test "integration: unified health - probe failure trips circuit breaker" {
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 3,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 3 },
     });
 
     // Backend is healthy
@@ -448,8 +443,7 @@ test "integration: unified health - no state disagreement" {
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 2,
-        .healthy_threshold = 2,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 2, .healthy_threshold = 2 },
     });
 
     // Request failures trip circuit breaker
@@ -485,7 +479,7 @@ test "integration: unified health - probe and request failures both count toward
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 3,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 3 },
     });
 
     // Mix of probe and request failures
@@ -544,8 +538,7 @@ test "integration: unified health - probe failure resets success progress" {
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 2,
-        .healthy_threshold = 3,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 2, .healthy_threshold = 3 },
     });
 
     // Trip circuit breaker
@@ -587,8 +580,7 @@ test "integration: unified health - mixed probe and request recovery" {
     var health = SharedHealthState{};
     health.markAllUnhealthy();
     var state = WorkerState.init(&backends, &pool, &health, .{
-        .unhealthy_threshold = 3,
-        .healthy_threshold = 2,
+        .circuit_breaker_config = .{ .unhealthy_threshold = 3, .healthy_threshold = 2 },
     });
 
     // Backend 0 goes down via request failures
