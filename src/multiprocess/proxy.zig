@@ -24,6 +24,7 @@ const http_utils = @import("../http/http_utils.zig");
 const simd_parse = @import("../internal/simd_parse.zig");
 const metrics = @import("../utils/metrics.zig");
 const WorkerState = @import("worker_state.zig").WorkerState;
+const shared_region = @import("../memory/shared_region.zig");
 const tls = @import("tls");
 
 // ============================================================================
@@ -121,15 +122,16 @@ pub fn generateHandler(
                 }
             }
 
-            // Prevent bitmap overflow in circuit breaker health tracking.
-            std.debug.assert(state.backends.items.len <= MAX_BACKENDS);
+            // Use dynamic backend count (from shared region if available)
+            const backend_count = state.getBackendCount();
+            std.debug.assert(backend_count <= MAX_BACKENDS);
 
             log.debug("Handler called: backends={d} healthy={d}", .{
-                state.backends.items.len,
+                backend_count,
                 state.circuit_breaker.countHealthy(),
             });
 
-            if (state.backends.items.len == 0) {
+            if (backend_count == 0) {
                 return ctx.response.apply(.{
                     .status = .@"Service Unavailable",
                     .mime = http.Mime.TEXT,
@@ -147,7 +149,7 @@ pub fn generateHandler(
             };
 
             // Prevent out-of-bounds access to backends array and bitmap.
-            std.debug.assert(backend_idx < state.backends.items.len);
+            std.debug.assert(backend_idx < backend_count);
             std.debug.assert(backend_idx < MAX_BACKENDS);
 
             log.debug("Selected backend {d}", .{backend_idx});
@@ -164,25 +166,54 @@ inline fn proxyWithFailover(
 ) !http.Respond {
     // Prevent out-of-bounds access to backends array and bitmap.
     std.debug.assert(primary_idx < MAX_BACKENDS);
-    std.debug.assert(primary_idx < state.backends.items.len);
+    const backend_count = state.getBackendCount();
+    std.debug.assert(primary_idx < backend_count);
 
-    const backends = state.backends;
+    // Try to get backend from shared region (hot reload) or fall back to local
+    if (state.getSharedBackend(primary_idx)) |shared_backend| {
+        if (streamingProxyShared(ctx, shared_backend, primary_idx, state)) |response| {
+            state.recordSuccess(primary_idx);
+            return response;
+        } else |err| {
+            state.recordFailure(primary_idx);
+            log.warn("Backend {d} failed: {s}", .{ primary_idx + 1, @errorName(err) });
+        }
+    } else {
+        // Fall back to local backends list
+        const backends = state.backends;
+        if (streamingProxy(ctx, &backends.items[primary_idx], primary_idx, state)) |response| {
+            state.recordSuccess(primary_idx);
+            return response;
+        } else |err| {
+            state.recordFailure(primary_idx);
+            log.warn("Backend {d} failed: {s}", .{ primary_idx + 1, @errorName(err) });
+        }
+    }
 
-    if (streamingProxy(ctx, &backends.items[primary_idx], primary_idx, state)) |response| {
-        state.recordSuccess(primary_idx);
-        return response;
-    } else |err| {
-        state.recordFailure(primary_idx);
-        log.warn("Backend {d} failed: {s}", .{ primary_idx + 1, @errorName(err) });
+    // Try failover
+    if (state.findHealthyBackend(primary_idx)) |failover_idx| {
+        // Prevent bitmap overflow in circuit breaker after failover selection.
+        std.debug.assert(failover_idx < MAX_BACKENDS);
 
-        if (state.findHealthyBackend(primary_idx)) |failover_idx| {
-            // Prevent bitmap overflow in circuit breaker after failover selection.
-            std.debug.assert(failover_idx < MAX_BACKENDS);
+        log.debug("Failing over to backend {d}", .{failover_idx + 1});
+        metrics.global_metrics.recordFailover();
 
-            log.debug("Failing over to backend {d}", .{failover_idx + 1});
-            metrics.global_metrics.recordFailover();
+        const failover_u32: u32 = @intCast(failover_idx);
 
-            const failover_u32: u32 = @intCast(failover_idx);
+        if (state.getSharedBackend(failover_idx)) |shared_backend| {
+            if (streamingProxyShared(ctx, shared_backend, failover_u32, state)) |response| {
+                state.recordSuccess(failover_idx);
+                return response;
+            } else |failover_err| {
+                state.recordFailure(failover_idx);
+                const err_name = @errorName(failover_err);
+                log.warn("Failover to backend {d} failed: {s}", .{
+                    failover_idx + 1,
+                    err_name,
+                });
+            }
+        } else {
+            const backends = state.backends;
             const backend = &backends.items[failover_idx];
             if (streamingProxy(ctx, backend, failover_u32, state)) |response| {
                 state.recordSuccess(failover_idx);
@@ -196,13 +227,13 @@ inline fn proxyWithFailover(
                 });
             }
         }
-
-        return ctx.response.apply(.{
-            .status = .@"Service Unavailable",
-            .mime = http.Mime.TEXT,
-            .body = "All backends unavailable",
-        });
     }
+
+    return ctx.response.apply(.{
+        .status = .@"Service Unavailable",
+        .mime = http.Mime.TEXT,
+        .body = "All backends unavailable",
+    });
 }
 
 // ============================================================================
@@ -311,6 +342,88 @@ inline fn streamingProxy(
     return streamingProxy_finalize(ctx, &proxy_state, state, backend_idx, start_ns, req_id);
 }
 
+/// Streaming proxy implementation for SharedBackend (hot reload support).
+inline fn streamingProxyShared(
+    ctx: *const http.Context,
+    backend: *const shared_region.SharedBackend,
+    backend_idx: u32,
+    state: *WorkerState,
+) ProxyError!http.Respond {
+    // Prevent bitmap overflow in circuit breaker health tracking.
+    std.debug.assert(backend_idx < MAX_BACKENDS);
+
+    const start_ns = std.time.Instant.now() catch null;
+    const req_id = getRequestId();
+
+    log.debug("[REQ {d}] START (shared) uri={s} method={s} -> {s}:{d}", .{
+        req_id,
+        ctx.request.uri orelse "/",
+        @tagName(ctx.request.method orelse .GET),
+        backend.getHost(),
+        backend.port,
+    });
+
+    // Phase 1: Acquire connection.
+    var proxy_state = streamingProxy_acquireConnectionShared(
+        ctx,
+        backend,
+        backend_idx,
+        state,
+        req_id,
+    ) catch |err| {
+        return err;
+    };
+
+    // Fix pointers after struct copy
+    proxy_state.sock.fixTlsPointersAfterCopy();
+    proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
+
+    proxy_state.assertValid();
+
+    // Phase 2: Send request.
+    streamingProxy_sendRequestShared(ctx, backend, &proxy_state, req_id) catch |err| {
+        proxy_state.sock.close_blocking();
+        return err;
+    };
+
+    // Phase 3-6: Same as regular streamingProxy (backend-agnostic)
+    var header_buffer: [MAX_HEADER_BYTES]u8 = undefined;
+    var header_len: u32 = 0;
+    var header_end: u32 = 0;
+    const msg_len = streamingProxy_readHeaders(
+        ctx,
+        &proxy_state,
+        &header_buffer,
+        &header_len,
+        &header_end,
+        req_id,
+    ) catch |err| {
+        proxy_state.sock.close_blocking();
+        return err;
+    };
+
+    std.debug.assert(header_end > 0);
+    std.debug.assert(header_end <= header_len);
+
+    const body_already_read = header_len - header_end;
+    streamingProxy_forwardHeaders(
+        ctx,
+        &proxy_state,
+        &header_buffer,
+        header_end,
+        body_already_read,
+        msg_len,
+        req_id,
+    ) catch |err| {
+        proxy_state.sock.close_blocking();
+        return err;
+    };
+
+    streamingProxy_streamBody(ctx, &proxy_state, header_end, header_len, msg_len, req_id);
+
+    return streamingProxy_finalize(ctx, &proxy_state, state, backend_idx, start_ns, req_id);
+}
+
 // ============================================================================
 // Phase 1: Acquire Connection (<70 lines)
 // ============================================================================
@@ -392,6 +505,83 @@ fn streamingProxy_acquireConnection(
     return proxy_state;
 }
 
+/// Acquire connection for SharedBackend (hot reload support)
+fn streamingProxy_acquireConnectionShared(
+    ctx: *const http.Context,
+    backend: *const shared_region.SharedBackend,
+    backend_idx: u32,
+    state: *WorkerState,
+    req_id: u32,
+) ProxyError!ProxyState {
+    std.debug.assert(backend_idx < MAX_BACKENDS);
+
+    const pool_result = state.connection_pool.getConnection(backend_idx);
+
+    if (pool_result) |pooled_sock_const| {
+        var pooled_sock = pooled_sock_const;
+
+        metrics.global_metrics.recordPoolHit();
+        metrics.global_metrics.recordPoolHitForBackend(backend_idx);
+        log.debug("[REQ {d}] POOL HIT backend={d}", .{ req_id, backend_idx });
+
+        std.debug.assert(pooled_sock.stream != null);
+
+        var proxy_state = ProxyState{
+            .sock = pooled_sock,
+            .from_pool = true,
+            .can_return_to_pool = true,
+            .is_tls = pooled_sock.isTls(),
+            .tls_conn_ptr = null,
+            .status_code = 0,
+            .bytes_from_backend = 0,
+            .bytes_to_client = 0,
+            .body_had_error = false,
+            .client_write_error = false,
+            .backend_wants_close = false,
+        };
+        proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
+        return proxy_state;
+    }
+
+    // No pooled connection - create fresh using SharedBackend
+    metrics.global_metrics.recordPoolMiss();
+    metrics.global_metrics.recordPoolMissForBackend(backend_idx);
+    log.debug("[REQ {d}] POOL MISS backend={d} -> {s}:{d}", .{
+        req_id,
+        backend_idx,
+        backend.getHost(),
+        backend.port,
+    });
+
+    // UltraSock.fromBackendServer uses duck typing (anytype) so SharedBackend works
+    var sock = UltraSock.fromBackendServer(backend);
+    sock.connect(ctx.io) catch {
+        sock.close_blocking();
+        return ProxyError.BackendUnavailable;
+    };
+
+    if (sock.stream == null) {
+        log.err("[REQ {d}] No stream after connection setup!", .{req_id});
+        return ProxyError.ConnectionFailed;
+    }
+
+    var proxy_state = ProxyState{
+        .sock = sock,
+        .from_pool = false,
+        .can_return_to_pool = true,
+        .is_tls = sock.isTls(),
+        .tls_conn_ptr = null,
+        .status_code = 0,
+        .bytes_from_backend = 0,
+        .bytes_to_client = 0,
+        .body_had_error = false,
+        .client_write_error = false,
+        .backend_wants_close = false,
+    };
+    proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
+    return proxy_state;
+}
+
 // ============================================================================
 // Phase 2: Send Request (<70 lines)
 // ============================================================================
@@ -402,6 +592,15 @@ fn streamingProxy_acquireConnection(
 pub fn streamingProxy_buildRequestHeaders(
     ctx: *const http.Context,
     backend: *const types.BackendServer,
+    buffer: *[MAX_REQUEST_HEADER_BYTES]u8,
+) ![]const u8 {
+    return streamingProxy_buildRequestHeadersGeneric(ctx, backend, buffer);
+}
+
+/// Generic header builder that works with both BackendServer and SharedBackend
+fn streamingProxy_buildRequestHeadersGeneric(
+    ctx: *const http.Context,
+    backend: anytype,
     buffer: *[MAX_REQUEST_HEADER_BYTES]u8,
 ) ![]const u8 {
     // TigerStyle: explicit bounds checking.
@@ -552,6 +751,58 @@ fn streamingProxy_sendRequest(
     }
 }
 
+/// Send request for SharedBackend (hot reload support)
+fn streamingProxy_sendRequestShared(
+    ctx: *const http.Context,
+    backend: *const shared_region.SharedBackend,
+    proxy_state: *ProxyState,
+    req_id: u32,
+) ProxyError!void {
+    proxy_state.assertValid();
+    std.debug.assert(proxy_state.sock.stream != null);
+
+    var request_buf: [MAX_REQUEST_HEADER_BYTES]u8 = undefined;
+    const request_data = streamingProxy_buildRequestHeadersGeneric(
+        ctx,
+        backend,
+        &request_buf,
+    ) catch {
+        return ProxyError.ConnectionFailed;
+    };
+
+    std.debug.assert(request_data.len > 0);
+    std.debug.assert(request_data.len <= MAX_REQUEST_HEADER_BYTES);
+
+    log.debug("[REQ {d}] SENDING TO BACKEND (shared, {s}): {s}", .{
+        req_id,
+        if (proxy_state.is_tls) "TLS" else "plain",
+        request_data[0..@min(request_data.len, 60)],
+    });
+
+    var send_ok = false;
+    if (proxy_state.is_tls) {
+        send_ok = streamingProxy_sendRequest_tls(proxy_state, request_data, ctx.request.body, req_id);
+    } else {
+        send_ok = streamingProxy_sendRequest_plain(ctx, proxy_state, request_data, ctx.request.body);
+    }
+
+    // Retry on stale pooled connection
+    if (!send_ok and proxy_state.from_pool) {
+        send_ok = streamingProxy_sendRequest_retryShared(
+            ctx,
+            backend,
+            proxy_state,
+            request_data,
+            req_id,
+        );
+    }
+
+    if (!send_ok) {
+        metrics.global_metrics.recordSendFailure();
+        return ProxyError.SendFailed;
+    }
+}
+
 fn streamingProxy_sendRequest_tls(
     proxy_state: *ProxyState,
     request_data: []const u8,
@@ -633,6 +884,37 @@ fn streamingProxy_sendRequest_retry(
     proxy_state.is_tls = proxy_state.sock.isTls();
 
     // Get body from ctx for retry
+    const body = ctx.request.body;
+
+    if (proxy_state.is_tls) {
+        return streamingProxy_sendRequest_tls(proxy_state, request_data, body, req_id);
+    } else {
+        return streamingProxy_sendRequest_plain(ctx, proxy_state, request_data, body);
+    }
+}
+
+/// Retry for SharedBackend (hot reload support)
+fn streamingProxy_sendRequest_retryShared(
+    ctx: *const http.Context,
+    backend: *const shared_region.SharedBackend,
+    proxy_state: *ProxyState,
+    request_data: []const u8,
+    req_id: u32,
+) bool {
+    metrics.global_metrics.recordStaleConnection();
+    log.debug("[REQ {d}] Pooled conn stale on write, retrying with fresh (shared)", .{req_id});
+    proxy_state.sock.close_blocking();
+
+    // UltraSock.fromBackendServer uses duck typing so SharedBackend works
+    proxy_state.sock = UltraSock.fromBackendServer(backend);
+    proxy_state.sock.connect(ctx.io) catch {
+        proxy_state.sock.close_blocking();
+        return false;
+    };
+    proxy_state.from_pool = false;
+    proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
+    proxy_state.is_tls = proxy_state.sock.isTls();
+
     const body = ctx.request.body;
 
     if (proxy_state.is_tls) {

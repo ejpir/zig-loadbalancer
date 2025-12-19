@@ -41,7 +41,10 @@ pub const Config = struct {
 
 /// Complete worker state for request handling
 pub const WorkerState = struct {
+    // Legacy: local backends list (used in single-process mode and tests)
     backends: *const types.BackendsList,
+    // Shared region for hot reload (null in single-process mode)
+    shared_region: ?*shared_region.SharedRegion = null,
     connection_pool: *simple_pool.SimpleConnectionPool,
     circuit_breaker: CircuitBreaker,
     config: Config,
@@ -97,6 +100,31 @@ pub const WorkerState = struct {
         return state;
     }
 
+    /// Set shared region for hot reload support
+    pub fn setSharedRegion(self: *WorkerState, region: *shared_region.SharedRegion) void {
+        self.shared_region = region;
+    }
+
+    /// Get active backend count (from shared region if available)
+    pub fn getBackendCount(self: *const WorkerState) usize {
+        if (self.shared_region) |region| {
+            return region.control.getBackendCount();
+        }
+        return self.backends.items.len;
+    }
+
+    /// Get shared backend by index (from shared region)
+    pub fn getSharedBackend(self: *const WorkerState, idx: usize) ?*const shared_region.SharedBackend {
+        if (self.shared_region) |region| {
+            const active = region.getActiveBackends();
+            if (idx < region.control.getBackendCount()) {
+                return &active[idx];
+            }
+            return null;
+        }
+        return null;
+    }
+
     /// Set worker ID (called from main after init)
     /// Also mixes worker_id into random_state for unique sequences per worker
     pub fn setWorkerId(self: *WorkerState, id: usize) void {
@@ -114,20 +142,29 @@ pub const WorkerState = struct {
         self: *WorkerState,
         comptime strategy: types.LoadBalancerStrategy,
     ) ?usize {
-        std.debug.assert(self.backends.items.len <= MAX_BACKENDS);
-        if (self.backends.items.len == 0) return null;
+        // Use dynamic backend count from shared region if available
+        const backend_count = self.getBackendCount();
+        std.debug.assert(backend_count <= MAX_BACKENDS);
+        if (backend_count == 0) return null;
 
         var selector = BackendSelector{
             .health = self.circuit_breaker.health,
-            .backend_count = self.backends.items.len,
+            .backend_count = backend_count,
             .rr_counter = self.rr_state,
             .random_state = self.random_state,
         };
 
         // Copy backend weights for weighted round-robin
         if (strategy == .weighted_round_robin) {
-            for (self.backends.items, 0..) |backend, i| {
-                selector.weights[i] = backend.weight;
+            if (self.shared_region) |region| {
+                const active = region.getActiveBackends();
+                for (0..backend_count) |i| {
+                    selector.weights[i] = active[i].weight;
+                }
+            } else {
+                for (self.backends.items, 0..) |backend, i| {
+                    selector.weights[i] = backend.weight;
+                }
             }
         }
 
