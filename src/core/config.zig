@@ -111,15 +111,29 @@ pub inline fn isInsecureTls() bool {
 /// Global runtime trace setting for hex/ASCII payload dumps
 pub var runtime_trace_enabled: bool = false;
 
+/// Global runtime TLS trace setting for detailed TLS handshake info
+pub var runtime_tls_trace_enabled: bool = false;
+
 /// Enable payload tracing (call once at startup)
 pub fn setTraceEnabled(enabled: bool) void {
     runtime_trace_enabled = enabled;
+}
+
+/// Enable TLS trace (call once at startup)
+pub fn setTlsTraceEnabled(enabled: bool) void {
+    runtime_tls_trace_enabled = enabled;
 }
 
 /// Check if payload tracing is enabled
 /// Inline to guarantee zero function call overhead in hot paths
 pub inline fn isTraceEnabled() bool {
     return runtime_trace_enabled;
+}
+
+/// Check if TLS tracing is enabled
+/// Inline to guarantee zero function call overhead
+pub inline fn isTlsTraceEnabled() bool {
+    return runtime_tls_trace_enabled;
 }
 
 /// Dump data as hex + ASCII (like hexdump -C)

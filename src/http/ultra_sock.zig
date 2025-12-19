@@ -265,7 +265,50 @@ pub const UltraSock = struct {
             return error.TlsHandshakeFailed;
         };
 
-        log.info("TLS connection established with {s}:{}", .{ self.host, self.port });
+        // Log TLS connection details
+        const cipher_name = @tagName(self.tls_conn.?.cipher);
+
+        if (config_mod.isTlsTraceEnabled()) {
+            // Detailed TLS trace logging
+            const tls_log = std.log.scoped(.tls_trace);
+
+            // Determine TLS version from cipher suite
+            // TLS 1.3 ciphers: AES_128_GCM_SHA256, AES_256_GCM_SHA384, CHACHA20_POLY1305_SHA256
+            // TLS 1.2 ciphers: ECDHE_* or RSA_*
+            const tls_version: []const u8 = if (std.mem.startsWith(u8, cipher_name, "AES_") or
+                std.mem.startsWith(u8, cipher_name, "CHACHA20_"))
+                "TLS 1.3"
+            else
+                "TLS 1.2";
+
+            // CA verification mode
+            const ca_mode: []const u8 = switch (self.tls_options.ca) {
+                .none => "none (INSECURE)",
+                .system => "system trust store",
+                .custom => "custom bundle",
+            };
+
+            // Host verification mode
+            const host_mode: []const u8 = switch (self.tls_options.host) {
+                .none => "disabled (INSECURE)",
+                .from_connection => "enabled",
+                .explicit => "explicit",
+            };
+
+            tls_log.info("=== TLS Handshake Complete ===", .{});
+            tls_log.info("  Host: {s}:{}", .{ self.host, self.port });
+            tls_log.info("  Version: {s}", .{tls_version});
+            tls_log.info("  Cipher Suite: {s}", .{cipher_name});
+            tls_log.info("  CA Verification: {s}", .{ca_mode});
+            tls_log.info("  Host Verification: {s}", .{host_mode});
+            if (ca_bundle_loaded) {
+                if (global_ca_bundle) |bundle| {
+                    tls_log.info("  CA Certificates: {} loaded", .{bundle.map.count()});
+                }
+            }
+        } else {
+            log.info("TLS established {s}:{} ({s})", .{ self.host, self.port, cipher_name });
+        }
     }
 
     /// Ensure CA bundle is loaded (only once per process)

@@ -96,6 +96,7 @@ const Config = struct {
     upgrade_fd: ?posix.fd_t = null, // Inherited socket fd for binary hot reload
     insecure_tls: bool = false, // Skip TLS verification (for testing only)
     trace: bool = false, // Enable hex/ASCII payload tracing
+    tls_trace: bool = false, // Enable detailed TLS handshake tracing
 };
 
 // ============================================================================
@@ -121,6 +122,7 @@ fn printUsage() void {
         \\    -l, --loglevel <LEVEL>  Log level: err, warn, info, debug (default: info)
         \\    -k, --insecure          Skip TLS certificate verification (testing only)
         \\    -t, --trace             Dump raw request/response payloads (hex + ASCII)
+        \\    --tls-trace             Show detailed TLS handshake info (cipher, version, CA)
         \\    --upgrade-fd <FD>       Inherit socket fd for binary hot reload (internal)
         \\    --help                  Show this help
         \\
@@ -149,6 +151,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     var upgrade_fd: ?posix.fd_t = null;
     var insecure_tls: bool = false;
     var trace: bool = false;
+    var tls_trace: bool = false;
 
     var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
     errdefer backend_list.deinit(allocator);
@@ -246,6 +249,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         } else if (std.mem.eql(u8, arg, "--trace") or
                    std.mem.eql(u8, arg, "-t")) {
             trace = true;
+        } else if (std.mem.eql(u8, arg, "--tls-trace")) {
+            tls_trace = true;
         } else if (std.mem.eql(u8, arg, "--upgrade-fd")) {
             if (i + 1 < args.len) {
                 upgrade_fd = try std.fmt.parseInt(posix.fd_t, args[i + 1], 10);
@@ -262,6 +267,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     // Notify if trace mode is enabled
     if (trace) {
         std.debug.print("TRACE: Payload hex/ASCII dumps enabled (may impact performance)\n", .{});
+    }
+
+    // Notify if TLS trace mode is enabled
+    if (tls_trace) {
+        std.debug.print("TLS-TRACE: Detailed TLS handshake info enabled\n", .{});
     }
 
     // Use default mode if not specified
@@ -305,6 +315,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         .upgrade_fd = upgrade_fd,
         .insecure_tls = insecure_tls,
         .trace = trace,
+        .tls_trace = tls_trace,
         .lbConfig = .{
             .worker_count = worker_count,
             .port = port,
@@ -340,6 +351,9 @@ pub fn main() !void {
 
     // Set runtime trace mode
     config_mod.setTraceEnabled(config.trace);
+
+    // Set runtime TLS trace mode
+    config_mod.setTlsTraceEnabled(config.tls_trace);
 
     // Validate configuration
     try config.lbConfig.validate();
