@@ -98,6 +98,7 @@ Mix HTTP and HTTPS backends freely.
 -c, --config FILE    JSON config file for hot reload (watches for changes)
 -l, --loglevel LVL   Log level: err, warn, info, debug (default: info)
 -k, --insecure       Skip TLS certificate verification (testing only!)
+-t, --trace          Dump raw request/response payloads (hex + ASCII)
 --help               Show help message
 ```
 
@@ -151,6 +152,37 @@ TLS is automatically enabled for port 443. To disable verification for testing:
 
 # WARNING: Do not use --insecure in production!
 ```
+
+### Debugging
+
+| Option | CLI Flag | Default | Description |
+|--------|----------|---------|-------------|
+| `trace` | `-t, --trace` | `false` | Dump raw payloads as hex + ASCII |
+
+Enable payload tracing to see exactly what's being sent/received:
+
+```bash
+./zig-out/bin/load_balancer -t -b httpbin.org:443 -p 8080
+```
+
+Output (hexdump -C format):
+```
+info(trace): === REQUEST TO BACKEND (104 bytes) ===
+info(trace): 00000000  47 45 54 20 2f 69 70 20  48 54 54 50 2f 31 2e 31  |GET /ip HTTP/1.1|
+info(trace): 00000010  0d 0a 48 6f 73 74 3a 20  68 74 74 70 62 69 6e 2e  |..Host: httpbin.|
+...
+info(trace): === RESPONSE BODY (with headers) (33 bytes) ===
+info(trace): 00000000  7b 0a 20 20 22 6f 72 69  67 69 6e 22 3a 20 22 ...  |{.  "origin": "...|
+```
+
+Traces include:
+- `REQUEST TO BACKEND` — outgoing HTTP headers
+- `REQUEST BODY` — outgoing body data (if present)
+- `RESPONSE HEADERS FROM BACKEND` — incoming HTTP headers
+- `RESPONSE BODY (with headers)` — body received with headers
+- `RESPONSE BODY CHUNK` — body received in subsequent reads
+
+**Performance:** Zero overhead when disabled (inline boolean check, branch prediction).
 
 ### Compile-Time Constants
 
