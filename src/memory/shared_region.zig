@@ -87,8 +87,11 @@ pub const ControlBlock = extern struct {
     /// Number of configured backends
     backend_count: std.atomic.Value(u32) = .{ .raw = 0 },
 
+    /// Shared round-robin counter for cross-worker load balancing
+    rr_counter: std.atomic.Value(u32) = .{ .raw = 0 },
+
     /// Padding to fill cache line (64 bytes total)
-    _padding: [40]u8 = undefined,
+    _padding: [32]u8 = undefined,
 
     /// Get the index of the currently active backend array
     pub fn getActiveIndex(self: *const ControlBlock) usize {
@@ -115,6 +118,15 @@ pub const ControlBlock = extern struct {
         // Flip active index
         _ = self.active_index.fetchXor(1, .release);
         return new_gen;
+    }
+
+    /// Atomically get and increment the round-robin counter
+    /// Returns the current value before increment, modulo backend_count
+    pub fn getNextRoundRobin(self: *ControlBlock) u32 {
+        const count = self.backend_count.load(.acquire);
+        if (count == 0) return 0;
+        const val = self.rr_counter.fetchAdd(1, .acq_rel);
+        return val % count;
     }
 };
 

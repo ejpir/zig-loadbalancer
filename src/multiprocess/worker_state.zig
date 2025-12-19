@@ -147,10 +147,17 @@ pub const WorkerState = struct {
         std.debug.assert(backend_count <= MAX_BACKENDS);
         if (backend_count == 0) return null;
 
+        // For round-robin with shared region, use shared atomic counter
+        // This ensures even distribution across all workers
+        const rr_start: usize = if (strategy == .round_robin and self.shared_region != null)
+            self.shared_region.?.control.getNextRoundRobin()
+        else
+            self.rr_state;
+
         var selector = BackendSelector{
             .health = self.circuit_breaker.health,
             .backend_count = backend_count,
-            .rr_counter = self.rr_state,
+            .rr_counter = rr_start,
             .random_state = self.random_state,
         };
 
