@@ -64,18 +64,11 @@ pub const BackendConnection = struct {
     }
 
     /// Connect to backend, detecting protocol via ALPN
+    /// TigerStyle: sock.isHttp2() uses copy-safe enum, no dangling pointers
     pub fn connect(self: *Self, sock: *UltraSock, io: Io) !void {
-        self.connectWithProtocol(sock, io, null) catch |err| return err;
-    }
-
-    /// Connect with explicit protocol override (used when ALPN already checked)
-    pub fn connectWithProtocol(self: *Self, sock: *UltraSock, io: Io, force_protocol: ?Protocol) !void {
         self.sock = sock;
 
-        // Use forced protocol or detect via ALPN
-        const use_http2 = if (force_protocol) |proto| proto == .http2 else sock.isHttp2();
-
-        if (use_http2) {
+        if (sock.isHttp2()) {
             log.info("Backend supports HTTP/2, initializing h2 connection", .{});
             self.protocol = .http2;
             self.h2_client = Http2Client.init(self.allocator);
@@ -209,8 +202,8 @@ pub const BackendConnection = struct {
         }
     }
 
-    /// Check if using HTTP/2
-    pub fn isHttp2(self: *const Self) bool {
+    /// Check if using HTTP/2 (inlined - simple enum check)
+    pub inline fn isHttp2(self: *const Self) bool {
         return self.protocol == .http2;
     }
 };

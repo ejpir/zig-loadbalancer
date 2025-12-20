@@ -103,7 +103,8 @@ pub const BackendServer = struct {
         };
     }
 
-    pub fn getFullHost(self: *const BackendServer) []const u8 {
+    /// Get full host string (inlined - hot path, simple slice)
+    pub inline fn getFullHost(self: *const BackendServer) []const u8 {
         return self.host_ptr[0..self.host_len];
     }
 };

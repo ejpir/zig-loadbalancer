@@ -219,6 +219,31 @@ Changes detected via kqueue (macOS) / inotify (Linux). Zero-downtime reload.
 | **Connection pooling** | Per-backend, per-worker pools |
 | **Crash isolation** | Workers are separate processes |
 
+## HTTP/2 Support
+
+Automatic HTTP/2 for HTTPS backends:
+
+```bash
+./load_balancer -b api.cloudflare.com:443 -p 8080
+# ALPN negotiates h2 automatically
+```
+
+**What's supported:**
+- ALPN protocol negotiation during TLS handshake
+- HPACK header compression (static table)
+- Flow control (WINDOW_UPDATE frames)
+- Graceful fallback to HTTP/1.1 if server doesn't support h2
+
+**What's not (yet):**
+- Stream multiplexing (single request per connection)
+- Server push
+- Connection pooling for HTTP/2 (fresh connection each request)
+
+Use `--tls-trace` to see the negotiated protocol:
+```
+info(tls_trace): ALPN Protocol: http2
+```
+
 ## Building
 
 ```bash

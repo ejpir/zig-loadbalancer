@@ -193,23 +193,54 @@ Uses `HealthState` bitmap for O(1) health checks via `@popCount`/`@ctz`.
 
 ### `simple_connection_pool.zig` — Connection Reuse
 
-Per-backend LIFO stacks:
+Per-backend LIFO stacks, lock-free design:
 ```zig
 const MAX_IDLE_CONNS = 8;
 const MAX_BACKENDS = 64;
 
-stacks: [MAX_BACKENDS]SimpleConnectionStack
+stacks: [MAX_BACKENDS]SimpleConnectionStack  // No mutex!
 ```
 
-No atomics needed — each worker has its own pool.
+**No synchronization needed:**
+- Each worker has its own pool instance
+- I/O event loop is single-threaded (io_uring/kqueue completions are sequential)
+- Health probe thread uses shared_region, NOT the connection pool
+- Eliminates mutex overhead on every `getConnection()`/`returnConnection()`
 
 ### `ultra_sock.zig` — TCP/TLS Socket
 
-Unified interface for HTTP and HTTPS backends:
+Unified interface for HTTP/1.1 and HTTP/2 backends:
 - Port 443 → TLS handshake via `ianic/tls.zig`
+- ALPN negotiation: `["h2", "http/1.1"]` → server picks protocol
+- `negotiated_protocol: AppProtocol` — Copy-safe enum (not slice pointer)
 - Other ports → Plain TCP
 - DNS resolution via `getaddrinfo()`
-- `fixTlsPointersAfterCopy()` — Required after struct copy
+
+**HTTP/2 support:**
+- ALPN advertises `h2` during TLS handshake
+- If server selects `h2`, uses HTTP/2 framing (HPACK compression)
+- Falls back to HTTP/1.1 if server doesn't support h2
+- `isHttp2()` — Inlined enum check for hot path
+
+### `http2/` — HTTP/2 Protocol Support
+
+Backend HTTP/2 support via ALPN negotiation:
+
+```
+src/http/http2/
+├── mod.zig       # Constants (INITIAL_WINDOW_SIZE, frame types)
+├── frame.zig     # Frame parsing/building (HEADERS, DATA, SETTINGS, etc.)
+├── hpack.zig     # HPACK header compression (static table, Huffman)
+├── huffman.zig   # Huffman decoding for HPACK
+├── stream.zig    # Stream state machine (unused, future multiplexing)
+└── client.zig    # HTTP/2 client (connection preface, request/response)
+```
+
+**Key design:**
+- ALPN negotiates protocol during TLS handshake
+- `AppProtocol` enum is copy-safe (no dangling pointers)
+- HPACK uses static table only (no dynamic table state)
+- WINDOW_UPDATE sent after DATA frames (flow control)
 
 ### `http_utils.zig` — Message Framing
 

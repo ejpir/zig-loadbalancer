@@ -67,14 +67,20 @@ pub const SimpleConnectionStack = struct {
     }
 };
 
-/// Simple connection pool - thread-safe with mutex
+/// Per-worker connection pool - NO SYNCHRONIZATION NEEDED
+///
+/// Each worker process has its own pool instance. Within a worker:
+/// - I/O event loop is single-threaded (io_uring/kqueue completions are sequential)
+/// - Health probe thread does NOT access connection pool (uses shared_region instead)
+/// - No concurrent access = no locks needed
+///
+/// This eliminates mutex overhead on every connection acquire/release.
+/// TigerStyle: explicit single-threaded design, no hidden synchronization costs.
 pub const SimpleConnectionPool = struct {
     /// Per-backend connection stacks (zero-initialized for safety)
     pools: [MAX_BACKENDS]SimpleConnectionStack = [_]SimpleConnectionStack{.{}} ** MAX_BACKENDS,
     /// Number of active backends
     backend_count: usize = 0,
-    /// Single mutex (simpler, better cache locality)
-    mutex: std.Thread.Mutex = .{},
 
     /// Deinitialize and close all connections
     pub fn deinit(self: *SimpleConnectionPool) void {
@@ -89,34 +95,27 @@ pub const SimpleConnectionPool = struct {
     }
 
     /// Get a connection for a backend (returns null if pool empty)
-    /// Thread-safe with mutex
+    /// No synchronization - single-threaded I/O loop per worker
     pub inline fn getConnection(self: *SimpleConnectionPool, backend_idx: usize) ?UltraSock {
         if (backend_idx >= MAX_BACKENDS or backend_idx >= self.backend_count) return null;
-        self.mutex.lock();
-        defer self.mutex.unlock();
         return self.pools[backend_idx].pop();
     }
 
     /// Return a connection to the pool
-    /// Thread-safe with mutex
+    /// No synchronization - single-threaded I/O loop per worker
     pub inline fn returnConnection(
         self: *SimpleConnectionPool,
         backend_idx: usize,
         socket: UltraSock,
     ) void {
         if (backend_idx >= MAX_BACKENDS or backend_idx >= self.backend_count) {
-            // Cannot pool connection to non-existent backend
             var sock = socket;
             sock.close_blocking();
             return;
         }
 
-        self.mutex.lock();
-        const pushed = self.pools[backend_idx].push(socket);
-        self.mutex.unlock();
-
-        if (!pushed) {
-            // Limit pool size to prevent unbounded memory growth
+        if (!self.pools[backend_idx].push(socket)) {
+            // Pool full - close excess connection
             var sock = socket;
             sock.close_blocking();
         }

@@ -464,9 +464,7 @@ fn streamingProxyHttp2(
     defer h2_conn.deinit();
 
     // Connect and perform h2 handshake (connection preface + SETTINGS)
-    // Force HTTP/2 protocol since we already know ALPN negotiated h2
-    // (socket copy may have invalidated negotiated_alpn pointer)
-    h2_conn.connectWithProtocol(&proxy_state.sock, ctx.io, .http2) catch |err| {
+    h2_conn.connect(&proxy_state.sock, ctx.io) catch |err| {
         log.err("[REQ {d}] HTTP/2 connection failed: {}", .{ req_id, err });
         proxy_state.sock.close_blocking();
         return ProxyError.ConnectionFailed;
