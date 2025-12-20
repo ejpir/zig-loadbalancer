@@ -76,8 +76,8 @@ pub const TlsOptions = struct {
         };
     }
 
-    /// Check if this config skips verification (for logging warnings)
-    pub fn isInsecure(self: TlsOptions) bool {
+    /// Check if this config skips verification (inlined - called during connection setup)
+    pub inline fn isInsecure(self: TlsOptions) bool {
         return self.ca == .none;
     }
 
@@ -116,6 +116,10 @@ var global_ca_bundle: ?tls.config.cert.Bundle = null;
 var ca_bundle_loaded: bool = false;
 
 pub const UltraSock = struct {
+    /// Negotiated application protocol (copy-safe enum, not slice pointer)
+    /// TigerStyle: enum is value type, survives struct copy without dangling pointer
+    pub const AppProtocol = enum { unknown, http1_1, http2 };
+
     stream: ?Io.net.Stream = null,
     tls_conn: ?tls.Connection = null,
     io: ?Io = null,
@@ -132,8 +136,7 @@ pub const UltraSock = struct {
 
     // TLS diagnostic for capturing negotiated ALPN
     tls_diagnostic: tls.config.Client.Diagnostic = .{},
-    /// Negotiated ALPN protocol (e.g., "h2" for HTTP/2)
-    negotiated_alpn: ?[]const u8 = null,
+    negotiated_protocol: AppProtocol = .unknown,
 
     /// Initialize a new UltraSock with default TLS options (production)
     pub fn init(protocol: Protocol, host: []const u8, port: u16) UltraSock {
@@ -302,8 +305,12 @@ pub const UltraSock = struct {
             return error.TlsHandshakeFailed;
         };
 
-        // Capture negotiated ALPN protocol from diagnostic
-        self.negotiated_alpn = self.tls_diagnostic.negotiated_alpn;
+        // Convert ALPN to copy-safe enum (TigerStyle: no dangling pointers after copy)
+        if (self.tls_diagnostic.negotiated_alpn) |alpn| {
+            self.negotiated_protocol = if (std.mem.eql(u8, alpn, "h2")) .http2 else .http1_1;
+        } else {
+            self.negotiated_protocol = .http1_1;
+        }
 
         // Log TLS connection details
         const cipher_name = @tagName(self.tls_conn.?.cipher);
@@ -339,7 +346,7 @@ pub const UltraSock = struct {
             tls_log.info("  Host: {s}:{}", .{ self.host, self.port });
             tls_log.info("  Version: {s}", .{tls_version});
             tls_log.info("  Cipher Suite: {s}", .{cipher_name});
-            tls_log.info("  ALPN Protocol: {s}", .{self.negotiated_alpn orelse "none"});
+            tls_log.info("  ALPN Protocol: {s}", .{@tagName(self.negotiated_protocol)});
             tls_log.info("  CA Verification: {s}", .{ca_mode});
             tls_log.info("  Host Verification: {s}", .{host_mode});
             if (ca_bundle_loaded) {
@@ -348,8 +355,8 @@ pub const UltraSock = struct {
                 }
             }
         } else {
-            const alpn_info = self.negotiated_alpn orelse "http/1.1";
-            log.info("TLS established {s}:{} ({s}, {s})", .{ self.host, self.port, cipher_name, alpn_info });
+            const alpn_name = @tagName(self.negotiated_protocol);
+            log.info("TLS established {s}:{} ({s}, {s})", .{ self.host, self.port, cipher_name, alpn_name });
         }
     }
 
@@ -688,17 +695,15 @@ pub const UltraSock = struct {
         return false;
     }
 
-    /// Check if this is a TLS connection
-    pub fn isTls(self: *const UltraSock) bool {
+    /// Check if this is a TLS connection (inlined - hot path)
+    pub inline fn isTls(self: *const UltraSock) bool {
         return self.tls_conn != null;
     }
 
-    /// Check if HTTP/2 was negotiated via ALPN
-    pub fn isHttp2(self: *const UltraSock) bool {
-        if (self.negotiated_alpn) |alpn| {
-            return std.mem.eql(u8, alpn, "h2");
-        }
-        return false;
+    /// Check if HTTP/2 was negotiated via ALPN (inlined - hot path)
+    /// TigerStyle: simple enum comparison, no string parsing
+    pub inline fn isHttp2(self: *const UltraSock) bool {
+        return self.negotiated_protocol == .http2;
     }
 
     /// Initialize with HTTP/2 ALPN negotiation (zero allocation)

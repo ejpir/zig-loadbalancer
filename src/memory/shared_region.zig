@@ -52,18 +52,18 @@ pub const SharedBackend = extern struct {
         self.host[copy_len] = 0; // Null terminate
     }
 
-    /// Check if backend is configured (non-empty)
-    pub fn isConfigured(self: *const SharedBackend) bool {
+    /// Check if backend is configured (inlined - simple field check)
+    pub inline fn isConfigured(self: *const SharedBackend) bool {
         return self.host[0] != 0 and self.port != 0;
     }
 
-    /// Check if backend uses HTTPS (for UltraSock compatibility)
-    pub fn isHttps(self: *const SharedBackend) bool {
+    /// Check if backend uses HTTPS (inlined - simple field check)
+    pub inline fn isHttps(self: *const SharedBackend) bool {
         return self.use_tls or self.port == 443;
     }
 
-    /// Get full host (same as getHost for SharedBackend, for UltraSock compatibility)
-    pub fn getFullHost(self: *const SharedBackend) []const u8 {
+    /// Get full host (inlined - delegates to getHost)
+    pub inline fn getFullHost(self: *const SharedBackend) []const u8 {
         return self.getHost();
     }
 };
