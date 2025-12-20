@@ -18,9 +18,10 @@ cleanup() {
 # Set up signal handlers
 trap cleanup SIGINT SIGTERM
 
-# Change to script directory
+# Change to project root (parent of scripts/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+cd "$PROJECT_ROOT"
 
 echo "Building load balancer and backends..."
 zig build
@@ -30,9 +31,6 @@ if [ $? -ne 0 ]; then
     echo "Build failed. Exiting."
     exit 1
 fi
-
-# Create logs directory if it doesn't exist
-mkdir -p logs
 
 echo "Starting backend servers..."
 
