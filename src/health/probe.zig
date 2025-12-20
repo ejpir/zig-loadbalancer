@@ -82,7 +82,8 @@ fn probeBackend(backend: *const types.BackendServer, config: Config, io: Io) boo
 
     log.debug("Probing {s}:{d} (https={})", .{ host, backend.port, is_https });
 
-    // Create UltraSock from backend (uses runtime TLS config for --insecure flag)
+    // Create UltraSock from backend - use HTTP/1.1 only for health probes
+    // Health probes are simple and don't benefit from HTTP/2 complexity
     var sock = UltraSock.fromBackendServer(backend);
     defer sock.close_blocking();
 
@@ -273,10 +274,10 @@ test "probeBackend: TLS options with insecure mode" {
     var sock = UltraSock.fromBackendServerWithTls(&backend, insecure_opts);
     defer sock.deinit();
 
-    // Verify insecure options
+    // Verify insecure options - CA skipped but SNI still sent for routing
     try testing.expect(sock.tls_options.isInsecure());
     try testing.expectEqual(@as(TlsOptions.CaVerification, .none), sock.tls_options.ca);
-    try testing.expectEqual(@as(TlsOptions.HostVerification, .none), sock.tls_options.host);
+    try testing.expectEqual(@as(TlsOptions.HostVerification, .from_connection), sock.tls_options.host);
 }
 
 test "probeBackend: TLS options with production mode" {

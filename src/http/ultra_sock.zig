@@ -40,6 +40,9 @@ pub const TlsOptions = struct {
 
     ca: CaVerification = .system,
     host: HostVerification = .from_connection,
+    /// ALPN protocols to negotiate (e.g., "h2", "http/1.1")
+    /// First protocol in list is preferred.
+    alpn_protocols: []const []const u8 = &.{},
 
     /// Create TlsOptions from config.zig defaults
     /// Uses DEFAULT_TLS_VERIFY_CA and DEFAULT_TLS_VERIFY_HOST
@@ -65,16 +68,41 @@ pub const TlsOptions = struct {
     }
 
     /// Insecure preset: skip all verification (local dev only)
+    /// Still sends SNI (required for virtual hosts/CDNs), just doesn't verify certificate hostname
     pub fn insecure() TlsOptions {
         return .{
             .ca = .none,
-            .host = .none,
+            .host = .from_connection, // Send SNI for routing, skip verification via ca = .none
         };
     }
 
     /// Check if this config skips verification (for logging warnings)
     pub fn isInsecure(self: TlsOptions) bool {
-        return self.ca == .none or self.host == .none;
+        return self.ca == .none;
+    }
+
+    /// Production preset with HTTP/2 ALPN negotiation
+    pub fn productionWithHttp2() TlsOptions {
+        return .{
+            .ca = .system,
+            .host = .from_connection,
+            .alpn_protocols = &.{ "h2", "http/1.1" },
+        };
+    }
+
+    /// Insecure preset with HTTP/2 ALPN (local dev only)
+    /// Still sends SNI (required for virtual hosts/CDNs), just doesn't verify certificate hostname
+    pub fn insecureWithHttp2() TlsOptions {
+        return .{
+            .ca = .none,
+            .host = .from_connection, // Send SNI for routing, skip verification via ca = .none
+            .alpn_protocols = &.{ "h2", "http/1.1" },
+        };
+    }
+
+    /// Get TLS options with HTTP/2 based on runtime config
+    pub fn fromRuntimeWithHttp2() TlsOptions {
+        return if (config_mod.isInsecureTls()) insecureWithHttp2() else productionWithHttp2();
     }
 };
 
@@ -101,6 +129,11 @@ pub const UltraSock = struct {
     stream_reader: Io.net.Stream.Reader = undefined,
     stream_writer: Io.net.Stream.Writer = undefined,
     has_reader_writer: bool = false,
+
+    // TLS diagnostic for capturing negotiated ALPN
+    tls_diagnostic: tls.config.Client.Diagnostic = .{},
+    /// Negotiated ALPN protocol (e.g., "h2" for HTTP/2)
+    negotiated_alpn: ?[]const u8 = null,
 
     /// Initialize a new UltraSock with default TLS options (production)
     pub fn init(protocol: Protocol, host: []const u8, port: u16) UltraSock {
@@ -250,10 +283,14 @@ pub const UltraSock = struct {
         const now = try Io.Clock.real.now(io);
         log.debug("Starting TLS handshake with {s}:{}", .{ self.host, self.port });
 
+        // Reset diagnostic for this connection
+        self.tls_diagnostic = .{};
+
         const client_opts = try buildTlsClientOptions(
             self.tls_options,
             self.host,
             now,
+            &self.tls_diagnostic,
         );
 
         self.tls_conn = tls.client(
@@ -264,6 +301,9 @@ pub const UltraSock = struct {
             log.err("TLS handshake failed: {}", .{err});
             return error.TlsHandshakeFailed;
         };
+
+        // Capture negotiated ALPN protocol from diagnostic
+        self.negotiated_alpn = self.tls_diagnostic.negotiated_alpn;
 
         // Log TLS connection details
         const cipher_name = @tagName(self.tls_conn.?.cipher);
@@ -299,6 +339,7 @@ pub const UltraSock = struct {
             tls_log.info("  Host: {s}:{}", .{ self.host, self.port });
             tls_log.info("  Version: {s}", .{tls_version});
             tls_log.info("  Cipher Suite: {s}", .{cipher_name});
+            tls_log.info("  ALPN Protocol: {s}", .{self.negotiated_alpn orelse "none"});
             tls_log.info("  CA Verification: {s}", .{ca_mode});
             tls_log.info("  Host Verification: {s}", .{host_mode});
             if (ca_bundle_loaded) {
@@ -307,7 +348,8 @@ pub const UltraSock = struct {
                 }
             }
         } else {
-            log.info("TLS established {s}:{} ({s})", .{ self.host, self.port, cipher_name });
+            const alpn_info = self.negotiated_alpn orelse "http/1.1";
+            log.info("TLS established {s}:{} ({s}, {s})", .{ self.host, self.port, cipher_name, alpn_info });
         }
     }
 
@@ -330,6 +372,7 @@ pub const UltraSock = struct {
         tls_options: TlsOptions,
         host: []const u8,
         now: Io.Timestamp,
+        diagnostic: ?*tls.config.Client.Diagnostic,
     ) !tls.config.Client {
         return tls.config.Client{
             .host = switch (tls_options.host) {
@@ -344,6 +387,8 @@ pub const UltraSock = struct {
             },
             .insecure_skip_verify = tls_options.ca == .none,
             .now = now,
+            .alpn_protocols = tls_options.alpn_protocols,
+            .diagnostic = diagnostic,
         };
     }
 
@@ -648,6 +693,19 @@ pub const UltraSock = struct {
         return self.tls_conn != null;
     }
 
+    /// Check if HTTP/2 was negotiated via ALPN
+    pub fn isHttp2(self: *const UltraSock) bool {
+        if (self.negotiated_alpn) |alpn| {
+            return std.mem.eql(u8, alpn, "h2");
+        }
+        return false;
+    }
+
+    /// Initialize with HTTP/2 ALPN negotiation (zero allocation)
+    pub fn initWithHttp2(protocol: Protocol, host: []const u8, port: u16) UltraSock {
+        return initWithTls(protocol, host, port, TlsOptions.fromRuntimeWithHttp2());
+    }
+
     /// Create from backend config (zero allocation)
     pub fn fromBackendConfig(backend: anytype) UltraSock {
         return fromBackendConfigWithTls(backend, TlsOptions.fromRuntime());
@@ -671,6 +729,11 @@ pub const UltraSock = struct {
     /// Create from BackendServer struct (zero allocation)
     pub fn fromBackendServer(backend: anytype) UltraSock {
         return fromBackendServerWithTls(backend, TlsOptions.fromRuntime());
+    }
+
+    /// Create from BackendServer struct with HTTP/2 ALPN negotiation (zero allocation)
+    pub fn fromBackendServerWithHttp2(backend: anytype) UltraSock {
+        return fromBackendServerWithTls(backend, TlsOptions.fromRuntimeWithHttp2());
     }
 
     /// Create from BackendServer struct with explicit TLS options (zero allocation)
@@ -758,7 +821,7 @@ test "TlsOptions: fromRuntime returns insecure when flag is set" {
     // Get options from runtime
     const opts = TlsOptions.fromRuntime();
 
-    // Verify CA verification is none (insecure)
+    // Verify CA verification is none (insecure), but SNI still sent for routing
     try std.testing.expectEqual(@as(TlsOptions.CaVerification, .none), opts.ca);
-    try std.testing.expectEqual(@as(TlsOptions.HostVerification, .none), opts.host);
+    try std.testing.expectEqual(@as(TlsOptions.HostVerification, .from_connection), opts.host);
 }

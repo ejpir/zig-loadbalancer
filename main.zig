@@ -196,10 +196,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             if (i + 1 < args.len) {
                 const backend_str = args[i + 1];
                 if (std.mem.lastIndexOf(u8, backend_str, ":")) |colon| {
-                    const backend_host = try allocator.dupe(
-                        u8,
-                        backend_str[0..colon],
-                    );
+                    const backend_host = try allocator.dupe(u8, backend_str[0..colon]);
                     const port_str = backend_str[colon + 1 ..];
                     const backend_port = try std.fmt.parseInt(u16, port_str, 10);
                     try backend_list.append(
@@ -301,11 +298,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     if (backend_list.items.len == 0) {
         try backend_list.append(
             allocator,
-            .{ .host = "127.0.0.1", .port = 9001 },
+            .{ .host = try allocator.dupe(u8, "127.0.0.1"), .port = 9001 },
         );
         try backend_list.append(
             allocator,
-            .{ .host = "127.0.0.1", .port = 9002 },
+            .{ .host = try allocator.dupe(u8, "127.0.0.1"), .port = 9002 },
         );
     }
 
@@ -327,6 +324,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
 }
 
 fn freeConfig(allocator: std.mem.Allocator, config: Config) void {
+    // Free each allocated backend host string
+    for (config.lbConfig.backends) |backend| {
+        allocator.free(backend.host);
+    }
     allocator.free(config.lbConfig.backends);
 }
 
