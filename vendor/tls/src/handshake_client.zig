@@ -69,6 +69,10 @@ pub const Options = struct {
 
     session_resumption: ?*SessionResumption = null,
 
+    /// ALPN protocols to negotiate (e.g., "h2", "http/1.1")
+    /// First protocol in list is preferred.
+    alpn_protocols: []const []const u8 = &.{},
+
     pub const Diagnostic = struct {
         tls_version: proto.Version = @enumFromInt(0),
         cipher_suite_tag: CipherSuite = @enumFromInt(0),
@@ -79,6 +83,10 @@ pub const Options = struct {
         max_server_record_len: usize = 0,
         max_server_cleartext_len: usize = 0,
         max_client_record_len: usize = 0,
+        /// Buffer for negotiated ALPN (owns the data)
+        alpn_buf: [256]u8 = undefined,
+        /// Negotiated ALPN protocol (e.g., "h2" for HTTP/2)
+        negotiated_alpn: ?[]const u8 = null,
     };
 
     /// Collects and stores session resumption tickets.
@@ -229,6 +237,10 @@ pub const Handshake = struct {
     server_pub_key_buf: [1120]u8 = undefined,
     server_pub_key: []const u8 = undefined,
     pre_shared_selected_identity: ?u16 = null,
+    /// Buffer for negotiated ALPN protocol (max 255 bytes per RFC 7301)
+    alpn_buf: [256]u8 = undefined,
+    /// Negotiated ALPN protocol from server
+    negotiated_alpn: ?[]const u8 = null,
     // statistics
     max_server_record_len: usize = 0,
     max_server_cleartext_len: usize = 0,
@@ -465,6 +477,7 @@ pub const Handshake = struct {
         try w.extension(.supported_groups, opt.named_groups);
         try w.keyShare(opt.named_groups, shared_keys);
         try w.serverName(opt.host);
+        try w.alpn(opt.alpn_protocols);
         // binder key placeholder
         const binder_pos: ?usize = if (resumption_ticket) |ticket| brk: {
             // Add pre shared key extension if this is session resumption. Must be last extension.
@@ -603,6 +616,17 @@ pub const Handshake = struct {
                     .pre_shared_key => {
                         h.pre_shared_selected_identity = try d.decode(u16);
                     },
+                    .application_layer_protocol_negotiation => {
+                        // ALPN response: u16 list_len, u8 proto_len, proto_name
+                        const list_len = try d.decode(u16);
+                        if (list_len > 0) {
+                            const proto_len = try d.decode(u8);
+                            // Copy ALPN to persistent buffer
+                            h.negotiated_alpn = try common.dupe(&h.alpn_buf, try d.slice(proto_len));
+                        }
+                        // Skip any remaining (shouldn't be any)
+                        if (len > list_len + 2) try d.skip(len - list_len - 2);
+                    },
                     else => {
                         try d.skip(len);
                     },
@@ -627,6 +651,39 @@ pub const Handshake = struct {
         h.cert.signature_scheme = try d.decode(proto.SignatureScheme);
         h.cert.signature = try common.dupe(&h.cert.signature_buf, try d.slice(try d.decode(u16)));
         if (curve_type != .named_curve) return error.TlsIllegalParameter;
+    }
+
+    /// Parse EncryptedExtensions message (TLS 1.3)
+    /// Extracts ALPN protocol if present
+    fn parseEncryptedExtensions(h: *Self, d: *record.Decoder, length: u24) !void {
+        const extensions_end = d.idx + length;
+        const extensions_len = try d.decode(u16);
+        const extensions_data_end = d.idx + extensions_len;
+
+        while (d.idx < extensions_data_end) {
+            const ext_type = try d.decode(proto.Extension);
+            const ext_len = try d.decode(u16);
+
+            if (ext_type == .application_layer_protocol_negotiation) {
+                // Parse ALPN extension
+                const list_len = try d.decode(u16);
+                if (list_len > 0) {
+                    const proto_len = try d.decode(u8);
+                    // Copy ALPN to persistent buffer (slice would be invalidated)
+                    h.negotiated_alpn = try common.dupe(&h.alpn_buf, try d.slice(proto_len));
+                }
+                // Skip any remaining in this extension
+                if (ext_len > list_len + 2) try d.skip(ext_len - list_len - 2);
+            } else {
+                // Skip unknown extensions
+                try d.skip(ext_len);
+            }
+        }
+
+        // Skip any remaining bytes in the message
+        if (d.idx < extensions_end) {
+            try d.skip(extensions_end - d.idx);
+        }
     }
 
     /// Read encrypted part (after server hello) of the server first flight
@@ -679,7 +736,8 @@ pub const Handshake = struct {
                         }
                         switch (handshake_type) {
                             .encrypted_extensions => {
-                                try d.skip(length);
+                                // Parse encrypted extensions for ALPN (TLS 1.3)
+                                try h.parseEncryptedExtensions(&d, length);
                                 handshake_states = if (is_session_resumption)
                                     &.{ .certificate_request, .certificate, .finished }
                                 else if (h.cert.skip_verify)
@@ -895,6 +953,15 @@ pub const Handshake = struct {
             d.max_server_record_len = h.max_server_record_len;
             d.max_server_cleartext_len = h.max_server_cleartext_len;
             d.max_client_record_len = h.max_client_record_len;
+            // Copy ALPN to Diagnostic's own buffer (Handshake buffer will be destroyed)
+            if (h.negotiated_alpn) |alpn| {
+                if (alpn.len <= d.alpn_buf.len) {
+                    @memcpy(d.alpn_buf[0..alpn.len], alpn);
+                    d.negotiated_alpn = d.alpn_buf[0..alpn.len];
+                }
+            } else {
+                d.negotiated_alpn = null;
+            }
             if (opt.auth) |a|
                 d.client_signature_scheme = a.key.signature_scheme;
         }

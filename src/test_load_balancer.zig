@@ -25,6 +25,13 @@ pub const shared_region = @import("memory/shared_region.zig");
 // HTTP module tests
 pub const http_utils = @import("http/http_utils.zig");
 pub const ultra_sock = @import("http/ultra_sock.zig");
+pub const backend_conn = @import("http/backend_conn.zig");
+
+// HTTP/2 module tests
+pub const http2_mod = @import("http/http2/mod.zig");
+pub const http2_frame = @import("http/http2/frame.zig");
+pub const http2_hpack = @import("http/http2/hpack.zig");
+pub const http2_client = @import("http/http2/client.zig");
 
 // Internal module tests
 pub const simd_parse = @import("internal/simd_parse.zig");
@@ -55,6 +62,11 @@ comptime {
     _ = shared_region;
     _ = http_utils;
     _ = ultra_sock;
+    _ = backend_conn;
+    _ = http2_mod;
+    _ = http2_frame;
+    _ = http2_hpack;
+    _ = http2_client;
     _ = simd_parse;
     _ = config;
     _ = config_watcher;

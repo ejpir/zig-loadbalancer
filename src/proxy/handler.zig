@@ -31,6 +31,7 @@ const tls = @import("tls");
 const proxy_connection = @import("connection.zig");
 const proxy_request = @import("request.zig");
 const proxy_io = @import("io.zig");
+const BackendConnection = @import("../http/backend_conn.zig").BackendConnection;
 
 const MAX_BACKENDS = config.MAX_BACKENDS;
 const MAX_HEADER_BYTES = config.MAX_HEADER_BYTES;
@@ -61,6 +62,7 @@ pub const ProxyState = struct {
     from_pool: bool,
     can_return_to_pool: bool,
     is_tls: bool,
+    is_http2: bool,
     tls_conn_ptr: ?*tls.Connection,
     status_code: u16,
     bytes_from_backend: u32,
@@ -285,7 +287,12 @@ inline fn streamingProxy(
     // TigerStyle: validate state after acquisition.
     proxy_state.assertValid();
 
-    // Phase 2: Send request.
+    // Route to HTTP/2 handler if ALPN negotiated h2
+    if (proxy_state.is_http2) {
+        return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
+    }
+
+    // Phase 2: Send request (HTTP/1.1 path).
     proxy_request.sendRequest(
         types.BackendServer,
         ctx,
@@ -380,7 +387,12 @@ inline fn streamingProxyShared(
 
     proxy_state.assertValid();
 
-    // Phase 2: Send request.
+    // Route to HTTP/2 handler if ALPN negotiated h2
+    if (proxy_state.is_http2) {
+        return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
+    }
+
+    // Phase 2: Send request (HTTP/1.1 path).
     proxy_request.sendRequest(
         shared_region.SharedBackend,
         ctx,
@@ -428,6 +440,107 @@ inline fn streamingProxyShared(
     proxy_io.streamBody(ctx, &proxy_state, header_end, header_len, msg_len, req_id);
 
     return streamingProxy_finalize(ctx, &proxy_state, state, backend_idx, start_ns, req_id);
+}
+
+// ============================================================================
+// HTTP/2 Streaming Proxy (uses BackendConnection wrapper)
+// ============================================================================
+
+/// HTTP/2 proxy implementation - uses BackendConnection for h2 framing.
+/// Generic over backend type to support both BackendServer and SharedBackend.
+fn streamingProxyHttp2(
+    ctx: *const http.Context,
+    backend: anytype,
+    proxy_state: *ProxyState,
+    state: *WorkerState,
+    backend_idx: u32,
+    start_ns: ?std.time.Instant,
+    req_id: u32,
+) ProxyError!http.Respond {
+    log.debug("[REQ {d}] Using HTTP/2 for backend {d}", .{ req_id, backend_idx });
+
+    // Initialize HTTP/2 connection wrapper
+    var h2_conn = BackendConnection.init(std.heap.page_allocator);
+    defer h2_conn.deinit();
+
+    // Connect and perform h2 handshake (connection preface + SETTINGS)
+    // Force HTTP/2 protocol since we already know ALPN negotiated h2
+    // (socket copy may have invalidated negotiated_alpn pointer)
+    h2_conn.connectWithProtocol(&proxy_state.sock, ctx.io, .http2) catch |err| {
+        log.err("[REQ {d}] HTTP/2 connection failed: {}", .{ req_id, err });
+        proxy_state.sock.close_blocking();
+        return ProxyError.ConnectionFailed;
+    };
+
+    // Build request parameters
+    const method = @tagName(ctx.request.method orelse .GET);
+    const path = ctx.request.uri orelse "/";
+    const host = backend.getFullHost();
+
+    // Send HTTP/2 request and get response
+    var response = h2_conn.sendRequest(
+        ctx.io,
+        method,
+        path,
+        host,
+        &.{}, // Additional headers - could extract from ctx.request.headers
+        ctx.request.body,
+    ) catch |err| {
+        log.err("[REQ {d}] HTTP/2 request failed: {}", .{ req_id, err });
+        proxy_state.sock.close_blocking();
+        return ProxyError.SendFailed;
+    };
+    defer response.deinit(std.heap.page_allocator);
+
+    // Update proxy state with response info
+    proxy_state.status_code = response.status;
+    proxy_state.bytes_from_backend = @intCast(response.body.len);
+
+    // Handle invalid/missing status code
+    if (response.status == 0) {
+        log.err("[REQ {d}] HTTP/2 response has invalid status: 0", .{req_id});
+        proxy_state.sock.close_blocking();
+        return ProxyError.InvalidResponse;
+    }
+
+    // Forward response to client
+    const client_writer = ctx.writer;
+    // Convert status code - use 502 for invalid status codes from backend
+    const status: http.Status = std.meta.intToEnum(http.Status, response.status) catch .@"Bad Gateway";
+    var http_response = ctx.response;
+    http_response.status = status;
+    http_response.mime = http.Mime.HTML; // Default to HTML for HTTP/2 responses
+
+    // Write response headers
+    http_response.headers_into_writer_opts(client_writer, response.body.len, true) catch {
+        proxy_state.client_write_error = true;
+        proxy_state.sock.close_blocking();
+        return ProxyError.SendFailed;
+    };
+
+    // Write response body
+    if (response.body.len > 0) {
+        client_writer.writeAll(response.body) catch {
+            proxy_state.client_write_error = true;
+        };
+    }
+    client_writer.flush() catch {
+        proxy_state.client_write_error = true;
+    };
+
+    proxy_state.bytes_to_client = @intCast(response.body.len);
+
+    log.debug("[REQ {d}] HTTP/2 response: status={d} body={d} bytes", .{
+        req_id,
+        response.status,
+        response.body.len,
+    });
+
+    // HTTP/2 connections can be reused for multiple streams, but for simplicity
+    // we don't pool them yet (would need HTTP/2 connection pooling)
+    proxy_state.can_return_to_pool = false;
+
+    return streamingProxy_finalize(ctx, proxy_state, state, backend_idx, start_ns, req_id);
 }
 
 // ============================================================================

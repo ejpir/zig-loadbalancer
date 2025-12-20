@@ -2,6 +2,7 @@
 ///
 /// Handles connection acquisition from pool or fresh creation.
 /// Uses generic implementation to deduplicate BackendServer vs SharedBackend paths.
+/// Supports both HTTP/1.1 and HTTP/2 via ALPN negotiation.
 ///
 /// TigerStyle compliance:
 /// - Functions <70 lines
@@ -59,11 +60,13 @@ pub fn acquireConnection(
         std.debug.assert(pooled_sock.stream != null);
 
         // Build proxy_state, then get tls_conn_ptr from COPIED sock (not local).
+        // Pooled connections preserve their protocol from initial negotiation.
         var proxy_state = ProxyState{
             .sock = pooled_sock,
             .from_pool = true,
             .can_return_to_pool = true,
             .is_tls = pooled_sock.isTls(),
+            .is_http2 = pooled_sock.isHttp2(),
             .tls_conn_ptr = null, // Set after copy to avoid dangling pointer.
             .status_code = 0,
             .bytes_from_backend = 0,
@@ -81,12 +84,18 @@ pub fn acquireConnection(
     metrics.global_metrics.recordPoolMissForBackend(backend_idx);
     log.debug("[REQ {d}] POOL MISS backend={d}", .{ req_id, backend_idx });
 
-    // UltraSock.fromBackendServer uses duck typing (anytype) so any backend type works
-    var sock = UltraSock.fromBackendServer(backend);
+    // Use HTTP/2 ALPN for HTTPS backends (enables protocol negotiation)
+    // UltraSock.fromBackendServerWithHttp2 uses duck typing (anytype) so any backend type works
+    var sock = UltraSock.fromBackendServerWithHttp2(backend);
     sock.connect(ctx.io) catch {
         sock.close_blocking();
         return ProxyError.BackendUnavailable;
     };
+
+    // Log negotiated protocol
+    if (sock.isHttp2()) {
+        log.debug("[REQ {d}] HTTP/2 negotiated with backend {d}", .{ req_id, backend_idx });
+    }
 
     // TigerStyle: pair assertion - validate fresh connection.
     if (sock.stream == null) {
@@ -95,11 +104,14 @@ pub fn acquireConnection(
     }
 
     // Build proxy_state, then get tls_conn_ptr from COPIED sock (not local).
+    // is_http2 is set based on ALPN negotiation result.
+    const negotiated_http2 = sock.isHttp2();
     var proxy_state = ProxyState{
         .sock = sock,
         .from_pool = false,
         .can_return_to_pool = true,
         .is_tls = sock.isTls(),
+        .is_http2 = negotiated_http2,
         .tls_conn_ptr = null, // Set after copy to avoid dangling pointer.
         .status_code = 0,
         .bytes_from_backend = 0,
