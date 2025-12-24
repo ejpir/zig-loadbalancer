@@ -528,13 +528,14 @@ pub const Http2Client = struct {
             const was_clean_shutdown = shutdown_requested.*;
             log.debug("readerTask: exiting, shutdown_requested={}", .{was_clean_shutdown});
 
-            // On unclean shutdown (GOAWAY, error): send close_notify and mark dead
-            // DO NOT close socket here - deinitAsync will do it after awaiting us
-            // This prevents race where deinitAsync tries to send close_notify on closed socket
+            // On unclean shutdown (GOAWAY, error): send close_notify, close socket, mark dead
+            // We MUST close the socket here - backend is waiting for TCP FIN after close_notify
+            // deinitAsync will check state==dead and skip all socket operations
             if (!was_clean_shutdown) {
                 state.* = .dead;
                 sock.sendCloseNotify(io);
-                log.debug("readerTask: sent close_notify, marked dead", .{});
+                sock.closeSocketOnly();
+                log.debug("readerTask: sent close_notify, closed socket, marked dead", .{});
             }
 
             // Now signal waiting streams and update state
