@@ -1,15 +1,26 @@
 //! HTTP/2 Client for Load Balancer Backend Connections
 //!
-//! Provides HTTP/2 protocol support for connecting to backend servers.
-//! Integrates with UltraSock for transport (HTTP or HTTPS).
+//! Provides HTTP/2 protocol support with stream multiplexing.
+//! Uses a write queue pattern for safe concurrent access:
+//! - sendRequest() queues frames to a buffer (no IO)
+//! - flush() writes all queued frames in single TLS write
 //!
-//! Usage:
+//! Usage (single request):
 //!   var client = Http2Client.init(allocator);
 //!   try client.connect(&sock, io);
-//!   const stream_id = try client.sendRequest(&sock, io, "GET", "/api", "backend.com", null);
+//!   const stream_id = try client.sendRequest("GET", "/api", "backend.com", null);
+//!   try client.flush(&sock, io);
 //!   const response = try client.readResponse(&sock, io, stream_id);
+//!
+//! Usage (multiplexed - queue multiple then flush once):
+//!   const s1 = try client.sendRequest("GET", "/a", host, null);
+//!   const s2 = try client.sendRequest("GET", "/b", host, null);
+//!   try client.flush(&sock, io);  // Single TLS write for both
+//!   const r1 = try client.readResponse(&sock, io, s1);
+//!   const r2 = try client.readResponse(&sock, io, s2);
 
 const std = @import("std");
+const posix = std.posix;
 const log = std.log.scoped(.http2_client);
 
 const frame = @import("frame.zig");
@@ -19,7 +30,48 @@ const UltraSock = @import("../ultra_sock.zig").UltraSock;
 
 const Io = std.Io;
 
-/// HTTP/2 Client State
+// Import shared connection state enum
+pub const State = mod.ConnectionState;
+
+/// Maximum concurrent streams per connection
+const MAX_STREAMS: usize = 8;
+
+/// Per-stream state for multiplexing
+pub const Stream = struct {
+    id: u31 = 0, // HTTP/2 stream ID
+    active: bool = false,
+    status: u16 = 0,
+    headers: [32]hpack.Header = undefined,
+    header_count: usize = 0,
+    body: std.ArrayList(u8) = .{},
+    end_stream: bool = false,
+
+    // Async signaling (replaces pipes)
+    condition: Io.Condition = .{},
+    completed: bool = false,
+    error_code: ?u32 = null,
+    retry_needed: bool = false, // Set when GOAWAY indicates stream wasn't processed
+
+    pub fn reset(self: *Stream) void {
+        self.id = 0;
+        self.active = false;
+        self.status = 0;
+        self.header_count = 0;
+        self.end_stream = false;
+        self.completed = false;
+        self.error_code = null;
+        self.retry_needed = false;
+        self.condition = .{};
+        // Don't deinit body - reuse capacity
+        self.body.items.len = 0;
+    }
+};
+
+/// Write buffer size - enough for multiple frames
+/// Max frame is 16KB + 9 byte header, we allow batching several
+const WRITE_BUFFER_SIZE: usize = 32768;
+
+/// HTTP/2 Client State with multiplexing support
 pub const Http2Client = struct {
     allocator: std.mem.Allocator,
     next_stream_id: u31 = 1, // Client uses odd stream IDs
@@ -29,6 +81,16 @@ pub const Http2Client = struct {
     connection_window: i64 = mod.INITIAL_WINDOW_SIZE,
     settings_acked: bool = false,
     preface_sent: bool = false,
+    goaway_received: bool = false, // GOAWAY received - no new streams allowed
+
+    /// Pending streams for multiplexing (fixed-size, no allocation)
+    streams: [MAX_STREAMS]Stream = [_]Stream{.{}} ** MAX_STREAMS,
+    active_streams: usize = 0,
+
+    /// Write buffer for frame batching (enables safe multiplexing)
+    /// Frames are queued here, then flushed in one TLS write
+    write_buffer: [WRITE_BUFFER_SIZE]u8 = undefined,
+    write_len: usize = 0,
 
     const Self = @This();
 
@@ -38,16 +100,55 @@ pub const Http2Client = struct {
         };
     }
 
+    pub fn deinit(self: *Self) void {
+        for (&self.streams) |*s| {
+            // Only deinit if body was actually allocated
+            if (s.body.capacity > 0) {
+                s.body.deinit(self.allocator);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Write Queue - enables safe multiplexing by batching frame writes
+    // =========================================================================
+
+    /// Queue data to write buffer (no IO, just memcpy)
+    fn queueWrite(self: *Self, data: []const u8) !void {
+        if (self.write_len + data.len > WRITE_BUFFER_SIZE) {
+            return error.WriteBufferFull;
+        }
+        @memcpy(self.write_buffer[self.write_len..][0..data.len], data);
+        self.write_len += data.len;
+    }
+
+    /// Flush all queued frames to socket in single TLS write
+    /// This is the ONLY place that writes to the socket, ensuring serialization
+    pub fn flush(self: *Self, sock: *UltraSock, io: Io) !void {
+        if (self.write_len == 0) return;
+
+        _ = try sock.send_all(io, self.write_buffer[0..self.write_len]);
+        self.write_len = 0;
+    }
+
+    /// Check if there's queued data to flush
+    pub fn hasPendingWrites(self: *const Self) bool {
+        return self.write_len > 0;
+    }
+
+    // =========================================================================
+    // Connection Setup
+    // =========================================================================
+
     /// Establish HTTP/2 connection over UltraSock
-    /// Sends connection preface and initial SETTINGS
+    /// Queues and flushes connection preface, then reads server settings
     pub fn connect(self: *Self, sock: *UltraSock, io: Io) !void {
-        // Connection preface
+        // Build connection preface + SETTINGS frame
         var preface_buf: [64]u8 = undefined;
         @memcpy(preface_buf[0..mod.CONNECTION_PREFACE.len], mod.CONNECTION_PREFACE);
 
-        // Initial SETTINGS frame
         const settings = [_]frame.SettingsEntry{
-            .{ .id = mod.Settings.MAX_CONCURRENT_STREAMS, .value = 100 },
+            .{ .id = mod.Settings.MAX_CONCURRENT_STREAMS, .value = MAX_STREAMS },
             .{ .id = mod.Settings.INITIAL_WINDOW_SIZE, .value = mod.INITIAL_WINDOW_SIZE },
             .{ .id = mod.Settings.MAX_FRAME_SIZE, .value = mod.MAX_FRAME_SIZE_DEFAULT },
         };
@@ -55,39 +156,53 @@ pub const Http2Client = struct {
         var settings_buf: [64]u8 = undefined;
         const settings_len = try frame.FrameBuilder.settings(&settings_buf, &settings);
 
-        // Send preface + settings
         const total_len = mod.CONNECTION_PREFACE.len + settings_len;
         @memcpy(preface_buf[mod.CONNECTION_PREFACE.len..][0..settings_len], settings_buf[0..settings_len]);
 
-        _ = try sock.send_all(io, preface_buf[0..total_len]);
+        // Queue and flush immediately (must send before reading server settings)
+        try self.queueWrite(preface_buf[0..total_len]);
+        try self.flush(sock, io);
         self.preface_sent = true;
 
         log.debug("HTTP/2 connection preface sent", .{});
-
-        // Read server's SETTINGS
         try self.readServerSettings(sock, io);
     }
 
-    /// Send HTTP/2 request, returns stream ID
+    /// Queue HTTP/2 request frames, returns stream ID
+    /// Frames are queued to write buffer - caller must call flush() to send
+    /// Can be called multiple times before flushing (multiplexing)
     pub fn sendRequest(
         self: *Self,
-        sock: *UltraSock,
-        io: Io,
         method: []const u8,
         path: []const u8,
         authority: []const u8,
         body: ?[]const u8,
     ) !u31 {
+        // Don't accept new streams after GOAWAY
+        if (self.goaway_received) {
+            return error.ConnectionGoaway;
+        }
+
+        // Find free stream slot
+        const slot = self.findFreeSlot() orelse return error.TooManyStreams;
+
         const stream_id = self.nextStreamId();
-        log.debug("Sending HTTP/2 request: method={s}, path={s}, authority={s}, stream={d}", .{
-            method,
-            path,
-            authority,
-            stream_id,
+        self.streams[slot].id = stream_id;
+        self.streams[slot].active = true;
+        self.streams[slot].end_stream = false;
+        self.streams[slot].status = 0;
+        self.streams[slot].header_count = 0;
+        self.streams[slot].body.items.len = 0;
+        self.streams[slot].completed = false;
+        self.streams[slot].error_code = null;
+        self.active_streams += 1;
+
+        log.debug("Queueing HTTP/2 request: method={s}, path={s}, stream={d}, slot={d}", .{
+            method, path, stream_id, slot,
         });
+
         const end_stream = (body == null);
 
-        // Encode headers with HPACK
         var hpack_buf: [4096]u8 = undefined;
         const hpack_len = try hpack.Hpack.encodeRequest(
             &hpack_buf,
@@ -97,7 +212,6 @@ pub const Http2Client = struct {
             &[_]hpack.Header{},
         );
 
-        // Build HEADERS frame
         var frame_buf: [4096]u8 = undefined;
         const headers_len = try frame.FrameBuilder.headers(
             &frame_buf,
@@ -106,29 +220,24 @@ pub const Http2Client = struct {
             end_stream,
         );
 
-        _ = try sock.send_all(io, frame_buf[0..headers_len]);
-        log.debug("Sent HEADERS frame: stream={d}, end_stream={}", .{ stream_id, end_stream });
+        // Queue HEADERS frame (no IO here)
+        try self.queueWrite(frame_buf[0..headers_len]);
 
-        // Send body if present
+        // Queue DATA frames if body present
         if (body) |data| {
-            try self.sendData(sock, io, stream_id, data, true);
+            try self.queueData(stream_id, data, true);
         }
 
         return stream_id;
     }
 
-    /// Send DATA frame
-    pub fn sendData(
+    /// Queue DATA frames to write buffer (no IO)
+    fn queueData(
         self: *Self,
-        sock: *UltraSock,
-        io: Io,
         stream_id: u31,
         data: []const u8,
         end_stream: bool,
     ) !void {
-        _ = self;
-
-        // Split into frames if needed
         var offset: usize = 0;
         while (offset < data.len) {
             const chunk_size = @min(data.len - offset, mod.MAX_FRAME_SIZE_DEFAULT);
@@ -142,150 +251,173 @@ pub const Http2Client = struct {
                 is_last,
             );
 
-            _ = try sock.send_all(io, frame_buf[0..frame_len]);
+            try self.queueWrite(frame_buf[0..frame_len]);
             offset += chunk_size;
         }
-
-        log.debug("Sent DATA: stream={d}, len={d}, end_stream={}", .{ stream_id, data.len, end_stream });
     }
 
-    /// Read response headers and body
+    /// Read response for a specific stream (blocks until stream completes)
+    /// Handles frame demuxing - frames for other streams are routed correctly
+    ///
+    /// WARNING: This is for SINGLE-STREAM connections only (fresh, non-pooled).
+    /// For multiplexed connections, use H2PooledConnection.awaitResponse() instead,
+    /// which uses the dedicated readerTask to properly dispatch frames to streams.
+    /// Using this function on a pooled connection WILL cause frame corruption.
+    ///
+    /// Internal function - prefer H2PooledConnection.awaitResponse() for pool usage.
     pub fn readResponse(
         self: *Self,
         sock: *UltraSock,
         io: Io,
         stream_id: u31,
     ) !Response {
-        var response = Response{
-            .status = 0,
-            .headers = undefined,
-            .header_count = 0,
-            .body = std.ArrayList(u8){},
+        const slot = self.findStreamSlot(stream_id) orelse return error.StreamNotFound;
+
+        var recv_buf: [mod.MAX_FRAME_SIZE_DEFAULT + 9]u8 = undefined;
+
+        // Read frames until our stream is complete
+        while (!self.streams[slot].end_stream) {
+            try self.readAndRouteFrame(sock, io, &recv_buf);
+        }
+
+        // Build response from stream state
+        const response = Response{
+            .status = self.streams[slot].status,
+            .headers = self.streams[slot].headers,
+            .header_count = self.streams[slot].header_count,
+            .body = self.streams[slot].body,
             .allocator = self.allocator,
         };
 
-        var recv_buf: [mod.MAX_FRAME_SIZE_DEFAULT + 9]u8 = undefined;
-        var end_stream = false;
-
-        while (!end_stream) {
-            // Read frame header
-            var header_buf: [9]u8 = undefined;
-            var header_read: usize = 0;
-            while (header_read < 9) {
-                const n = try sock.recv(io, header_buf[header_read..]);
-                if (n == 0) return error.ConnectionClosed;
-                header_read += n;
-            }
-
-            const fh = try frame.FrameHeader.parse(&header_buf);
-            // END_STREAM flag (0x01) only applies to DATA and HEADERS frames
-            // For SETTINGS, flag 0x01 means ACK (not end_stream)
-            const frame_type = frame.FrameType.fromU8(fh.frame_type);
-            if (frame_type == .data or frame_type == .headers) {
-                if (fh.isEndStream()) {
-                    end_stream = true;
-                }
-            }
-            log.debug("Received frame: type={d}, stream={d}, len={d}, flags=0x{x:0>2}, end_stream={}", .{
-                fh.frame_type,
-                fh.stream_id,
-                fh.length,
-                fh.flags,
-                end_stream,
-            });
-
-            // Read payload
-            if (fh.length > 0) {
-                var payload_read: usize = 0;
-                while (payload_read < fh.length) {
-                    const n = try sock.recv(io, recv_buf[payload_read..fh.length]);
-                    if (n == 0) return error.ConnectionClosed;
-                    payload_read += n;
-                }
-
-                const payload = recv_buf[0..fh.length];
-
-                // Use the already-computed frame_type from above
-                const ft = frame_type orelse continue;
-                switch (ft) {
-                    .headers => {
-                        // Decode HPACK headers
-                        response.header_count = try hpack.Hpack.decodeHeaders(
-                            payload,
-                            &response.headers,
-                        );
-                        response.status = hpack.Hpack.getStatus(
-                            response.headers[0..response.header_count],
-                        ) orelse 0;
-                        log.debug("Received HEADERS: stream={d}, status={d}", .{ fh.stream_id, response.status });
-                    },
-                    .data => {
-                        if (fh.stream_id == stream_id) {
-                            try response.body.appendSlice(self.allocator, payload);
-                            log.debug("Received DATA: stream={d}, len={d}", .{ fh.stream_id, fh.length });
-
-                            // Send WINDOW_UPDATE to allow more data (flow control)
-                            const data_len = fh.length;
-                            if (data_len > 0) {
-                                // Update connection window
-                                var conn_wu_buf: [13]u8 = undefined;
-                                const conn_wu_len = try frame.FrameBuilder.windowUpdate(&conn_wu_buf, 0, data_len);
-                                _ = try sock.send_all(io, conn_wu_buf[0..conn_wu_len]);
-
-                                // Update stream window
-                                var stream_wu_buf: [13]u8 = undefined;
-                                const stream_wu_len = try frame.FrameBuilder.windowUpdate(&stream_wu_buf, stream_id, data_len);
-                                _ = try sock.send_all(io, stream_wu_buf[0..stream_wu_len]);
-                            }
-                        }
-                    },
-                    .settings => {
-                        if (!fh.isAck()) {
-                            // Send SETTINGS ACK
-                            var ack_buf: [9]u8 = undefined;
-                            const ack_len = try frame.FrameBuilder.settingsAck(&ack_buf);
-                            _ = try sock.send_all(io, ack_buf[0..ack_len]);
-                        }
-                    },
-                    .window_update => {
-                        // Update flow control window
-                        if (payload.len >= 4) {
-                            const increment = std.mem.readInt(u32, payload[0..4], .big);
-                            self.connection_window += increment;
-                        }
-                    },
-                    .ping => {
-                        // Respond to PING
-                        if (!fh.isAck()) {
-                            var ping_buf: [17]u8 = undefined;
-                            const ping_len = try frame.FrameBuilder.ping(&ping_buf, payload[0..8].*, true);
-                            _ = try sock.send_all(io, ping_buf[0..ping_len]);
-                        }
-                    },
-                    .goaway => {
-                        log.warn("Received GOAWAY from server", .{});
-                        return error.ConnectionGoaway;
-                    },
-                    .rst_stream => {
-                        if (fh.stream_id == stream_id) {
-                            log.warn("Stream {d} reset by server", .{stream_id});
-                            return error.StreamReset;
-                        }
-                    },
-                    else => {},
-                }
-            }
-        }
+        // Clear stream slot (but don't deinit body - it's moved to response)
+        self.streams[slot].active = false;
+        self.streams[slot].body = .{}; // Reset to empty (ownership transferred)
+        self.active_streams -= 1;
 
         return response;
     }
 
-    /// Send WINDOW_UPDATE to increase flow control window
-    pub fn sendWindowUpdate(self: *Self, sock: *UltraSock, io: Io, stream_id: u31, increment: u31) !void {
+    /// Read and route a single frame to the appropriate stream
+    fn readAndRouteFrame(self: *Self, sock: *UltraSock, io: Io, recv_buf: *[mod.MAX_FRAME_SIZE_DEFAULT + 9]u8) !void {
+        // Read frame header
+        var header_buf: [9]u8 = undefined;
+        var header_read: usize = 0;
+        while (header_read < 9) {
+            const n = try sock.recv(io, header_buf[header_read..]);
+            if (n == 0) return error.ConnectionClosed;
+            header_read += n;
+        }
+
+        const fh = try frame.FrameHeader.parse(&header_buf);
+        const frame_type = frame.FrameType.fromU8(fh.frame_type);
+
+        // TigerStyle: Validate frame length before reading
+        // HTTP/2 default max frame size is 16384, reject corrupt frames
+        if (fh.length > mod.MAX_FRAME_SIZE_DEFAULT) {
+            log.err("Invalid frame length: {d} > {d} (max)", .{ fh.length, mod.MAX_FRAME_SIZE_DEFAULT });
+            return error.FrameTooLarge;
+        }
+
+        // Read payload
+        var payload: []const u8 = &.{};
+        if (fh.length > 0) {
+            var payload_read: usize = 0;
+            while (payload_read < fh.length) {
+                const n = try sock.recv(io, recv_buf[payload_read..fh.length]);
+                if (n == 0) return error.ConnectionClosed;
+                payload_read += n;
+            }
+            payload = recv_buf[0..fh.length];
+        }
+
+        // Route frame to correct stream or handle connection-level frames
+        const ft = frame_type orelse return;
+
+        switch (ft) {
+            .headers => try self.handleHeaders(fh, payload),
+            .data => try self.handleData(sock, io, fh, payload),
+            .settings => try self.handleSettings(sock, io, fh),
+            .window_update => self.handleWindowUpdate(fh, payload),
+            .ping => try self.handlePing(sock, io, fh, payload),
+            .goaway => return error.ConnectionGoaway,
+            .rst_stream => try self.handleRstStream(fh),
+            else => {},
+        }
+    }
+
+    fn handleHeaders(self: *Self, fh: frame.FrameHeader, payload: []const u8) !void {
+        const slot = self.findStreamSlot(fh.stream_id) orelse return;
+
+        self.streams[slot].header_count = try hpack.Hpack.decodeHeaders(
+            payload,
+            &self.streams[slot].headers,
+        );
+        self.streams[slot].status = hpack.Hpack.getStatus(
+            self.streams[slot].headers[0..self.streams[slot].header_count],
+        ) orelse 0;
+
+        if (fh.isEndStream()) {
+            self.streams[slot].end_stream = true;
+        }
+
+        log.debug("HEADERS stream={d} status={d} end={}", .{
+            fh.stream_id, self.streams[slot].status, self.streams[slot].end_stream
+        });
+    }
+
+    fn handleData(self: *Self, sock: *UltraSock, io: Io, fh: frame.FrameHeader, payload: []const u8) !void {
+        const slot = self.findStreamSlot(fh.stream_id) orelse return;
+
+        try self.streams[slot].body.appendSlice(self.allocator, payload);
+
+        if (fh.isEndStream()) {
+            self.streams[slot].end_stream = true;
+        }
+
+        // Flow control: send WINDOW_UPDATE
+        if (fh.length > 0) {
+            var conn_wu_buf: [13]u8 = undefined;
+            const conn_wu_len = try frame.FrameBuilder.windowUpdate(&conn_wu_buf, 0, fh.length);
+            _ = try sock.send_all(io, conn_wu_buf[0..conn_wu_len]);
+
+            var stream_wu_buf: [13]u8 = undefined;
+            const stream_wu_len = try frame.FrameBuilder.windowUpdate(&stream_wu_buf, fh.stream_id, fh.length);
+            _ = try sock.send_all(io, stream_wu_buf[0..stream_wu_len]);
+        }
+
+        log.debug("DATA stream={d} len={d} end={}", .{ fh.stream_id, fh.length, self.streams[slot].end_stream });
+    }
+
+    fn handleSettings(self: *Self, sock: *UltraSock, io: Io, fh: frame.FrameHeader) !void {
+        if (!fh.isAck()) {
+            var ack_buf: [9]u8 = undefined;
+            const ack_len = try frame.FrameBuilder.settingsAck(&ack_buf);
+            _ = try sock.send_all(io, ack_buf[0..ack_len]);
+        }
         _ = self;
-        var buf: [13]u8 = undefined;
-        const len = try frame.FrameBuilder.windowUpdate(&buf, stream_id, increment);
-        _ = try sock.send_all(io, buf[0..len]);
+    }
+
+    fn handleWindowUpdate(self: *Self, fh: frame.FrameHeader, payload: []const u8) void {
+        if (fh.stream_id == 0 and payload.len >= 4) {
+            const increment = std.mem.readInt(u32, payload[0..4], .big);
+            self.connection_window += increment;
+        }
+    }
+
+    fn handlePing(self: *Self, sock: *UltraSock, io: Io, fh: frame.FrameHeader, payload: []const u8) !void {
+        _ = self;
+        if (!fh.isAck() and payload.len >= 8) {
+            var ping_buf: [17]u8 = undefined;
+            const ping_len = try frame.FrameBuilder.ping(&ping_buf, payload[0..8].*, true);
+            _ = try sock.send_all(io, ping_buf[0..ping_len]);
+        }
+    }
+
+    fn handleRstStream(self: *Self, fh: frame.FrameHeader) !void {
+        const slot = self.findStreamSlot(fh.stream_id) orelse return;
+        log.warn("Stream {d} reset by server", .{fh.stream_id});
+        self.streams[slot].end_stream = true;
+        self.streams[slot].status = 0; // Mark as failed
     }
 
     /// Close HTTP/2 connection gracefully
@@ -295,18 +427,38 @@ pub const Http2Client = struct {
         _ = try sock.send_all(io, buf[0..len]);
     }
 
-    // --- Private helpers ---
+    /// Get count of active streams
+    pub inline fn activeStreamCount(self: *const Self) usize {
+        return self.active_streams;
+    }
 
-    fn nextStreamId(self: *Self) u31 {
+    // --- Stream ID management ---
+
+    /// Get next stream ID and increment counter (client uses odd IDs)
+    pub inline fn nextStreamId(self: *Self) u31 {
         const id = self.next_stream_id;
-        self.next_stream_id += 2; // Client streams are odd
+        self.next_stream_id += 2;
         return id;
+    }
+
+    /// Find a free stream slot (public for multiplexing)
+    pub fn findFreeSlot(self: *Self) ?usize {
+        for (self.streams, 0..) |s, i| {
+            if (!s.active) return i;
+        }
+        return null;
+    }
+
+    pub fn findStreamSlot(self: *Self, stream_id: u31) ?usize {
+        for (self.streams, 0..) |s, i| {
+            if (s.active and s.id == stream_id) return i;
+        }
+        return null;
     }
 
     fn readServerSettings(self: *Self, sock: *UltraSock, io: Io) !void {
         var recv_buf: [256]u8 = undefined;
 
-        // Read frame header
         var header_read: usize = 0;
         while (header_read < 9) {
             const n = try sock.recv(io, recv_buf[header_read..9]);
@@ -321,7 +473,6 @@ pub const Http2Client = struct {
             return error.ProtocolError;
         }
 
-        // Read settings payload
         if (fh.length > 0) {
             var payload_read: usize = 0;
             while (payload_read < fh.length) {
@@ -330,7 +481,6 @@ pub const Http2Client = struct {
                 payload_read += n;
             }
 
-            // Parse settings
             var offset: usize = 0;
             while (offset + 6 <= fh.length) {
                 const id = std.mem.readInt(u16, recv_buf[9 + offset ..][0..2], .big);
@@ -346,13 +496,253 @@ pub const Http2Client = struct {
             }
         }
 
-        // Send SETTINGS ACK
         var ack_buf: [9]u8 = undefined;
         const ack_len = try frame.FrameBuilder.settingsAck(&ack_buf);
         _ = try sock.send_all(io, ack_buf[0..ack_len]);
 
         self.settings_acked = true;
-        log.debug("HTTP/2 SETTINGS exchanged", .{});
+        log.debug("HTTP/2 SETTINGS exchanged, max_streams={d}", .{self.max_concurrent_streams});
+    }
+
+    // =========================================================================
+    // Multiplexing: Dedicated reader for concurrent streams
+    // =========================================================================
+    /// Async reader task for multiplexing.
+    /// Reads frames and dispatches to correct stream, signals completion.
+    /// Runs until shutdown requested or connection error.
+    /// Spawned via Io.async() - yields during I/O waits.
+    pub fn readerTask(
+        self: *Self,
+        sock: *UltraSock,
+        shutdown_requested: *bool,
+        reader_running: *bool,
+        state: *State,
+        goaway_received: *bool,
+        stream_mutex: *Io.Mutex,
+        io: Io,
+    ) void {
+        log.debug("readerTask: started, active_streams={d}", .{self.active_streams});
+        defer {
+            // CRITICAL: Capture shutdown state BEFORE any other operations
+            // After signalAllStreams: request() wakes -> release() -> deinitAsync() sets shutdown_requested=true
+            const was_clean_shutdown = shutdown_requested.*;
+            log.debug("readerTask: exiting, shutdown_requested={}", .{was_clean_shutdown});
+
+            // On unclean shutdown (GOAWAY, error): send close_notify and mark dead
+            // DO NOT close socket here - deinitAsync will do it after awaiting us
+            // This prevents race where deinitAsync tries to send close_notify on closed socket
+            if (!was_clean_shutdown) {
+                state.* = .dead;
+                sock.sendCloseNotify(io);
+                log.debug("readerTask: sent close_notify, marked dead", .{});
+            }
+
+            // Now signal waiting streams and update state
+            goaway_received.* = self.goaway_received;
+            self.signalAllStreams(stream_mutex, io);
+            reader_running.* = false;
+        }
+
+        var recv_buf: [mod.MAX_FRAME_SIZE_DEFAULT + 9]u8 = undefined;
+
+        while (!shutdown_requested.*) {
+            // Read frame header (9 bytes) - loop to handle partial reads
+            var header_buf: [9]u8 = undefined;
+            var header_read: usize = 0;
+            log.debug("Reader: waiting for frame header...", .{});
+            while (header_read < 9) {
+                const n = sock.recv(io, header_buf[header_read..]) catch |err| {
+                    // Check shutdown first
+                    if (shutdown_requested.*) {
+                        log.debug("Reader: shutdown requested during recv", .{});
+                        return;
+                    }
+
+                    // If no active streams, this might be an idle timeout while pooled
+                    // Check if socket fd is still valid (recv sets connected=false on any error)
+                    if (self.active_streams == 0) {
+                        // Check if socket is actually dead or just timed out
+                        if (sock.getFd()) |fd| {
+                            // Socket fd still valid - likely just a timeout, not a real disconnect
+                            // Restore connected flag and continue waiting
+                            if (!sock.hasStaleData()) {
+                                sock.connected = true;
+                                log.debug("Reader: idle timeout, continuing (fd={}, no active streams)", .{fd});
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Active streams or socket truly dead - exit reader
+                    log.debug("Reader: recv failed: {}, active_streams={}, connected={}", .{ err, self.active_streams, sock.connected });
+                    return;
+                };
+                if (n == 0) {
+                    log.debug("Reader: connection closed during header read", .{});
+                    return;
+                }
+                header_read += n;
+            }
+            log.debug("Reader: got frame header, parsing...", .{});
+
+            const fh = frame.FrameHeader.parse(&header_buf) catch |err| {
+                log.debug("Reader: frame header parse failed: {}", .{err});
+                return;
+            };
+            log.debug("Reader: frame type={d}, len={d}, stream={d}", .{ fh.frame_type, fh.length, fh.stream_id });
+
+            if (fh.length > mod.MAX_FRAME_SIZE_DEFAULT) {
+                log.err("Frame too large: {d}", .{fh.length});
+                return;
+            }
+
+            // Read payload - loop to handle partial reads
+            if (fh.length > 0) {
+                var payload_read: usize = 0;
+                while (payload_read < fh.length) {
+                    const n = sock.recv(io, recv_buf[payload_read..fh.length]) catch |err| {
+                        log.debug("Reader payload recv error: {}", .{err});
+                        return;
+                    };
+                    if (n == 0) {
+                        log.debug("Reader: connection closed during payload read", .{});
+                        return;
+                    }
+                    payload_read += n;
+                }
+            }
+
+            const payload = recv_buf[0..fh.length];
+
+            // Dispatch frame to correct stream (mutex-protected)
+            stream_mutex.lock(io) catch return; // Cancelled
+            const dispatch_result = self.dispatchFrame(fh, payload, io);
+            stream_mutex.unlock(io);
+
+            dispatch_result catch |err| {
+                if (err == error.ConnectionGoaway) {
+                    log.debug("Reader: received GOAWAY, exiting", .{});
+                    return;
+                }
+                log.debug("Frame dispatch error: {}", .{err});
+            };
+        }
+    }
+
+    /// Dispatch a frame to the correct stream
+    fn dispatchFrame(self: *Self, fh: frame.FrameHeader, payload: []const u8, io: Io) !void {
+        const ft = frame.FrameType.fromU8(fh.frame_type) orelse return;
+
+        switch (ft) {
+            .headers => {
+                if (self.findStreamSlot(fh.stream_id)) |slot| {
+                    self.streams[slot].header_count = hpack.Hpack.decodeHeaders(
+                        payload,
+                        &self.streams[slot].headers,
+                    ) catch 0;
+                    self.streams[slot].status = hpack.Hpack.getStatus(
+                        self.streams[slot].headers[0..self.streams[slot].header_count],
+                    ) orelse 0;
+
+                    if (fh.isEndStream()) {
+                        self.streams[slot].end_stream = true;
+                        self.streams[slot].completed = true;
+                        self.streams[slot].condition.signal(io);
+                    }
+                }
+            },
+            .data => {
+                if (self.findStreamSlot(fh.stream_id)) |slot| {
+                    self.streams[slot].body.appendSlice(self.allocator, payload) catch {};
+
+                    if (fh.isEndStream()) {
+                        self.streams[slot].end_stream = true;
+                        self.streams[slot].completed = true;
+                        self.streams[slot].condition.signal(io);
+                    }
+                }
+            },
+            .rst_stream => {
+                if (self.findStreamSlot(fh.stream_id)) |slot| {
+                    if (payload.len >= 4) {
+                        self.streams[slot].error_code = std.mem.readInt(u32, payload[0..4], .big);
+                    }
+                    self.streams[slot].completed = true;
+                    self.streams[slot].condition.signal(io);
+                }
+            },
+            .goaway => {
+                // GOAWAY contains: last_stream_id (4 bytes) + error_code (4 bytes)
+                // Per RFC 7540: streams > last_stream_id were NOT processed, retry immediately
+                // Streams <= last_stream_id might complete, let them wait for response or timeout
+                if (payload.len >= 4) {
+                    const last_stream_id = std.mem.readInt(u32, payload[0..4], .big);
+                    log.debug("GOAWAY received: last_stream_id={d}", .{last_stream_id});
+
+                    // Signal streams that won't be processed (ID > last_stream_id) for retry
+                    // Also count remaining active streams that might still complete
+                    var remaining_active: u32 = 0;
+                    for (&self.streams) |*stream| {
+                        if (stream.active and !stream.completed) {
+                            if (stream.id > last_stream_id) {
+                                log.debug("GOAWAY: signaling stream {d} for retry", .{stream.id});
+                                stream.retry_needed = true;
+                                stream.completed = true;
+                                stream.condition.signal(io);
+                            } else {
+                                remaining_active += 1;
+                            }
+                        }
+                    }
+
+                    // Mark that we received GOAWAY - no new streams allowed
+                    self.goaway_received = true;
+                    log.debug("GOAWAY: set goaway_received=true, active_streams={d}, remaining={d}", .{ self.active_streams, remaining_active });
+
+                    // FAST EXIT: If no streams are waiting for completion, exit immediately
+                    // instead of waiting for read timeout. This prevents 1-2s delay on retry.
+                    if (remaining_active == 0) {
+                        log.debug("GOAWAY: no remaining streams, exiting immediately", .{});
+                        return error.ConnectionGoaway;
+                    }
+                    // Continue reading - remaining streams <= last_stream_id may still complete
+                } else {
+                    // Malformed GOAWAY - signal all and exit
+                    self.signalAllStreamsUnlocked(io);
+                    return error.ConnectionGoaway;
+                }
+            },
+            .window_update => {
+                if (fh.stream_id == 0 and payload.len >= 4) {
+                    const increment = std.mem.readInt(u32, payload[0..4], .big);
+                    self.connection_window += @intCast(increment & 0x7FFFFFFF);
+                }
+            },
+            .settings => {
+                if (!fh.isAck()) {
+                    self.settings_acked = true;
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Signal all active streams (acquires mutex)
+    pub fn signalAllStreams(self: *Self, stream_mutex: *Io.Mutex, io: Io) void {
+        stream_mutex.lock(io) catch return; // Cancelled
+        defer stream_mutex.unlock(io);
+        self.signalAllStreamsUnlocked(io);
+    }
+
+    /// Signal all active streams (mutex must be held)
+    fn signalAllStreamsUnlocked(self: *Self, io: Io) void {
+        for (&self.streams) |*stream| {
+            if (stream.active and !stream.completed) {
+                stream.retry_needed = true;
+                stream.completed = true;
+                stream.condition.signal(io);
+            }
+        }
     }
 };
 
@@ -377,13 +767,47 @@ pub const Response = struct {
         return null;
     }
 
-    pub fn getBody(self: *const Response) []const u8 {
+    pub inline fn getBody(self: *const Response) []const u8 {
         return self.body.items;
     }
 };
 
+// ============================================================================
+// Tests
+// ============================================================================
+
 test "http2 client init" {
-    const client = Http2Client.init(std.testing.allocator);
+    var client = Http2Client.init(std.testing.allocator);
+    defer client.deinit();
     try std.testing.expectEqual(@as(u31, 1), client.next_stream_id);
     try std.testing.expectEqual(false, client.preface_sent);
+    try std.testing.expectEqual(@as(usize, 0), client.active_streams);
+}
+
+test "http2 client stream slot management" {
+    var client = Http2Client.init(std.testing.allocator);
+    defer client.deinit();
+
+    // Initially all slots free
+    try std.testing.expectEqual(@as(?usize, 0), client.findFreeSlot());
+
+    // Allocate a stream
+    client.streams[0].active = true;
+    client.streams[0].id = 1;
+
+    try std.testing.expectEqual(@as(?usize, 1), client.findFreeSlot());
+    try std.testing.expectEqual(@as(?usize, 0), client.findStreamSlot(1));
+    try std.testing.expectEqual(@as(?usize, null), client.findStreamSlot(3));
+}
+
+test "http2 client max streams" {
+    var client = Http2Client.init(std.testing.allocator);
+    defer client.deinit();
+
+    // Fill all slots
+    for (&client.streams) |*s| {
+        s.active = true;
+    }
+
+    try std.testing.expectEqual(@as(?usize, null), client.findFreeSlot());
 }

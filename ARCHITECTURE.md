@@ -242,6 +242,289 @@ src/http/http2/
 - HPACK uses static table only (no dynamic table state)
 - WINDOW_UPDATE sent after DATA frames (flow control)
 
+## HTTP/2 over TLS — Complete Lifecycle
+
+### Phase 1: Connection Setup
+
+```
+  Load Balancer                                                    Backend
+       │                                                              │
+       │  pool.getOrCreate(backend_idx, io)                           │
+       │  └─► createFreshConnection()                                 │
+       │      └─► UltraSock.initWithTls()                             │
+       │          └─► conn.sock.connectWithBuffers()                  │
+       │                                                              │
+       │                    ┌──────────────────┐                      │
+       │                    │   TCP HANDSHAKE  │                      │
+       │                    └──────────────────┘                      │
+       │                         SYN ─────────────────────────────────►
+       │                     ◄───────────────────────────── SYN-ACK   │
+       │                         ACK ─────────────────────────────────►
+       │                                                              │
+       │                    ┌──────────────────┐                      │
+       │                    │   TLS HANDSHAKE  │                      │
+       │                    └──────────────────┘                      │
+       │                   ClientHello ───────────────────────────────►
+       │                     (ALPN: h2, http/1.1)                     │
+       │                   ◄─────────────────────────── ServerHello   │
+       │                     (ALPN: h2)              + Certificate    │
+       │                   ClientFinished ────────────────────────────►
+       │                   ◄──────────────────────── ServerFinished   │
+       │                                                              │
+       │  conn.connect(io)                                            │
+       │  └─► h2_client.connect()                                     │
+       │                                                              │
+       │                    ┌──────────────────┐                      │
+       │                    │  HTTP/2 PREFACE  │                      │
+       │                    └──────────────────┘                      │
+       │              PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n ────────────────►
+       │                   SETTINGS frame ────────────────────────────►
+       │                   ◄──────────────────────── SETTINGS frame   │
+       │                   SETTINGS ACK ──────────────────────────────►
+       │                   ◄────────────────────────── SETTINGS ACK   │
+       │                                                              │
+       ▼                                                              ▼
+  ┌──────────┐                                                  ┌──────────┐
+  │ H2Conn   │                                                  │ Backend  │
+  │ .ready   │                                                  │  Ready   │
+  └──────────┘                                                  └──────────┘
+```
+
+### Phase 2: Request/Response Flow
+
+```
+  H2Connection                    Wire                              Backend
+       │                                                              │
+       │  conn.request(method, path, host, body, io)                  │
+       │  │                                                           │
+       │  ├─► write_mutex.lock()                                      │
+       │  ├─► h2_client.sendRequest()                                 │
+       │  │   └─► Queue HEADERS + DATA frames                         │
+       │  ├─► h2_client.flush()                                       │
+       │  │       HEADERS (stream=1, :method=GET, :path=/) ───────────►
+       │  │       DATA (stream=1, body) ──────────────────────────────►
+       │  ├─► write_mutex.unlock()                                    │
+       │  │                                                           │
+       │  ├─► stream_mutex.lock()                                     │
+       │  ├─► spawnReader() [if not running]                          │
+       │  │   └─► Io.async(readerTask)                                │
+       │  │                                                           │
+       │  └─► condition.wait()  ◄─────── [BLOCKED]                    │
+       │                                                              │
+       │                                                              │
+       │  readerTask (async)                                          │
+       │  │                                                           │
+       │  ├─► sock.recv() ◄───────────────────────────────────────────│
+       │  │       ◄─────────────────── HEADERS (stream=1, :status=200)│
+       │  │       ◄─────────────────── DATA (stream=1, body)          │
+       │  │       ◄─────────────────── DATA (stream=1, END_STREAM)    │
+       │  │                                                           │
+       │  ├─► dispatchFrame()                                         │
+       │  │   └─► streams[slot].completed = true                      │
+       │  │   └─► streams[slot].condition.signal() ───────────────────┐
+       │  │                                                           │
+       │  └─► [continues waiting for next frame]                      │
+       │                                                              │
+       │  request() resumes: ◄────────────────────────────────────────┘
+       │  │                                                           │
+       │  ├─► Build Response { status, headers, body }                │
+       │  ├─► stream_mutex.unlock()                                   │
+       │  └─► return Response                                         │
+       │                                                              │
+       │  pool.release(conn, success=true, io)                        │
+       │  └─► state = .available  [back to pool]                      │
+```
+
+### Phase 3: Multiplexing (HTTP/2)
+
+Multiple concurrent requests on same connection:
+
+```
+       │  Request A: stream=1                Request B: stream=3      │
+       │       │                                   │                  │
+       │       ├─► write_mutex.lock()              │                  │
+       │       ├─► sendRequest() ──────────────────┼──────────────────►
+       │       ├─► write_mutex.unlock()            │                  │
+       │       │                                   │                  │
+       │       │                    ├─► write_mutex.lock()            │
+       │       │                    ├─► sendRequest() ────────────────►
+       │       │                    ├─► write_mutex.unlock()          │
+       │       │                                   │                  │
+       │       ├─► condition.wait()  ├─► condition.wait()             │
+       │       │                     │                                │
+       │  readerTask dispatches to correct stream:                    │
+       │       ◄──────────────────────────────── HEADERS (stream=3)   │
+       │       ◄──────────────────────────────── HEADERS (stream=1)   │
+       │       ◄──────────────────────────────── DATA (stream=1)      │
+       │       ◄──────────────────────────────── DATA (stream=3)      │
+       │       │                     │                                │
+       │       ├─► signal(stream=1)  │                                │
+       │       │                     ├─► signal(stream=3)             │
+       │       ▼                     ▼                                │
+       │  Response A            Response B                            │
+```
+
+### Phase 4: Shutdown Scenarios
+
+#### Scenario A: Backend sends GOAWAY (graceful, after N requests)
+
+```
+  readerTask                      Wire                              Backend
+       │                                                              │
+       │  sock.recv()                                                 │
+       │       ◄───────────────────────── GOAWAY (last_stream=2001)   │
+       │                                                              │
+       │  dispatchFrame() → handleGoaway()                            │
+       │  └─► self.goaway_received = true                             │
+       │  └─► return error.ConnectionGoaway                           │
+       │                                                              │
+       │  defer block executes:                                       │
+       │  ┌────────────────────────────────────────────────────────┐  │
+       │  │ was_clean_shutdown = false                             │  │
+       │  │ state.* = .dead                                        │  │
+       │  │ sock.sendCloseNotify(io) ─────────────────────────────────►
+       │  │     └─► conn.close() → TLS close_notify alert          │  │
+       │  │ sock.closeSocketOnly() ───────────────────────────────────►
+       │  │     └─► posix.close(fd) → TCP FIN                      │  │
+       │  │ signalAllStreams()                                     │  │
+       │  │ reader_running.* = false                               │  │
+       │  └────────────────────────────────────────────────────────┘  │
+       │                                                              │
+       │                   ◄────────────────────────── TCP FIN-ACK    │
+       │                                                              │
+       ▼                                                              ▼
+  Connection                                                     Connection
+    Closed                                                         Closed
+```
+
+#### Scenario B: Backend closes connection (idle timeout)
+
+```
+  readerTask                      Wire                              Backend
+       │                                                              │
+       │  sock.recv() [waiting for frame header]                      │
+       │       ◄─────────────────────────────── TLS close_notify      │
+       │       returns n=0 (EOF)                                      │
+       │                                                              │
+       │  "Reader: connection closed during header read"              │
+       │  return (exits read loop)                                    │
+       │                                                              │
+       │  defer block executes:                                       │
+       │  ┌────────────────────────────────────────────────────────┐  │
+       │  │ was_clean_shutdown = false                             │  │
+       │  │ state.* = .dead                                        │  │
+       │  │ sock.sendCloseNotify(io) ─────────────────────────────────►
+       │  │ sock.closeSocketOnly() ───────────────────────────────────►
+       │  │ signalAllStreams()                                     │  │
+       │  │ reader_running.* = false                               │  │
+       │  └────────────────────────────────────────────────────────┘  │
+       │                                                              │
+       ▼                                                              ▼
+  Connection                                                     Connection
+    Closed                                                         Closed
+```
+
+#### Scenario C: Clean shutdown (pool.deinit or explicit close)
+
+```
+  pool/connection                 Wire                           readerTask
+       │                                                              │
+       │  conn.deinitAsync(io)                                        │
+       │  │                                                           │
+       │  ├─► shutdown_requested = true                               │
+       │  │                                                           │
+       │  ├─► if reader_running:                                      │
+       │  │       sock.sendCloseNotify(io) ◄──────────────────────────│
+       │  │           (unblocks recv)           sock.recv() returns   │
+       │  │                                     with error/EOF        │
+       │  │                                                           │
+       │  ├─► future.await(io) ◄──────────── defer block runs:        │
+       │  │       [waits]                    │ was_clean_shutdown=true│
+       │  │                                  │ [skip close_notify]    │
+       │  │                                  │ signalAllStreams()     │
+       │  │       [resumes] ◄────────────────│ reader_running=false   │
+       │  │                                  └────────────────────────│
+       │  ├─► if state != .dead:                                      │
+       │  │       sock.sendCloseNotify(io) ───────────────────────────►
+       │  │                                                           │
+       │  ├─► sock.closeSocketOnly() ─────────────────────────────────►
+       │  │                                                           │
+       │  └─► h2_client.deinit()                                      │
+       │                                                              │
+       ▼
+  Connection
+    Closed
+```
+
+### HTTP/2 Method Reference
+
+| Module | Key Methods |
+|--------|-------------|
+| **H2ConnectionPool** (pool.zig) | `getOrCreate()` - Get/create pooled connection |
+| | `release()` - Return connection to pool |
+| | `destroyConnection()` - Cleanup dead connection |
+| | `isConnectionStale()` - Check if conn needs cleanup |
+| **H2Connection** (connection.zig) | `init()` - Create connection struct |
+| | `connect()` - HTTP/2 handshake (preface) |
+| | `request()` - Full request/response cycle |
+| | `spawnReader()` - Start async reader task |
+| | `deinitAsync()` - Graceful shutdown with Io |
+| | `markDead()` - Mark connection unusable |
+| **Http2Client** (client.zig) | `sendRequest()` - Queue request frames |
+| | `flush()` - Send queued frames |
+| | `readerTask()` - Async frame reader |
+| | `dispatchFrame()` - Route frame to stream |
+| | `handleGoaway()` - Process GOAWAY frame |
+| | `signalAllStreams()` - Wake all waiting requests |
+| **UltraSock** (ultra_sock.zig) | `connect()` - TCP + TLS connection |
+| | `connectWithBuffers()` - Connect with custom TLS bufs |
+| | `send_all()` - Send data (TLS encrypted) |
+| | `recv()` - Receive data (TLS decrypted) |
+| | `sendCloseNotify()` - Send TLS close_notify alert |
+| | `closeSocketOnly()` - Close TCP (no TLS alert) |
+| | `closeAsync()` - Full close (alert + TCP) |
+
+### Protocol Layers
+
+```
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │                          APPLICATION                                    │
+    │                     (handler.zig, proxy)                                │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │                          HTTP/2 FRAMING                                 │
+    │         (client.zig: HEADERS, DATA, SETTINGS, GOAWAY, etc.)             │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │                          TLS 1.3                                        │
+    │    (ultra_sock.zig + vendor/tls: encryption, close_notify alerts)       │
+    ├─────────────────────────────────────────────────────────────────────────┤
+    │                          TCP                                            │
+    │              (std.posix: SYN/ACK, FIN, socket I/O)                      │
+    └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### TLS Shutdown Critical Path
+
+The TLS shutdown must send **both** close_notify AND close TCP:
+
+```
+  readerTask defer block:
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  if (!was_clean_shutdown) {                                            │
+  │      state.* = .dead;                                                  │
+  │      sock.sendCloseNotify(io);    ──► TLS close_notify alert           │
+  │      sock.closeSocketOnly();      ──► TCP FIN                          │
+  │  }                                                                     │
+  │  signalAllStreams();              ──► Wake waiting requests            │
+  │  reader_running.* = false;                                             │
+  └────────────────────────────────────────────────────────────────────────┘
+
+  Key insight: Backend (Python/hypercorn) waits for BOTH:
+  ├── TLS close_notify  (sendCloseNotify)
+  └── TCP close/FIN     (closeSocketOnly)
+
+  Without TCP close, backend's wait_closed() times out!
+```
+
 ### `http_utils.zig` — Message Framing
 
 RFC 7230 compliance:
