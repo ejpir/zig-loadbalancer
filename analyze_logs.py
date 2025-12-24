@@ -264,8 +264,6 @@ def analyze(requests, events):
     # Calculate durations
     durations = []
     retried = []
-    pool_hits = 0
-    pool_misses = 0
 
     for req_id, data in requests.items():
         if 'start' in data and 'responded' in data:
@@ -274,11 +272,6 @@ def analyze(requests, events):
 
             if 'retry' in data:
                 retried.append((req_id, duration, data))
-
-            if 'pool_hit' in data:
-                pool_hits += 1
-            if 'pool_miss' in data:
-                pool_misses += 1
 
     # Sort by duration
     durations.sort(key=lambda x: x[1], reverse=True)
@@ -542,110 +535,6 @@ def analyze(requests, events):
         retry_pct = 100 * retry_success / (direct_success + retry_success)
         print(f"Retry rate:                   {retry_pct:.2f}%")
 
-    # Analyze pool_add outcomes
-    pool_add_requests = [(rid, data) for rid, data in requests.items() if 'pool_add' in data]
-    pool_add_success = sum(1 for rid, data in pool_add_requests if 'responded' in data and 'retry' not in data)
-    pool_add_retry = sum(1 for rid, data in pool_add_requests if 'retry' in data)
-
-    print(f"\nNew connection (pool_add) outcomes:")
-    print(f"  Total pool_add:             {len(pool_add_requests)}")
-    print(f"  Success on first try:       {pool_add_success}")
-    print(f"  Required retry:             {pool_add_retry}")
-    if len(pool_add_requests) > 0:
-        fail_pct = 100 * pool_add_retry / len(pool_add_requests)
-        print(f"  First-use failure rate:     {fail_pct:.1f}%")
-
-    # POOL CREATOR VS POOL USER ANALYSIS
-    print()
-    print("=" * 80)
-    print("POOL CREATOR VS POOL USER ANALYSIS")
-    print("=" * 80)
-
-    # Find requests that did pool_add and their response times
-    pool_creators = []
-    for req_id, data in requests.items():
-        if 'pool_add' in data:
-            pool_creators.append((req_id, data))
-
-    # Find first pool_hit requests right after pool_add (same connection reused)
-    pool_users = []
-    for req_id, data in requests.items():
-        if 'pool_hit' in data and 'h2_response' in data:
-            pool_users.append((req_id, data))
-
-    if pool_creators:
-        print(f"\nPool Creators (did pool_add):")
-        print(f"  {'REQ':<8} {'add@':>10} {'resp@':>10} {'wait':>8} {'error':>20}")
-        print(f"  {'-' * 60}")
-        for req_id, data in sorted(pool_creators, key=lambda x: x[1].get('pool_add', 0))[:15]:
-            add_ts = data.get('pool_add', 0)
-            resp_ts = data.get('h2_response', data.get('responded', 0))
-            wait = resp_ts - add_ts if resp_ts else 'N/A'
-            error = data.get('await_error', 'none' if 'retry' not in data else 'retry needed')
-            print(f"  {req_id:<8} {add_ts:>10} {resp_ts:>10} {wait:>8} {error:>20}")
-
-    if pool_users:
-        # Show first 15 pool users and their response times
-        first_users = sorted(pool_users, key=lambda x: x[1].get('pool_hit', 0))[:15]
-        print(f"\nPool Users (did pool_hit, first 15):")
-        print(f"  {'REQ':<8} {'hit@':>10} {'resp@':>10} {'latency':>8}")
-        print(f"  {'-' * 40}")
-        for req_id, data in first_users:
-            hit_ts = data.get('pool_hit', 0)
-            resp_ts = data.get('h2_response', 0)
-            latency = resp_ts - hit_ts if resp_ts else 'N/A'
-            print(f"  {req_id:<8} {hit_ts:>10} {resp_ts:>10} {latency:>8}ms")
-
-    # Compare timings
-    if pool_creators and pool_users:
-        creator_waits = []
-        for req_id, data in pool_creators:
-            if 'retry' not in data and 'h2_response' in data and 'pool_add' in data:
-                creator_waits.append(data['h2_response'] - data['pool_add'])
-
-        user_latencies = []
-        for req_id, data in pool_users:
-            if 'h2_response' in data and 'pool_hit' in data:
-                user_latencies.append(data['h2_response'] - data['pool_hit'])
-
-        print(f"\nLatency Comparison:")
-        if creator_waits:
-            print(f"  Pool creators (pool_add → h2_response, no retry):")
-            print(f"    Count: {len(creator_waits)}, Avg: {sum(creator_waits)/len(creator_waits):.1f}ms")
-        else:
-            print(f"  Pool creators: ALL REQUIRED RETRY (0 direct success)")
-        if user_latencies:
-            print(f"  Pool users (pool_hit → h2_response):")
-            print(f"    Count: {len(user_latencies)}, Avg: {sum(user_latencies)/len(user_latencies):.1f}ms")
-
-    # Analyze timing gap between pool_add and using_pooled
-    print()
-    print("=" * 80)
-    print("POOL_ADD TO AWAIT_FAILED GAP ANALYSIS")
-    print("=" * 80)
-
-    gaps = []
-    for req_id, data in pool_creators:
-        if 'pool_add' in data and 'await_failed' in data:
-            gap = data['await_failed'] - data['pool_add']
-            gaps.append((req_id, gap, data.get('await_error', 'unknown')))
-
-    if gaps:
-        print(f"\nTime from pool_add to await_failed (the 'stuck' time):")
-        for req_id, gap, error in sorted(gaps, key=lambda x: x[1])[:10]:
-            print(f"  REQ {req_id}: {gap}ms ({error})")
-        print(f"\n  Min gap: {min(g[1] for g in gaps)}ms")
-        print(f"  Max gap: {max(g[1] for g in gaps)}ms")
-        print(f"  Avg gap: {sum(g[1] for g in gaps) / len(gaps):.0f}ms")
-
-        # Bucket by error type
-        by_error = defaultdict(list)
-        for req_id, gap, error in gaps:
-            by_error[error].append(gap)
-        print(f"\n  By error type:")
-        for error, err_gaps in by_error.items():
-            print(f"    {error}: {len(err_gaps)} requests, avg gap: {sum(err_gaps)/len(err_gaps):.0f}ms")
-
     print()
     print("=" * 80)
     print("STATISTICS")
@@ -654,8 +543,6 @@ def analyze(requests, events):
     all_durations = [d[1] for d in durations]
     if all_durations:
         print(f"Total requests:     {len(all_durations)}")
-        print(f"Pool hits:          {pool_hits}")
-        print(f"Pool misses:        {pool_misses}")
         print(f"Retried requests:   {len(retried)}")
         print(f"Min duration:       {min(all_durations)}ms")
         print(f"Max duration:       {max(all_durations)}ms")
