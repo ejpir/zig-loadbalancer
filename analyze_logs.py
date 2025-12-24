@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze lb.log to understand request timing patterns."""
+"""Analyze lb.log to understand request timing patterns and TLS/HTTP2 lifecycle."""
 
 import re
 import sys
@@ -22,20 +22,42 @@ def parse_logs(filename):
     h2_response_pat = re.compile(r'\[\+ *(\d+)ms\].*\[REQ (\d+)\] HTTP/2 response: status=(\d+)')
     await_failed_pat = re.compile(r'\[\+ *(\d+)ms\].*\[REQ (\d+)\] H2 pooled await failed: error\.(\w+)')
 
-    # Global events
+    # Global events - GOAWAY
     goaway_pat = re.compile(r'\[\+ *(\d+)ms\].*GOAWAY received: last_stream_id=(\d+)')
+    goaway_closing_pat = re.compile(r'\[\+ *(\d+)ms\].*GOAWAY received, connection closing')
+    goaway_no_streams_pat = re.compile(r'\[\+ *(\d+)ms\].*GOAWAY: no remaining streams, exiting immediately')
+
+    # TLS lifecycle
+    tls_established_pat = re.compile(r'\[\+ *(\d+)ms\].*TLS established (\S+) \((\w+), (\w+)\)')
+    tls_handshake_pat = re.compile(r'\[\+ *(\d+)ms\].*Starting TLS handshake with (\S+)')
+    close_notify_pat = re.compile(r'\[\+ *(\d+)ms\].*Sending TLS close_notify')
+    close_notify_sent_pat = re.compile(r'\[\+ *(\d+)ms\].*sent close_notify')
+    close_notify_failed_pat = re.compile(r'\[\+ *(\d+)ms\].*TLS close_notify failed: (\S+)')
     tls_complete_pat = re.compile(r'\[\+ *(\d+)ms\].*TLS Handshake Complete')
     read_failed_pat = re.compile(r'\[\+ *(\d+)ms\].*TLS read error: error\.ReadFailed')
-    io_async_pat = re.compile(r'\[\+ *(\d+)ms\].*Io\.async returned after (\d+)us \((\d+)ms\)')
-    reader_exit_pat = re.compile(r'\[\+ *(\d+)ms\].*readerTask: exiting')
-    conn_dead_pat = re.compile(r'\[\+ *(\d+)ms\].*connection dead')
-    goaway_closing_pat = re.compile(r'\[\+ *(\d+)ms\].*GOAWAY received, connection closing')
-    spawn_reader_dead_pat = re.compile(r'\[\+ *(\d+)ms\].*spawnReader: connection dead')
+
+    # Connection lifecycle
+    conn_closed_header_pat = re.compile(r'\[\+ *(\d+)ms\].*connection closed during header read')
+    conn_dead_pat = re.compile(r'\[\+ *(\d+)ms\].*[Cc]onnection.*dead')
+    conn_marked_dead_pat = re.compile(r'\[\+ *(\d+)ms\].*Connection marked dead')
+
+    # Pool operations
+    pool_reusing_pat = re.compile(r'\[\+ *(\d+)ms\].*Reusing connection: backend=(\d+) slot=(\d+)')
+    pool_returning_pat = re.compile(r'\[\+ *(\d+)ms\].*Returning connection to pool: backend=(\d+)')
+    pool_destroying_pat = re.compile(r'\[\+ *(\d+)ms\].*Destroying.*connection: backend=(\d+)')
+    pool_stale_pat = re.compile(r'\[\+ *(\d+)ms\].*Connection stale, destroying')
+    pool_created_pat = re.compile(r'\[\+ *(\d+)ms\].*Created fresh connection: backend=(\d+) slot=(\d+)')
 
     # Reader lifecycle
     reader_start_pat = re.compile(r'\[\+ *(\d+)ms\].*readerTask: started, active_streams=(\d+)')
+    reader_exit_pat = re.compile(r'\[\+ *(\d+)ms\].*readerTask: exiting, shutdown_requested=(\w+)')
+    reader_idle_pat = re.compile(r'\[\+ *(\d+)ms\].*Reader: idle timeout, continuing')
     spawn_reader_start_pat = re.compile(r'\[\+ *(\d+)ms\].*spawnReader: starting reader task')
     spawn_reader_already_pat = re.compile(r'\[\+ *(\d+)ms\].*spawnReader: already running')
+    spawn_reader_dead_pat = re.compile(r'\[\+ *(\d+)ms\].*spawnReader: connection dead')
+
+    # Async/timing
+    io_async_pat = re.compile(r'\[\+ *(\d+)ms\].*Io\.async returned after (\d+)us \((\d+)ms\)')
 
     with open(filename) as f:
         for line in f:
@@ -162,6 +184,79 @@ def parse_logs(filename):
             if m:
                 ts = int(m.group(1))
                 events.append((ts, 'SPAWN_READER_ALREADY', ''))
+
+            # TLS lifecycle
+            m = tls_established_pat.search(line)
+            if m:
+                ts, host, cipher, proto = int(m.group(1)), m.group(2), m.group(3), m.group(4)
+                events.append((ts, 'TLS_ESTABLISHED', f'{host} ({proto})'))
+
+            m = tls_handshake_pat.search(line)
+            if m:
+                ts, host = int(m.group(1)), m.group(2)
+                events.append((ts, 'TLS_HANDSHAKE_START', host))
+
+            m = close_notify_pat.search(line)
+            if m:
+                ts = int(m.group(1))
+                events.append((ts, 'CLOSE_NOTIFY_SENDING', ''))
+
+            m = close_notify_sent_pat.search(line)
+            if m:
+                ts = int(m.group(1))
+                events.append((ts, 'CLOSE_NOTIFY_SENT', ''))
+
+            m = close_notify_failed_pat.search(line)
+            if m:
+                ts, err = int(m.group(1)), m.group(2)
+                events.append((ts, 'CLOSE_NOTIFY_FAILED', err))
+
+            # Connection lifecycle
+            m = conn_closed_header_pat.search(line)
+            if m:
+                ts = int(m.group(1))
+                events.append((ts, 'CONN_CLOSED_HEADER', ''))
+
+            m = conn_marked_dead_pat.search(line)
+            if m:
+                ts = int(m.group(1))
+                events.append((ts, 'CONN_MARKED_DEAD', ''))
+
+            # Pool operations
+            m = pool_reusing_pat.search(line)
+            if m:
+                ts, backend, slot = int(m.group(1)), m.group(2), m.group(3)
+                events.append((ts, 'POOL_REUSE', f'backend={backend} slot={slot}'))
+
+            m = pool_returning_pat.search(line)
+            if m:
+                ts, backend = int(m.group(1)), m.group(2)
+                events.append((ts, 'POOL_RETURN', f'backend={backend}'))
+
+            m = pool_destroying_pat.search(line)
+            if m:
+                ts, backend = int(m.group(1)), m.group(2)
+                events.append((ts, 'POOL_DESTROY', f'backend={backend}'))
+
+            m = pool_stale_pat.search(line)
+            if m:
+                ts = int(m.group(1))
+                events.append((ts, 'POOL_STALE', ''))
+
+            m = pool_created_pat.search(line)
+            if m:
+                ts, backend, slot = int(m.group(1)), m.group(2), m.group(3)
+                events.append((ts, 'POOL_CREATE', f'backend={backend} slot={slot}'))
+
+            m = goaway_no_streams_pat.search(line)
+            if m:
+                ts = int(m.group(1))
+                events.append((ts, 'GOAWAY_NO_STREAMS', ''))
+
+            m = reader_idle_pat.search(line)
+            if m:
+                ts = int(m.group(1))
+                events.append((ts, 'READER_IDLE', ''))
 
     return requests, events
 
@@ -586,6 +681,178 @@ def analyze(requests, events):
             print("  By bucket:")
             for bucket in sorted(buckets.keys()):
                 print(f"    {bucket}: {buckets[bucket]}")
+
+    # TLS LIFECYCLE ANALYSIS
+    print()
+    print("=" * 80)
+    print("TLS LIFECYCLE")
+    print("=" * 80)
+
+    tls_handshakes = [ts for ts, evt, _ in events if evt == 'TLS_HANDSHAKE_START']
+    tls_established = [(ts, d) for ts, evt, d in events if evt == 'TLS_ESTABLISHED']
+    close_notify_sending = [ts for ts, evt, _ in events if evt == 'CLOSE_NOTIFY_SENDING']
+    close_notify_sent = [ts for ts, evt, _ in events if evt == 'CLOSE_NOTIFY_SENT']
+    close_notify_failed = [(ts, d) for ts, evt, d in events if evt == 'CLOSE_NOTIFY_FAILED']
+
+    print(f"  TLS handshakes started:    {len(tls_handshakes)}")
+    print(f"  TLS connections established: {len(tls_established)}")
+    print(f"  close_notify sending:      {len(close_notify_sending)}")
+    print(f"  close_notify sent (reader): {len(close_notify_sent)}")
+    print(f"  close_notify failed:       {len(close_notify_failed)}")
+
+    if close_notify_failed:
+        print(f"\n  close_notify failures:")
+        for ts, err in close_notify_failed[:10]:
+            print(f"    +{ts}ms: {err}")
+
+    # Protocol breakdown
+    h2_conns = [d for ts, d in tls_established if 'http2' in d.lower() or 'h2' in d.lower()]
+    h1_conns = [d for ts, d in tls_established if 'http1' in d.lower() or 'http/1' in d.lower()]
+    print(f"\n  Protocol breakdown:")
+    print(f"    HTTP/2: {len(h2_conns)}")
+    print(f"    HTTP/1.1: {len(h1_conns)}")
+
+    # TLS handshake timing (if we have both start and established)
+    if tls_handshakes and tls_established:
+        # Match handshake starts with established (approximate)
+        handshake_times = []
+        starts = sorted(tls_handshakes)
+        established = sorted([ts for ts, _ in tls_established])
+        for i, start in enumerate(starts):
+            # Find next established after this start
+            later = [e for e in established if e > start]
+            if later:
+                handshake_times.append(later[0] - start)
+        if handshake_times:
+            print(f"\n  TLS handshake duration:")
+            print(f"    Min: {min(handshake_times)}ms")
+            print(f"    Max: {max(handshake_times)}ms")
+            print(f"    Avg: {sum(handshake_times)/len(handshake_times):.1f}ms")
+
+    # CONNECTION LIFECYCLE
+    print()
+    print("=" * 80)
+    print("CONNECTION LIFECYCLE")
+    print("=" * 80)
+
+    conn_closed_header = [ts for ts, evt, _ in events if evt == 'CONN_CLOSED_HEADER']
+    conn_marked_dead = [ts for ts, evt, _ in events if evt == 'CONN_MARKED_DEAD']
+    reader_idles = [ts for ts, evt, _ in events if evt == 'READER_IDLE']
+
+    print(f"  Connection closed during header read: {len(conn_closed_header)}")
+    print(f"  Connection marked dead:               {len(conn_marked_dead)}")
+    print(f"  Reader idle timeouts (continued):     {len(reader_idles)}")
+
+    # Analyze GOAWAY → close_notify → socket close sequence
+    goaway_events = [(ts, d) for ts, evt, d in events if evt == 'GOAWAY']
+    if goaway_events and close_notify_sending:
+        print(f"\n  GOAWAY → close_notify timing:")
+        gaps = []
+        for goaway_ts, _ in goaway_events:
+            # Find close_notify within 100ms after GOAWAY
+            later_cn = [ts for ts in close_notify_sending if goaway_ts <= ts <= goaway_ts + 100]
+            if later_cn:
+                gaps.append(later_cn[0] - goaway_ts)
+        if gaps:
+            print(f"    Matched GOAWAY→close_notify pairs: {len(gaps)}")
+            print(f"    Gap min: {min(gaps)}ms, max: {max(gaps)}ms, avg: {sum(gaps)/len(gaps):.1f}ms")
+
+    # POOL OPERATIONS
+    print()
+    print("=" * 80)
+    print("POOL OPERATIONS")
+    print("=" * 80)
+
+    pool_creates = [(ts, d) for ts, evt, d in events if evt == 'POOL_CREATE']
+    pool_reuses = [(ts, d) for ts, evt, d in events if evt == 'POOL_REUSE']
+    pool_returns = [(ts, d) for ts, evt, d in events if evt == 'POOL_RETURN']
+    pool_destroys = [(ts, d) for ts, evt, d in events if evt == 'POOL_DESTROY']
+    pool_stales = [ts for ts, evt, _ in events if evt == 'POOL_STALE']
+
+    print(f"  Fresh connections created: {len(pool_creates)}")
+    print(f"  Connections reused:        {len(pool_reuses)}")
+    print(f"  Connections returned:      {len(pool_returns)}")
+    print(f"  Connections destroyed:     {len(pool_destroys)}")
+    print(f"  Stale connections:         {len(pool_stales)}")
+
+    if pool_reuses:
+        reuse_ratio = len(pool_reuses) / (len(pool_creates) + len(pool_reuses)) * 100
+        print(f"\n  Pool hit rate: {reuse_ratio:.1f}%")
+
+    # Connection lifetime (create → destroy)
+    if pool_creates and pool_destroys:
+        create_times = sorted([ts for ts, _ in pool_creates])
+        destroy_times = sorted([ts for ts, _ in pool_destroys])
+        if len(create_times) == len(destroy_times):
+            lifetimes = [d - c for c, d in zip(create_times, destroy_times)]
+            if lifetimes and all(l >= 0 for l in lifetimes):
+                print(f"\n  Connection lifetime:")
+                print(f"    Min: {min(lifetimes)}ms")
+                print(f"    Max: {max(lifetimes)}ms")
+                print(f"    Avg: {sum(lifetimes)/len(lifetimes):.1f}ms")
+
+    # SHUTDOWN SEQUENCE ANALYSIS
+    print()
+    print("=" * 80)
+    print("SHUTDOWN SEQUENCE ANALYSIS")
+    print("=" * 80)
+
+    # Look for the pattern: GOAWAY → reader exit → close_notify → marked dead
+    goaway_times = sorted([ts for ts, evt, _ in events if evt == 'GOAWAY'])
+    reader_exits = [(ts, d) for ts, evt, d in events if evt == 'READER_EXIT']
+
+    clean_shutdowns = 0
+    unclean_shutdowns = 0
+    for ts, details in reader_exits:
+        if 'false' in details.lower():  # shutdown_requested=false
+            unclean_shutdowns += 1
+        else:
+            clean_shutdowns += 1
+
+    print(f"  Reader exits (clean shutdown):   {clean_shutdowns}")
+    print(f"  Reader exits (unclean/GOAWAY):   {unclean_shutdowns}")
+
+    # Check if close_notify follows unclean exits
+    unclean_exit_times = [ts for ts, d in reader_exits if 'false' in d.lower()]
+    close_notify_after_exit = 0
+    for exit_ts in unclean_exit_times:
+        # Look for close_notify within 10ms after exit
+        if any(exit_ts <= cn_ts <= exit_ts + 10 for cn_ts in close_notify_sending):
+            close_notify_after_exit += 1
+
+    if unclean_shutdowns > 0:
+        pct = 100 * close_notify_after_exit / unclean_shutdowns
+        print(f"  close_notify after unclean exit: {close_notify_after_exit}/{unclean_shutdowns} ({pct:.1f}%)")
+
+    # Timeline of last 10 shutdown sequences
+    print(f"\n  Last 10 shutdown sequences:")
+    shutdown_events = [(ts, evt, d) for ts, evt, d in events
+                       if evt in ('GOAWAY', 'READER_EXIT', 'CLOSE_NOTIFY_SENDING',
+                                  'CLOSE_NOTIFY_SENT', 'CONN_MARKED_DEAD', 'POOL_DESTROY',
+                                  'CONN_CLOSED_HEADER')]
+    shutdown_events.sort(key=lambda x: x[0])
+
+    # Group by approximate time (within 50ms)
+    if shutdown_events:
+        groups = []
+        current_group = [shutdown_events[0]]
+        for evt in shutdown_events[1:]:
+            if evt[0] - current_group[-1][0] < 50:
+                current_group.append(evt)
+            else:
+                if len(current_group) >= 2:  # Only show multi-event sequences
+                    groups.append(current_group)
+                current_group = [evt]
+        if len(current_group) >= 2:
+            groups.append(current_group)
+
+        for group in groups[-10:]:
+            start_ts = group[0][0]
+            print(f"\n    +{start_ts}ms:")
+            for ts, evt, details in group:
+                delta = ts - start_ts
+                det_str = f" ({details})" if details else ""
+                print(f"      +{delta:3}ms {evt}{det_str}")
 
 if __name__ == '__main__':
     filename = sys.argv[1] if len(sys.argv) > 1 else 'lb.log'

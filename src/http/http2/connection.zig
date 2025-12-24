@@ -290,8 +290,11 @@ pub const H2Connection = struct {
         // We must wait for it to complete before touching any shared state
         if (self.reader_future) |*future| {
             if (trace) tls_log.debug("  H2 deinitAsync: phase 1 - awaiting reader task", .{});
-            // Send close_notify to unblock reader from recv() if still waiting
-            if (self.reader_running) {
+            // Send close_notify to unblock reader from recv() ONLY if:
+            // - Reader is still running (might be blocked in recv)
+            // - State is not dead (reader hasn't already sent close_notify)
+            // If state is dead, reader already sent close_notify and we'd corrupt TLS state
+            if (self.reader_running and self.state != .dead) {
                 self.sock.sendCloseNotify(io);
             }
             _ = future.await(io);

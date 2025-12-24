@@ -528,14 +528,13 @@ pub const Http2Client = struct {
             const was_clean_shutdown = shutdown_requested.*;
             log.debug("readerTask: exiting, shutdown_requested={}", .{was_clean_shutdown});
 
-            // Send close_notify FIRST - backend is waiting and may timeout quickly
-            // Must happen before signalAllStreams which triggers slow cascade of operations
-            // Also close TCP socket - if no request is waiting, no one else will close it
+            // On unclean shutdown (GOAWAY, error): send close_notify and mark dead
+            // DO NOT close socket here - deinitAsync will do it after awaiting us
+            // This prevents race where deinitAsync tries to send close_notify on closed socket
             if (!was_clean_shutdown) {
                 state.* = .dead;
                 sock.sendCloseNotify(io);
-                sock.closeSocketOnly(); // Close TCP - backend is waiting for this
-                log.debug("readerTask: sent close_notify and closed socket, marked dead", .{});
+                log.debug("readerTask: sent close_notify, marked dead", .{});
             }
 
             // Now signal waiting streams and update state
