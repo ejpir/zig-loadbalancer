@@ -292,8 +292,8 @@ pub const H2Connection = struct {
             if (trace) tls_log.debug("  H2 deinitAsync: phase 1 - awaiting reader task", .{});
             // Send close_notify to unblock reader from recv() ONLY if:
             // - Reader is still running (might be blocked in recv)
-            // - State is not dead (reader hasn't already sent close_notify)
-            // If state is dead, reader already sent close_notify and we'd corrupt TLS state
+            // - State is not dead (reader hasn't already sent close_notify and closed socket)
+            // If state is dead, reader already handled everything - don't touch socket!
             if (self.reader_running and self.state != .dead) {
                 self.sock.sendCloseNotify(io);
             }
@@ -302,19 +302,17 @@ pub const H2Connection = struct {
             if (trace) tls_log.debug("  H2 deinitAsync: phase 1 - reader task completed", .{});
         }
 
-        // Phase 2: Send close_notify if reader didn't (clean shutdown path)
-        // Reader sends close_notify when it exits abnormally (GOAWAY, error)
-        // If state != .dead, reader exited cleanly without sending
+        // Phase 2 & 3: Only if reader didn't already handle shutdown
+        // When state == .dead, reader already sent close_notify AND closed socket
         if (self.state != .dead) {
+            // Clean shutdown path - reader exited without sending close_notify
             if (trace) tls_log.debug("  H2 deinitAsync: phase 2 - sending close_notify (clean shutdown)", .{});
             self.sock.sendCloseNotify(io);
+            if (trace) tls_log.debug("  H2 deinitAsync: phase 3 - closing socket", .{});
+            self.sock.closeSocketOnly();
         } else if (trace) {
-            tls_log.debug("  H2 deinitAsync: phase 2 - reader already sent close_notify", .{});
+            tls_log.debug("  H2 deinitAsync: reader already closed socket, skipping", .{});
         }
-
-        // Phase 3: Now close the socket
-        if (trace) tls_log.debug("  H2 deinitAsync: phase 3 - closing socket", .{});
-        self.sock.closeSocketOnly();
 
         self.h2_client.deinit();
 
