@@ -232,10 +232,10 @@ Automatic HTTP/2 for HTTPS backends:
 - ALPN protocol negotiation during TLS handshake
 - HPACK header compression (static table)
 - Flow control (WINDOW_UPDATE frames)
+- Stream multiplexing (up to 8 concurrent requests per connection)
 - Graceful fallback to HTTP/1.1 if server doesn't support h2
 
 **What's not (yet):**
-- Stream multiplexing (single request per connection)
 - Server push
 - Connection pooling for HTTP/2 (fresh connection each request)
 
@@ -249,7 +249,7 @@ info(tls_trace): ALPN Protocol: http2
 ```bash
 zig build                        # Debug
 zig build -Doptimize=ReleaseFast # Production
-zig build test                   # 240 tests
+zig build test                   # 242 tests
 ```
 
 Requires Zig 0.16.0+

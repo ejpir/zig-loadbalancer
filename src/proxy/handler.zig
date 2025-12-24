@@ -33,6 +33,10 @@ const proxy_request = @import("request.zig");
 const proxy_io = @import("io.zig");
 const BackendConnection = @import("../http/backend_conn.zig").BackendConnection;
 
+// Simplified H2 pool (TigerBeetle style)
+const H2Connection = @import("../http/http2/connection.zig").H2Connection;
+const H2ConnectionPool = @import("../http/http2/pool.zig").H2ConnectionPool;
+
 const MAX_BACKENDS = config.MAX_BACKENDS;
 const MAX_HEADER_BYTES = config.MAX_HEADER_BYTES;
 const MAX_BODY_CHUNK_BYTES = config.MAX_BODY_CHUNK_BYTES;
@@ -267,7 +271,27 @@ inline fn streamingProxy(
         @tagName(ctx.request.method orelse .GET),
     });
 
-    // Phase 1: Acquire connection.
+    // For HTTPS backends with new H2 pool, skip acquireConnection entirely
+    // This avoids creating connections in BOTH old and new pools
+    if (backend.isHttps() and state.h2_pool != null) {
+        var proxy_state = ProxyState{
+            .sock = undefined,
+            .from_pool = false,
+            .can_return_to_pool = false,
+            .is_tls = true,
+            .is_http2 = true,
+            .tls_conn_ptr = null,
+            .status_code = 0,
+            .bytes_from_backend = 0,
+            .bytes_to_client = 0,
+            .body_had_error = false,
+            .client_write_error = false,
+            .backend_wants_close = false,
+        };
+        return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
+    }
+
+    // Phase 1: Acquire connection (HTTP/1.1 path only now).
     var proxy_state = proxy_connection.acquireConnection(
         types.BackendServer,
         ctx,
@@ -279,15 +303,15 @@ inline fn streamingProxy(
         return err;
     };
 
-    // Fix pointers after struct copy - TLS connection has internal pointers that
-    // become dangling when the UltraSock is copied by value.
-    proxy_state.sock.fixTlsPointersAfterCopy();
+    // Fix pointers after struct copy - TLS connection and stream reader/writer
+    // have internal pointers that become dangling when UltraSock is copied by value.
+    proxy_state.sock.fixAllPointersAfterCopy(ctx.io);
     proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
 
     // TigerStyle: validate state after acquisition.
     proxy_state.assertValid();
 
-    // Route to HTTP/2 handler if ALPN negotiated h2
+    // Route to HTTP/2 handler if ALPN negotiated h2 (fallback for non-HTTPS H2)
     if (proxy_state.is_http2) {
         return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
     }
@@ -369,7 +393,27 @@ inline fn streamingProxyShared(
         backend.port,
     });
 
-    // Phase 1: Acquire connection.
+    // For HTTPS backends with new H2 pool, skip acquireConnection entirely
+    // This avoids creating connections in BOTH old and new pools
+    if (backend.isHttps() and state.h2_pool != null) {
+        var proxy_state = ProxyState{
+            .sock = undefined,
+            .from_pool = false,
+            .can_return_to_pool = false,
+            .is_tls = true,
+            .is_http2 = true,
+            .tls_conn_ptr = null,
+            .status_code = 0,
+            .bytes_from_backend = 0,
+            .bytes_to_client = 0,
+            .body_had_error = false,
+            .client_write_error = false,
+            .backend_wants_close = false,
+        };
+        return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
+    }
+
+    // Phase 1: Acquire connection (HTTP/1.1 path only now).
     var proxy_state = proxy_connection.acquireConnection(
         shared_region.SharedBackend,
         ctx,
@@ -381,13 +425,14 @@ inline fn streamingProxyShared(
         return err;
     };
 
-    // Fix pointers after struct copy
-    proxy_state.sock.fixTlsPointersAfterCopy();
+    // Fix pointers after struct copy - TLS connection and stream reader/writer
+    // have internal pointers that become dangling when UltraSock is copied by value.
+    proxy_state.sock.fixAllPointersAfterCopy(ctx.io);
     proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
 
     proxy_state.assertValid();
 
-    // Route to HTTP/2 handler if ALPN negotiated h2
+    // Route to HTTP/2 handler if ALPN negotiated h2 (fallback for non-HTTPS H2)
     if (proxy_state.is_http2) {
         return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
     }
@@ -446,58 +491,28 @@ inline fn streamingProxyShared(
 // HTTP/2 Streaming Proxy (uses BackendConnection wrapper)
 // ============================================================================
 
-/// HTTP/2 proxy implementation - uses BackendConnection for h2 framing.
-/// Generic over backend type to support both BackendServer and SharedBackend.
-fn streamingProxyHttp2(
+const h2_client_mod = @import("../http/http2/client.zig");
+const Http2Client = h2_client_mod.Http2Client;
+const H2Response = h2_client_mod.Response;
+
+/// Forward HTTP/2 response to client - shared by pooled and fresh connections
+fn forwardH2Response(
     ctx: *const http.Context,
-    backend: anytype,
     proxy_state: *ProxyState,
-    state: *WorkerState,
+    response: *H2Response,
     backend_idx: u32,
     start_ns: ?std.time.Instant,
     req_id: u32,
 ) ProxyError!http.Respond {
-    log.debug("[REQ {d}] Using HTTP/2 for backend {d}", .{ req_id, backend_idx });
-
-    // Initialize HTTP/2 connection wrapper
-    var h2_conn = BackendConnection.init(std.heap.page_allocator);
-    defer h2_conn.deinit();
-
-    // Connect and perform h2 handshake (connection preface + SETTINGS)
-    h2_conn.connect(&proxy_state.sock, ctx.io) catch |err| {
-        log.err("[REQ {d}] HTTP/2 connection failed: {}", .{ req_id, err });
-        proxy_state.sock.close_blocking();
-        return ProxyError.ConnectionFailed;
-    };
-
-    // Build request parameters
-    const method = @tagName(ctx.request.method orelse .GET);
-    const path = ctx.request.uri orelse "/";
-    const host = backend.getFullHost();
-
-    // Send HTTP/2 request and get response
-    var response = h2_conn.sendRequest(
-        ctx.io,
-        method,
-        path,
-        host,
-        &.{}, // Additional headers - could extract from ctx.request.headers
-        ctx.request.body,
-    ) catch |err| {
-        log.err("[REQ {d}] HTTP/2 request failed: {}", .{ req_id, err });
-        proxy_state.sock.close_blocking();
-        return ProxyError.SendFailed;
-    };
-    defer response.deinit(std.heap.page_allocator);
+    const body = response.getBody();
 
     // Update proxy state with response info
     proxy_state.status_code = response.status;
-    proxy_state.bytes_from_backend = @intCast(response.body.len);
+    proxy_state.bytes_from_backend = @intCast(body.len);
 
     // Handle invalid/missing status code
     if (response.status == 0) {
         log.err("[REQ {d}] HTTP/2 response has invalid status: 0", .{req_id});
-        proxy_state.sock.close_blocking();
         return ProxyError.InvalidResponse;
     }
 
@@ -510,15 +525,14 @@ fn streamingProxyHttp2(
     http_response.mime = http.Mime.HTML; // Default to HTML for HTTP/2 responses
 
     // Write response headers
-    http_response.headers_into_writer_opts(client_writer, response.body.len, true) catch {
+    http_response.headers_into_writer_opts(client_writer, body.len, true) catch {
         proxy_state.client_write_error = true;
-        proxy_state.sock.close_blocking();
         return ProxyError.SendFailed;
     };
 
     // Write response body
-    if (response.body.len > 0) {
-        client_writer.writeAll(response.body) catch {
+    if (body.len > 0) {
+        client_writer.writeAll(body) catch {
             proxy_state.client_write_error = true;
         };
     }
@@ -526,19 +540,80 @@ fn streamingProxyHttp2(
         proxy_state.client_write_error = true;
     };
 
-    proxy_state.bytes_to_client = @intCast(response.body.len);
+    proxy_state.bytes_to_client = @intCast(body.len);
 
     log.debug("[REQ {d}] HTTP/2 response: status={d} body={d} bytes", .{
         req_id,
         response.status,
-        response.body.len,
+        body.len,
     });
 
-    // HTTP/2 connections can be reused for multiple streams, but for simplicity
-    // we don't pool them yet (would need HTTP/2 connection pooling)
-    proxy_state.can_return_to_pool = false;
+    // Record metrics
+    const duration_ns: u64 = if (start_ns) |start| blk: {
+        const end_ns = std.time.Instant.now() catch break :blk 0;
+        break :blk end_ns.since(start);
+    } else 0;
+    const duration_ms: i64 = @intCast(duration_ns / 1_000_000);
+    _ = backend_idx;
 
-    return streamingProxy_finalize(ctx, proxy_state, state, backend_idx, start_ns, req_id);
+    metrics.global_metrics.recordRequest(duration_ms, proxy_state.status_code);
+
+    // Return response type
+    if (proxy_state.client_write_error) {
+        log.debug("[REQ {d}] => .close (client write error)", .{req_id});
+        return .close;
+    }
+    log.debug("[REQ {d}] => .responded", .{req_id});
+    return .responded;
+}
+
+/// HTTP/2 proxy implementation - uses BackendConnection for h2 framing.
+/// Generic over backend type to support both BackendServer and SharedBackend.
+/// Simplified HTTP/2 proxy using new pool API
+/// TigerBeetle style: minimal handler, complexity hidden in pool/connection
+fn streamingProxyHttp2(
+    ctx: *const http.Context,
+    backend: anytype,
+    proxy_state: *ProxyState,
+    state: *WorkerState,
+    backend_idx: u32,
+    start_ns: ?std.time.Instant,
+    req_id: u32,
+) ProxyError!http.Respond {
+    log.debug("[REQ {d}] HTTP/2 request to backend {d}", .{ req_id, backend_idx });
+
+    // Get pool (must exist)
+    const pool = state.h2_pool orelse return ProxyError.ConnectionFailed;
+
+    // Get or create connection (pool handles everything: TLS, handshake, retry)
+    var conn = pool.getOrCreate(backend_idx, ctx.io) catch |err| {
+        log.warn("[REQ {d}] H2 pool getOrCreate failed: {}", .{ req_id, err });
+        return ProxyError.ConnectionFailed;
+    };
+
+    // Make request (connection handles: send, reader spawn, await)
+    var response = conn.request(
+        @tagName(ctx.request.method orelse .GET),
+        ctx.request.uri orelse "/",
+        backend.getFullHost(),
+        ctx.request.body,
+        ctx.io,
+    ) catch |err| {
+        log.warn("[REQ {d}] H2 request failed: {}", .{ req_id, err });
+        pool.release(conn, false, ctx.io);
+        return ProxyError.SendFailed;
+    };
+    defer response.deinit();
+
+    // Update proxy state
+    proxy_state.status_code = response.status;
+    proxy_state.bytes_from_backend = @intCast(response.body.items.len);
+
+    // Release connection back to pool
+    pool.release(conn, true, ctx.io);
+
+    // Forward response to client
+    return forwardH2Response(ctx, proxy_state, &response, backend_idx, start_ns, req_id);
 }
 
 // ============================================================================

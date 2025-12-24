@@ -12,3 +12,11 @@ profile.json
 
 # Temp files
 simple_deps
+hello
+main
+test_hello
+test_hello.zig
+zig-x86_64-linux-*.tar.xz
+zig-x86_64-linux-*/
+zig-x86-linux-*.tar.xz
+zig-x86-linux-*/

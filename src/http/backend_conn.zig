@@ -107,14 +107,16 @@ pub const BackendConnection = struct {
     ) !Response {
         var client = &self.h2_client.?;
 
+        // Queue request frames
         const stream_id = try client.sendRequest(
-            self.sock,
-            io,
             method,
             path,
             authority,
             body,
         );
+
+        // Flush to socket (single TLS write)
+        try client.flush(self.sock, io);
 
         var h2_response = try client.readResponse(self.sock, io, stream_id);
 

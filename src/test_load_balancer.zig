@@ -13,8 +13,8 @@ pub const health_probe = @import("health/probe.zig");
 pub const backend_selector = @import("lb/selector.zig");
 pub const worker_state = @import("lb/worker.zig");
 
-// Multiprocess tests
-pub const connection_reuse = @import("multiprocess/connection_reuse.zig");
+// Proxy module tests
+pub const connection_reuse = @import("proxy/connection_reuse.zig");
 pub const proxy_test = @import("multiprocess/proxy_test.zig");
 pub const component_integration_test = @import("multiprocess/component_integration_test.zig");
 

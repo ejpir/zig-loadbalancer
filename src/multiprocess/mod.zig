@@ -17,7 +17,7 @@ pub const health = @import("../health/probe.zig");
 pub const circuit_breaker = @import("../health/circuit_breaker.zig");
 pub const backend_selector = @import("../lb/selector.zig");
 pub const worker_state = @import("../lb/worker.zig");
-pub const connection_reuse = @import("connection_reuse.zig");
+pub const connection_reuse = @import("../proxy/connection_reuse.zig");
 
 const shared_region = @import("../memory/shared_region.zig");
 

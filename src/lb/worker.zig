@@ -11,6 +11,7 @@ const types = @import("../core/types.zig");
 const metrics = @import("../metrics/mod.zig");
 const simple_pool = @import("../memory/pool.zig");
 const shared_region = @import("../memory/shared_region.zig");
+const H2ConnectionPool = @import("../http/http2/pool.zig").H2ConnectionPool;
 
 pub const circuit_breaker = @import("../health/circuit_breaker.zig");
 pub const backend_selector = @import("selector.zig");
@@ -48,6 +49,10 @@ pub const WorkerState = struct {
     // Shared region for hot reload (null in single-process mode)
     shared_region: ?*shared_region.SharedRegion = null,
     connection_pool: *simple_pool.SimpleConnectionPool,
+    // HTTP/2 connection pool (TigerBeetle style)
+    h2_pool: ?*H2ConnectionPool = null,
+    // Allocator for HTTP/2 pooled connections
+    allocator: std.mem.Allocator = std.heap.page_allocator,
     circuit_breaker: CircuitBreaker,
     config: Config,
     worker_id: usize = 0,
