@@ -28,15 +28,13 @@ pub fn main() !void {
         load_balancing.suite,
     };
 
-    var total_passed: usize = 0;
-    var total_failed: usize = 0;
     var suite_failures: usize = 0;
 
     for (suites) |suite| {
-        harness.runSuite(allocator, suite) catch {
+        harness.runSuite(allocator, suite) catch |err| {
+            std.debug.print("  Suite error: {}\n", .{err});
             suite_failures += 1;
         };
-        total_passed += suite.tests.len; // Approximate
     }
 
     std.debug.print("\n\x1b[1m════════════════════════════════════════\x1b[0m\n", .{});
@@ -44,7 +42,7 @@ pub fn main() !void {
         std.debug.print("\x1b[32m✓ All test suites passed!\x1b[0m\n", .{});
     } else {
         std.debug.print("\x1b[31m✗ {d} suite(s) had failures\x1b[0m\n", .{suite_failures});
-        std.process.exit(1);
+        return error.TestSuitesFailed;
     }
 }
 
