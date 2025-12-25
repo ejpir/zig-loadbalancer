@@ -4,6 +4,28 @@
 //! Single request() method handles everything: send, spawn reader, await.
 //! Per-connection TLS buffers for safe concurrent multiplexing.
 //!
+//! ## Synchronization Strategy
+//!
+//! We use atomics for simple counters/flags, mutexes for multi-step operations:
+//!
+//! | Primitive        | Type    | Why                                          |
+//! |------------------|---------|----------------------------------------------|
+//! | ref_count        | Atomic  | Single counter, fetchAdd/fetchSub            |
+//! | active_streams   | Atomic  | Single counter, concurrent inc/dec           |
+//! | reader_running   | Atomic  | Single flag, cmpxchg for race-free spawn     |
+//! | write_mutex      | Mutex   | Multi-step: encode → buffer → flush          |
+//! | stream.mutex     | Mutex   | Must wait for condition signal               |
+//! | stream.condition | CondVar | Sleep until reader signals completion        |
+//!
+//! **Why not all atomics?**
+//! - Atomics: ONE instruction, never blocks (fetchAdd, cmpxchg)
+//! - Mutex: Protects MULTIPLE operations as atomic unit
+//! - Condition: Lets coroutine SLEEP until signaled
+//!
+//! Atomics cannot protect multi-step sequences or wait for events.
+//! write_mutex ensures encode→buffer→flush completes without interleaving.
+//! stream.condition lets request() sleep until reader dispatches response.
+//!
 //! TigerBeetle style:
 //! - Fixed-size arrays, no hidden allocations
 //! - Explicit state, no implicit transitions
@@ -49,12 +71,15 @@ pub const H2Connection = struct {
     /// Binary state machine
     state: State = .ready,
 
-    // Multiplexing mutexes (must be at stable address - struct is heap-allocated)
+    // Multiplexing mutex (must be at stable address - struct is heap-allocated)
+    // CANNOT be atomic: protects multi-step TLS write sequence (encode → buffer → flush)
+    // All streams share this - contention is the price of safe multiplexing
     write_mutex: Io.Mutex = .init,
-    stream_mutex: Io.Mutex = .init,
 
     // Reader task tracking
-    reader_running: bool = false,
+    // CRITICAL: Use atomic for reader_running to prevent race where two requests
+    // both see false and spawn duplicate readers (causes double-close panic)
+    reader_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shutdown_requested: bool = false,
     reader_future: ?Io.Future(void) = null,
 
@@ -64,6 +89,12 @@ pub const H2Connection = struct {
     // Backend tracking and staleness detection
     backend_idx: u32 = 0,
     last_used_ns: i64 = 0,
+
+    // Reference counting for safe multiplexing
+    // Incremented by pool.getOrCreate(), decremented by pool.release()
+    // Only destroy when ref_count hits 0
+    // CRITICAL: Must be atomic - multiple coroutines may release concurrently
+    ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // Per-connection TLS buffers - CRITICAL for concurrent connections!
     // Threadlocal buffers are shared between connections on same thread.
@@ -150,53 +181,68 @@ pub const H2Connection = struct {
         if (trace) tls_log.debug("  H2 step 1: acquiring write_mutex", .{});
         log.debug("request: sending {s} {s}", .{ method, path });
         try self.write_mutex.lock(io);
-        const stream_id = try self.h2_client.sendRequest(method, path, host, body);
+
+        // Re-check state after acquiring mutex - connection may have died while waiting
+        if (self.state == .dead) {
+            self.write_mutex.unlock(io);
+            log.debug("request: connection died while waiting for mutex", .{});
+            return error.ConnectionDead;
+        }
+
+        // Send and flush - unlock mutex on ANY exit (success or error)
+        const stream_id = self.h2_client.sendRequest(method, path, host, body) catch |err| {
+            self.write_mutex.unlock(io);
+            return err;
+        };
         if (trace) tls_log.debug("  H2 step 1: flushing stream {d}", .{stream_id});
-        try self.h2_client.flush(&self.sock, io);
+        self.h2_client.flush(&self.sock, io) catch |err| {
+            self.write_mutex.unlock(io);
+            return err;
+        };
         self.write_mutex.unlock(io);
         if (trace) tls_log.debug("  H2 step 1: sent stream {d}, write_mutex released", .{stream_id});
         log.debug("request: sent stream {d}", .{stream_id});
 
-        // STEP 2: Lock stream_mutex FIRST (critical ordering)
-        // When reader tries to lock for dispatch, it BLOCKS -> Io.async yields
-        log.debug("request: locking stream_mutex", .{});
-        try self.stream_mutex.lock(io);
-
-        // STEP 3: Spawn reader if needed (will block on our mutex)
-        if (!self.reader_running) {
-            // Reset shutdown flag (may have been set when connection was released to pool)
-            self.shutdown_requested = false;
-            log.debug("request: spawning reader", .{});
-            if (!self.spawnReader(io)) {
-                self.stream_mutex.unlock(io);
-                return error.ConnectionDead;
-            }
-        }
-
-        // STEP 4: Wait for completion (condition.wait releases mutex)
+        // STEP 2: Find our stream slot (just allocated, must exist)
         const slot = self.h2_client.findStreamSlot(stream_id) orelse {
             log.err("Stream {d} not found in slots", .{stream_id});
-            self.stream_mutex.unlock(io);
             return error.StreamNotFound;
         };
 
+        // STEP 3: Spawn reader if needed AFTER send but BEFORE locking mutex
+        // Critical ordering:
+        // - After send: so reader has data to receive (won't timeout waiting)
+        // - Before lock: so when Io.async yields, we don't hold the mutex
+        // - Reader might dispatch our frame, but we're not in wait yet
+        //   That's OK - completed flag will be set, and our wait loop checks it first
+        // spawnReader uses atomic cmpxchg internally - safe to call from multiple coroutines
+        if (!self.spawnReader(io)) {
+            return error.ConnectionDead;
+        }
+
+        // STEP 4: Lock per-stream mutex and wait for completion
+        // If reader already set completed=true, the while loop exits immediately
+        log.debug("request: about to lock stream {d} mutex, slot {d}", .{ stream_id, slot });
+        log.debug("request: locking stream {d} mutex, slot {d}", .{ stream_id, slot });
+        try self.h2_client.streams[slot].mutex.lock(io);
+
         log.debug("request: waiting on stream {d}, slot {d}", .{ stream_id, slot });
         while (!self.h2_client.streams[slot].completed) {
-            try self.h2_client.streams[slot].condition.wait(io, &self.stream_mutex);
+            try self.h2_client.streams[slot].condition.wait(io, &self.h2_client.streams[slot].mutex);
         }
 
         // STEP 5: Check for stream errors and retry conditions
         if (self.h2_client.streams[slot].retry_needed) {
             log.debug("Stream {d} needs retry (GOAWAY)", .{stream_id});
+            self.h2_client.streams[slot].mutex.unlock(io);
             self.h2_client.streams[slot].reset();
-            self.stream_mutex.unlock(io);
             return error.RetryNeeded;
         }
 
         if (self.h2_client.streams[slot].error_code) |code| {
             log.debug("Stream {d} reset with error {d}", .{ stream_id, code });
+            self.h2_client.streams[slot].mutex.unlock(io);
             self.h2_client.streams[slot].reset();
-            self.stream_mutex.unlock(io);
             return error.StreamReset;
         }
 
@@ -213,11 +259,11 @@ pub const H2Connection = struct {
         self.h2_client.streams[slot].body = .{};
         self.h2_client.streams[slot].active = false;
 
-        // TigerBeetle style: assert correct state, bugs should crash
-        std.debug.assert(self.h2_client.active_streams > 0);
-        self.h2_client.active_streams -= 1;
+        // Atomically decrement active_streams (returns previous value)
+        const prev = self.h2_client.active_streams.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0); // Must have had at least 1 active stream
 
-        self.stream_mutex.unlock(io);
+        self.h2_client.streams[slot].mutex.unlock(io);
         self.last_used_ns = currentTimeNs();
         log.debug("request: completed stream {d}, status {d}", .{ stream_id, response.status });
         return response;
@@ -226,24 +272,33 @@ pub const H2Connection = struct {
     /// Spawn async reader task for frame dispatch
     /// Returns true if reader started, false if connection is dead
     /// Safe to call multiple times - no-op if already running
+    /// Uses atomic cmpxchg to prevent race condition where two requests
+    /// both spawn readers (causes double-close panic)
     fn spawnReader(self: *Self, io: Io) bool {
-        if (self.reader_running) {
+        // Atomic compare-and-swap: only proceed if we're the one who set it to true
+        // This prevents the race where two requests both see false and spawn readers
+        if (self.reader_running.cmpxchgStrong(false, true, .acq_rel, .acquire)) |_| {
+            // cmpxchg returned non-null = failed = someone else already set it
             log.debug("spawnReader: already running", .{});
             return true;
         }
+
+        // We won the race - we set reader_running from false to true
         if (self.state == .dead) {
             log.warn("spawnReader: connection dead", .{});
+            self.reader_running.store(false, .release);
             return false;
         }
         if (self.goaway_received) {
             log.warn("spawnReader: GOAWAY received", .{});
+            self.reader_running.store(false, .release);
             return false;
         }
 
         log.debug("spawnReader: starting reader task", .{});
-        self.reader_running = true;
+        self.shutdown_requested = false;
 
-        // Store future for proper cleanup (prevents async closure memory leak)
+        // Spawn reader and store future for proper cleanup in deinitAsync
         self.reader_future = Io.async(
             io,
             Http2Client.readerTask,
@@ -254,10 +309,10 @@ pub const H2Connection = struct {
                 &self.reader_running,
                 &self.state,
                 &self.goaway_received,
-                &self.stream_mutex,
                 io,
             },
         );
+        log.debug("spawnReader: Io.async returned, future={?}", .{if (self.reader_future != null) @as(?*anyopaque, @ptrCast(&self.reader_future.?)) else null});
 
         return true;
     }
@@ -274,7 +329,7 @@ pub const H2Connection = struct {
         return self.state == .ready and !self.goaway_received;
     }
 
-    /// Clean up resources (async version - properly awaits reader)
+    /// Clean up resources (async version - waits for reader to exit)
     /// Use when you have Io context (from request handler)
     pub fn deinitAsync(self: *Self, io: Io) void {
         const trace = config_mod.isTlsTraceEnabled();
@@ -285,30 +340,27 @@ pub const H2Connection = struct {
         self.shutdown_requested = true;
         if (trace) tls_log.debug("  H2 deinitAsync: shutdown_requested=true", .{});
 
-        // Phase 1: ALWAYS await reader future if it exists
-        // Critical: reader might still be in defer block even if reader_running=false
-        // We must wait for it to complete before touching any shared state
+        // Await reader future if it exists - ensures reader's defer block completes
         if (self.reader_future) |*future| {
-            if (trace) tls_log.debug("  H2 deinitAsync: phase 1 - awaiting reader task", .{});
-            // Send close_notify to unblock reader from recv() ONLY if:
-            // - Reader is still running (might be blocked in recv)
-            // - State is not dead (reader hasn't already sent close_notify and closed socket)
-            // If state is dead, reader already handled everything - don't touch socket!
-            if (self.reader_running and self.state != .dead) {
+            if (trace) tls_log.debug("  H2 deinitAsync: awaiting reader future", .{});
+
+            // Send close_notify to unblock reader from recv()
+            // Only if state is not dead (reader hasn't already closed socket)
+            if (self.reader_running.load(.acquire) and self.state != .dead) {
                 self.sock.sendCloseNotify(io);
             }
+
+            // Properly await the reader task
             _ = future.await(io);
             self.reader_future = null;
-            if (trace) tls_log.debug("  H2 deinitAsync: phase 1 - reader task completed", .{});
+            if (trace) tls_log.debug("  H2 deinitAsync: reader future completed", .{});
         }
 
-        // Phase 2 & 3: Only if reader didn't already handle shutdown
+        // Close socket if reader didn't already
         // When state == .dead, reader already sent close_notify AND closed socket
         if (self.state != .dead) {
-            // Clean shutdown path - reader exited without sending close_notify
-            if (trace) tls_log.debug("  H2 deinitAsync: phase 2 - sending close_notify (clean shutdown)", .{});
+            if (trace) tls_log.debug("  H2 deinitAsync: closing socket", .{});
             self.sock.sendCloseNotify(io);
-            if (trace) tls_log.debug("  H2 deinitAsync: phase 3 - closing socket", .{});
             self.sock.closeSocketOnly();
         } else if (trace) {
             tls_log.debug("  H2 deinitAsync: reader already closed socket, skipping", .{});
@@ -357,7 +409,7 @@ test "H2Connection: initial state" {
 
     try std.testing.expectEqual(State.ready, conn.state);
     try std.testing.expect(!conn.goaway_received);
-    try std.testing.expect(!conn.reader_running);
+    try std.testing.expect(!conn.reader_running.load(.acquire));
     try std.testing.expect(conn.isReady());
 }
 

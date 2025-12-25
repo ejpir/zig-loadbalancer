@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, fixrace]
+  pull_request:
+    branches: [main, master]
+
+env:
+  ZIG_VERSION: "0.16.0-dev.1657+985a3565c"
+  ZIG_URL: "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.1657+985a3565c.tar.xz"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: ~/zig
+          key: zig-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        run: |
+          if [ ! -d ~/zig ]; then
+            mkdir -p ~/zig
+            curl -L ${{ env.ZIG_URL }} | tar -xJ -C ~/zig --strip-components=1
+          fi
+          echo "$HOME/zig" >> $GITHUB_PATH
+
+      - name: Verify Zig version
+        run: zig version
+
+      - name: Patch ecdsa.zig for API compatibility
+        run: sed -i 's/mem\.trimLeft/mem.trimStart/g' ~/zig/lib/std/crypto/ecdsa.zig
+
+      - name: Build
+        run: zig build
+
+      - name: Run unit tests
+        run: zig build test
+
+  release-build:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux
+            artifact: load_balancer-x86_64-linux
+          - target: aarch64-linux
+            artifact: load_balancer-aarch64-linux
+          - target: x86_64-macos
+            artifact: load_balancer-x86_64-macos
+          - target: aarch64-macos
+            artifact: load_balancer-aarch64-macos
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: ~/zig
+          key: zig-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        run: |
+          if [ ! -d ~/zig ]; then
+            mkdir -p ~/zig
+            curl -L ${{ env.ZIG_URL }} | tar -xJ -C ~/zig --strip-components=1
+          fi
+          echo "$HOME/zig" >> $GITHUB_PATH
+
+      - name: Patch ecdsa.zig for API compatibility
+        run: sed -i 's/mem\.trimLeft/mem.trimStart/g' ~/zig/lib/std/crypto/ecdsa.zig
+
+      - name: Build release binary
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+          mv zig-out/bin/load_balancer ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}

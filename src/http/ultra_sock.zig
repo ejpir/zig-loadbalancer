@@ -551,6 +551,42 @@ pub const UltraSock = struct {
         }
     }
 
+    /// Receive with timeout - returns error.Timeout if no data within timeout_ms
+    /// For TLS: uses regular recv (TLS doesn't support raw socket timeout)
+    /// For plain: uses socket receiveTimeout directly
+    ///
+    /// Note: For TLS, timeout is approximate - we rely on the reader task's
+    /// periodic timeout checks between recv calls.
+    pub fn recvWithTimeout(self: *UltraSock, io: Io, buffer: []u8, timeout_ms: u32) !usize {
+        if (!self.connected) {
+            return error.NotConnected;
+        }
+
+        // TLS path: can't use raw socket timeout (corrupts TLS state)
+        // Just use regular recv - timeout handled at reader task level
+        if (self.tls_conn != null) {
+            return self.recv(io, buffer);
+        }
+
+        // Plain socket path - use receiveTimeout directly
+        if (self.stream) |stream| {
+            const duration = Io.Clock.Duration{
+                .raw = Io.Duration.fromMilliseconds(@as(i64, timeout_ms)),
+                .clock = .real,
+            };
+            const timeout = Io.Timeout{ .duration = duration };
+            const msg = stream.socket.receiveTimeout(io, buffer, timeout) catch |err| {
+                if (err == error.Timeout) {
+                    return error.Timeout;
+                }
+                self.connected = false;
+                return error.ReadFailed;
+            };
+            return msg.data.len;
+        }
+        return error.NotConnected;
+    }
+
     /// Get the TLS connection (for direct access to writeAll/read/next)
     pub fn getTlsConnection(self: *UltraSock) ?*tls.Connection {
         if (self.tls_conn != null) {
@@ -636,14 +672,20 @@ pub const UltraSock = struct {
 
     /// Send TLS close_notify alert without closing the socket
     /// Use this for graceful shutdown - allows peer to send their close_notify back
-    /// Note: Does NOT check `connected` flag - recv errors set connected=false but
-    /// we should still send close_notify if TLS connection exists
+    /// Only sends if socket is still connected - if recv failed, TLS state may be corrupt
     pub fn sendCloseNotify(self: *UltraSock, io: Io) void {
         const trace_enabled = config_mod.isTlsTraceEnabled();
         const tls_log = std.log.scoped(.tls_trace);
 
-        // Only check has_reader_writer and tls_conn - NOT connected
-        // After recv error/EOF, connected=false but we can still send close_notify
+        // MUST check connected - if recv failed, TLS cipher state may be corrupt
+        // Trying to encrypt close_notify with corrupt cipher causes panic
+        if (!self.connected) {
+            if (trace_enabled) {
+                tls_log.debug("Skipping close_notify: socket disconnected for {s}:{}", .{ self.host, self.port });
+            }
+            return;
+        }
+
         if (self.has_reader_writer) {
             if (self.tls_conn) |*conn| {
                 // Update io context for the writer

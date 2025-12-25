@@ -90,8 +90,8 @@ pub fn acquireConnection(
         return ProxyError.BackendUnavailable;
     };
 
-    // Set read timeout to detect dead connections.
-    sock.setReadTimeout(1000) catch {};
+    // Enable TCP keepalive to detect dead connections (replaces SO_RCVTIMEO)
+    sock.enableKeepalive() catch {};
 
     // Log negotiated protocol
     if (sock.isHttp2()) {

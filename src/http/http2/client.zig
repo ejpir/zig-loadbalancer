@@ -46,9 +46,12 @@ pub const Stream = struct {
     body: std.ArrayList(u8) = .{},
     end_stream: bool = false,
 
-    // Async signaling (replaces pipes)
-    condition: Io.Condition = .{},
-    completed: bool = false,
+    // Per-stream mutex+condition for async multiplexing
+    // CANNOT be atomic: request() must SLEEP until reader signals completion
+    // Flow: request() waits on condition → reader dispatches frame → signals condition
+    mutex: Io.Mutex = .init,
+    condition: Io.Condition = Io.Condition.init,
+    completed: bool = false, // Set by reader, checked by request()
     error_code: ?u32 = null,
     retry_needed: bool = false, // Set when GOAWAY indicates stream wasn't processed
 
@@ -61,7 +64,7 @@ pub const Stream = struct {
         self.completed = false;
         self.error_code = null;
         self.retry_needed = false;
-        self.condition = .{};
+        // Don't reset mutex/condition - they're managed by lock/unlock
         // Don't deinit body - reuse capacity
         self.body.items.len = 0;
     }
@@ -85,7 +88,10 @@ pub const Http2Client = struct {
 
     /// Pending streams for multiplexing (fixed-size, no allocation)
     streams: [MAX_STREAMS]Stream = [_]Stream{.{}} ** MAX_STREAMS,
-    active_streams: usize = 0,
+    /// Count of in-flight streams - MUST be atomic
+    /// Incremented under write_mutex, decremented under stream.mutex (different mutexes!)
+    /// Without atomic: concurrent decrements cause lost updates → count goes negative
+    active_streams: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     /// Write buffer for frame batching (enables safe multiplexing)
     /// Frames are queued here, then flushed in one TLS write
@@ -195,7 +201,7 @@ pub const Http2Client = struct {
         self.streams[slot].body.items.len = 0;
         self.streams[slot].completed = false;
         self.streams[slot].error_code = null;
-        self.active_streams += 1;
+        _ = self.active_streams.fetchAdd(1, .acq_rel);
 
         log.debug("Queueing HTTP/2 request: method={s}, path={s}, stream={d}, slot={d}", .{
             method, path, stream_id, slot,
@@ -292,7 +298,7 @@ pub const Http2Client = struct {
         // Clear stream slot (but don't deinit body - it's moved to response)
         self.streams[slot].active = false;
         self.streams[slot].body = .{}; // Reset to empty (ownership transferred)
-        self.active_streams -= 1;
+        _ = self.active_streams.fetchSub(1, .acq_rel);
 
         return response;
     }
@@ -428,8 +434,8 @@ pub const Http2Client = struct {
     }
 
     /// Get count of active streams
-    pub inline fn activeStreamCount(self: *const Self) usize {
-        return self.active_streams;
+    pub inline fn activeStreamCount(self: *Self) usize {
+        return self.active_streams.load(.acquire);
     }
 
     // --- Stream ID management ---
@@ -515,67 +521,66 @@ pub const Http2Client = struct {
         self: *Self,
         sock: *UltraSock,
         shutdown_requested: *bool,
-        reader_running: *bool,
+        reader_running: *std.atomic.Value(bool),
         state: *State,
         goaway_received: *bool,
-        stream_mutex: *Io.Mutex,
         io: Io,
     ) void {
-        log.debug("readerTask: started, active_streams={d}", .{self.active_streams});
+        log.debug("readerTask: started, active_streams={d}", .{self.active_streams.load(.acquire)});
         defer {
             // CRITICAL: Capture shutdown state BEFORE any other operations
             // After signalAllStreams: request() wakes -> release() -> deinitAsync() sets shutdown_requested=true
             const was_clean_shutdown = shutdown_requested.*;
             log.debug("readerTask: exiting, shutdown_requested={}", .{was_clean_shutdown});
 
-            // On unclean shutdown (GOAWAY, error): send close_notify, close socket, mark dead
-            // We MUST close the socket here - backend is waiting for TCP FIN after close_notify
-            // deinitAsync will check state==dead and skip all socket operations
+            // On unclean shutdown (GOAWAY, error): close socket, mark dead
+            // Only send close_notify if socket is still connected (TLS state valid)
+            // If backend already closed, TLS cipher state may be corrupt - skip close_notify
             if (!was_clean_shutdown) {
                 state.* = .dead;
-                sock.sendCloseNotify(io);
+                if (sock.connected) {
+                    sock.sendCloseNotify(io);
+                }
                 sock.closeSocketOnly();
-                log.debug("readerTask: sent close_notify, closed socket, marked dead", .{});
+                log.debug("readerTask: closed socket, marked dead", .{});
             }
 
             // Now signal waiting streams and update state
             goaway_received.* = self.goaway_received;
-            self.signalAllStreams(stream_mutex, io);
-            reader_running.* = false;
+            self.signalAllStreams(io);
+            reader_running.store(false, .release);
         }
 
         var recv_buf: [mod.MAX_FRAME_SIZE_DEFAULT + 9]u8 = undefined;
 
         while (!shutdown_requested.*) {
             // Read frame header (9 bytes) - loop to handle partial reads
+            // Use 5 second timeout to detect dead connections
+            const RECV_TIMEOUT_MS: u32 = 5000;
             var header_buf: [9]u8 = undefined;
             var header_read: usize = 0;
             log.debug("Reader: waiting for frame header...", .{});
             while (header_read < 9) {
-                const n = sock.recv(io, header_buf[header_read..]) catch |err| {
+                const n = sock.recvWithTimeout(io, header_buf[header_read..], RECV_TIMEOUT_MS) catch |err| {
                     // Check shutdown first
                     if (shutdown_requested.*) {
                         log.debug("Reader: shutdown requested during recv", .{});
                         return;
                     }
 
-                    // If no active streams, this might be an idle timeout while pooled
-                    // Check if socket fd is still valid (recv sets connected=false on any error)
-                    if (self.active_streams == 0) {
-                        // Check if socket is actually dead or just timed out
-                        if (sock.getFd()) |fd| {
-                            // Socket fd still valid - likely just a timeout, not a real disconnect
-                            // Restore connected flag and continue waiting
-                            if (!sock.hasStaleData()) {
-                                sock.connected = true;
-                                log.debug("Reader: idle timeout, continuing (fd={}, no active streams)", .{fd});
-                                continue;
-                            }
+                    // Timeout with no active streams - exit cleanly (connection idle)
+                    if (err == error.Timeout) {
+                        if (self.active_streams.load(.acquire) == 0) {
+                            log.debug("Reader: timeout with no active streams, exiting", .{});
+                            return;
                         }
+                        // Active streams waiting - keep trying
+                        log.debug("Reader: timeout but {d} streams active, continuing", .{self.active_streams.load(.acquire)});
+                        continue;
                     }
 
                     // Active streams or socket truly dead - exit reader
-                    log.debug("Reader: recv failed: {}, active_streams={}, connected={}", .{ err, self.active_streams, sock.connected });
+                    log.debug("Reader: recv failed: {}, active_streams={}, connected={}", .{ err, self.active_streams.load(.acquire), sock.connected });
                     return;
                 };
                 if (n == 0) {
@@ -601,7 +606,11 @@ pub const Http2Client = struct {
             if (fh.length > 0) {
                 var payload_read: usize = 0;
                 while (payload_read < fh.length) {
-                    const n = sock.recv(io, recv_buf[payload_read..fh.length]) catch |err| {
+                    const n = sock.recvWithTimeout(io, recv_buf[payload_read..fh.length], RECV_TIMEOUT_MS) catch |err| {
+                        if (err == error.Timeout) {
+                            log.debug("Reader: payload timeout, continuing", .{});
+                            continue;
+                        }
                         log.debug("Reader payload recv error: {}", .{err});
                         return;
                     };
@@ -615,10 +624,8 @@ pub const Http2Client = struct {
 
             const payload = recv_buf[0..fh.length];
 
-            // Dispatch frame to correct stream (mutex-protected)
-            stream_mutex.lock(io) catch return; // Cancelled
+            // Dispatch frame to correct stream (per-stream mutex in dispatchFrame)
             const dispatch_result = self.dispatchFrame(fh, payload, io);
-            stream_mutex.unlock(io);
 
             dispatch_result catch |err| {
                 if (err == error.ConnectionGoaway) {
@@ -637,6 +644,10 @@ pub const Http2Client = struct {
         switch (ft) {
             .headers => {
                 if (self.findStreamSlot(fh.stream_id)) |slot| {
+                    // Lock per-stream mutex for atomic update+signal
+                    self.streams[slot].mutex.lock(io) catch return;
+                    defer self.streams[slot].mutex.unlock(io);
+
                     self.streams[slot].header_count = hpack.Hpack.decodeHeaders(
                         payload,
                         &self.streams[slot].headers,
@@ -654,6 +665,10 @@ pub const Http2Client = struct {
             },
             .data => {
                 if (self.findStreamSlot(fh.stream_id)) |slot| {
+                    // Lock per-stream mutex for atomic update+signal
+                    self.streams[slot].mutex.lock(io) catch return;
+                    defer self.streams[slot].mutex.unlock(io);
+
                     self.streams[slot].body.appendSlice(self.allocator, payload) catch {};
 
                     if (fh.isEndStream()) {
@@ -665,6 +680,10 @@ pub const Http2Client = struct {
             },
             .rst_stream => {
                 if (self.findStreamSlot(fh.stream_id)) |slot| {
+                    // Lock per-stream mutex for atomic update+signal
+                    self.streams[slot].mutex.lock(io) catch return;
+                    defer self.streams[slot].mutex.unlock(io);
+
                     if (payload.len >= 4) {
                         self.streams[slot].error_code = std.mem.readInt(u32, payload[0..4], .big);
                     }
@@ -686,10 +705,13 @@ pub const Http2Client = struct {
                     for (&self.streams) |*stream| {
                         if (stream.active and !stream.completed) {
                             if (stream.id > last_stream_id) {
+                                // Lock per-stream mutex for atomic update+signal
+                                stream.mutex.lock(io) catch continue;
                                 log.debug("GOAWAY: signaling stream {d} for retry", .{stream.id});
                                 stream.retry_needed = true;
                                 stream.completed = true;
                                 stream.condition.signal(io);
+                                stream.mutex.unlock(io);
                             } else {
                                 remaining_active += 1;
                             }
@@ -698,7 +720,7 @@ pub const Http2Client = struct {
 
                     // Mark that we received GOAWAY - no new streams allowed
                     self.goaway_received = true;
-                    log.debug("GOAWAY: set goaway_received=true, active_streams={d}, remaining={d}", .{ self.active_streams, remaining_active });
+                    log.debug("GOAWAY: set goaway_received=true, active_streams={d}, remaining={d}", .{ self.active_streams.load(.acquire), remaining_active });
 
                     // FAST EXIT: If no streams are waiting for completion, exit immediately
                     // instead of waiting for read timeout. This prevents 1-2s delay on retry.
@@ -728,20 +750,28 @@ pub const Http2Client = struct {
         }
     }
 
-    /// Signal all active streams (acquires mutex)
-    pub fn signalAllStreams(self: *Self, stream_mutex: *Io.Mutex, io: Io) void {
-        stream_mutex.lock(io) catch return; // Cancelled
-        defer stream_mutex.unlock(io);
-        self.signalAllStreamsUnlocked(io);
-    }
-
-    /// Signal all active streams (mutex must be held)
-    fn signalAllStreamsUnlocked(self: *Self, io: Io) void {
+    /// Signal all active streams with per-stream mutexes
+    pub fn signalAllStreams(self: *Self, io: Io) void {
         for (&self.streams) |*stream| {
             if (stream.active and !stream.completed) {
+                stream.mutex.lock(io) catch continue;
                 stream.retry_needed = true;
                 stream.completed = true;
                 stream.condition.signal(io);
+                stream.mutex.unlock(io);
+            }
+        }
+    }
+
+    /// Signal all active streams (unlocked version for use when mutexes already held)
+    fn signalAllStreamsUnlocked(self: *Self, io: Io) void {
+        for (&self.streams) |*stream| {
+            if (stream.active and !stream.completed) {
+                stream.mutex.lock(io) catch continue;
+                stream.retry_needed = true;
+                stream.completed = true;
+                stream.condition.signal(io);
+                stream.mutex.unlock(io);
             }
         }
     }
@@ -782,7 +812,7 @@ test "http2 client init" {
     defer client.deinit();
     try std.testing.expectEqual(@as(u31, 1), client.next_stream_id);
     try std.testing.expectEqual(false, client.preface_sent);
-    try std.testing.expectEqual(@as(usize, 0), client.active_streams);
+    try std.testing.expectEqual(@as(usize, 0), client.active_streams.load(.acquire));
 }
 
 test "http2 client stream slot management" {

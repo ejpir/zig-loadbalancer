@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  ZIG_VERSION: "0.16.0-dev.1657+985a3565c"
+  ZIG_URL: "https://ziglang.org/builds/zig-x86_64-linux-0.16.0-dev.1657+985a3565c.tar.xz"
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux
+            artifact: load_balancer-x86_64-linux
+          - target: aarch64-linux
+            artifact: load_balancer-aarch64-linux
+          - target: x86_64-macos
+            artifact: load_balancer-x86_64-macos
+          - target: aarch64-macos
+            artifact: load_balancer-aarch64-macos
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: ~/zig
+          key: zig-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        run: |
+          if [ ! -d ~/zig ]; then
+            mkdir -p ~/zig
+            curl -L ${{ env.ZIG_URL }} | tar -xJ -C ~/zig --strip-components=1
+          fi
+          echo "$HOME/zig" >> $GITHUB_PATH
+
+      - name: Build release binary
+        run: |
+          zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+          mv zig-out/bin/load_balancer ${{ matrix.artifact }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  create-release:
+    runs-on: ubuntu-latest
+    needs: build-release
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          cd artifacts
+          for dir in */; do
+            name="${dir%/}"
+            chmod +x "$dir/$name"
+            tar -czvf "$name.tar.gz" -C "$dir" "$name"
+          done
+          ls -la *.tar.gz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*.tar.gz

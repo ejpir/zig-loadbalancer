@@ -54,6 +54,9 @@ pub const ProxyError = error{
     Timeout,
     EmptyResponse,
     InvalidResponse,
+    /// HTTP/2 GOAWAY exhausted retries - NOT a backend health failure
+    /// Server gracefully closed connection, just need fresh connection
+    GoawayRetriesExhausted,
 };
 
 // ============================================================================
@@ -169,7 +172,10 @@ inline fn proxyWithFailover(
             state.recordSuccess(primary_idx);
             return response;
         } else |err| {
-            state.recordFailure(primary_idx);
+            // GOAWAY exhaustion is NOT a backend failure - just connection-level flow control
+            if (err != ProxyError.GoawayRetriesExhausted) {
+                state.recordFailure(primary_idx);
+            }
             log.warn("[W{d}] Backend {d} failed: {s}", .{ state.worker_id, primary_idx + 1, @errorName(err) });
         }
     } else {
@@ -179,7 +185,10 @@ inline fn proxyWithFailover(
             state.recordSuccess(primary_idx);
             return response;
         } else |err| {
-            state.recordFailure(primary_idx);
+            // GOAWAY exhaustion is NOT a backend failure - just connection-level flow control
+            if (err != ProxyError.GoawayRetriesExhausted) {
+                state.recordFailure(primary_idx);
+            }
             log.warn("[W{d}] Backend {d} failed: {s}", .{ state.worker_id, primary_idx + 1, @errorName(err) });
         }
     }
@@ -199,7 +208,10 @@ inline fn proxyWithFailover(
                 state.recordSuccess(failover_idx);
                 return response;
             } else |failover_err| {
-                state.recordFailure(failover_idx);
+                // GOAWAY exhaustion is NOT a backend failure
+                if (failover_err != ProxyError.GoawayRetriesExhausted) {
+                    state.recordFailure(failover_idx);
+                }
                 const err_name = @errorName(failover_err);
                 log.warn("[W{d}] Failover to backend {d} failed: {s}", .{
                     state.worker_id,
@@ -214,7 +226,10 @@ inline fn proxyWithFailover(
                 state.recordSuccess(failover_idx);
                 return response;
             } else |failover_err| {
-                state.recordFailure(failover_idx);
+                // GOAWAY exhaustion is NOT a backend failure
+                if (failover_err != ProxyError.GoawayRetriesExhausted) {
+                    state.recordFailure(failover_idx);
+                }
                 const err_name = @errorName(failover_err);
                 log.warn("[W{d}] Failover to backend {d} failed: {s}", .{
                     state.worker_id,
@@ -519,7 +534,7 @@ fn forwardH2Response(
     // Forward response to client
     const client_writer = ctx.writer;
     // Convert status code - use 502 for invalid status codes from backend
-    const status: http.Status = std.meta.intToEnum(http.Status, response.status) catch .@"Bad Gateway";
+    const status: http.Status = std.enums.fromInt(http.Status, response.status) orelse .@"Bad Gateway";
     var http_response = ctx.response;
     http_response.status = status;
     http_response.mime = http.Mime.HTML; // Default to HTML for HTTP/2 responses
@@ -585,34 +600,78 @@ fn streamingProxyHttp2(
     // Get pool (must exist)
     const pool = state.h2_pool orelse return ProxyError.ConnectionFailed;
 
-    // Get or create connection (pool handles everything: TLS, handshake, retry)
-    var conn = pool.getOrCreate(backend_idx, ctx.io) catch |err| {
-        log.warn("[REQ {d}] H2 pool getOrCreate failed: {}", .{ req_id, err });
-        return ProxyError.ConnectionFailed;
-    };
+    // Retry loop for TooManyStreams (connection full, not broken)
+    const h2_conn = @import("../http/http2/connection.zig");
+    const h2_client = @import("../http/http2/client.zig");
+    var response: h2_client.Response = undefined;
+    var used_conn: *h2_conn.H2Connection = undefined;
+    var attempts: u32 = 0;
+    var last_was_goaway: bool = false; // Track if exhaustion was due to GOAWAY
+    while (attempts < 5) : (attempts += 1) {
+        // Micro-backoff for GOAWAY retries (prevents thundering herd without latency cost)
+        // 0µs, 100µs, 200µs, 400µs, 800µs - just enough to spread out retries
+        if (last_was_goaway and attempts > 0) {
+            const backoff_ns: u64 = @as(u64, 100_000) << @intCast(attempts - 1);
+            std.Io.sleep(ctx.io, .{ .nanoseconds = @intCast(backoff_ns) }, .awake) catch {};
+        }
+        last_was_goaway = false;
 
-    // Make request (connection handles: send, reader spawn, await)
-    var response = conn.request(
-        @tagName(ctx.request.method orelse .GET),
-        ctx.request.uri orelse "/",
-        backend.getFullHost(),
-        ctx.request.body,
-        ctx.io,
-    ) catch |err| {
-        log.warn("[REQ {d}] H2 request failed: {}", .{ req_id, err });
-        pool.release(conn, false, ctx.io);
+        // Get or create connection (pool handles everything: TLS, handshake, retry)
+        const conn = pool.getOrCreate(backend_idx, ctx.io) catch |err| {
+            log.warn("[REQ {d}] H2 pool getOrCreate failed: {}", .{ req_id, err });
+            return ProxyError.ConnectionFailed;
+        };
+
+        // Make request (connection handles: send, reader spawn, await)
+        response = conn.request(
+            @tagName(ctx.request.method orelse .GET),
+            ctx.request.uri orelse "/",
+            backend.getFullHost(),
+            ctx.request.body,
+            ctx.io,
+        ) catch |err| {
+            if (err == error.TooManyStreams) {
+                // Connection full (all 8 slots busy) - release as healthy and retry
+                log.debug("[REQ {d}] Connection full, retrying...", .{req_id});
+                pool.release(conn, true, ctx.io);
+                continue;
+            }
+            if (err == error.RetryNeeded or err == error.ConnectionGoaway) {
+                // GOAWAY received - get fresh connection and retry
+                // NOT a failure - just graceful connection shutdown
+                log.debug("[REQ {d}] GOAWAY, retrying on fresh connection", .{req_id});
+                pool.release(conn, false, ctx.io); // Destroy this conn, but NOT a backend failure
+                last_was_goaway = true;
+                continue;
+            }
+            // Other errors - connection is broken
+            log.warn("[REQ {d}] H2 request failed: {}", .{ req_id, err });
+            pool.release(conn, false, ctx.io);
+            return ProxyError.SendFailed;
+        };
+
+        // Success - save connection for release after response forwarding
+        used_conn = conn;
+        break;
+    } else {
+        // All retries exhausted
+        if (last_was_goaway) {
+            // GOAWAY exhausted retries - NOT a backend health failure
+            // Server is healthy, just aggressively closing connections under load
+            log.debug("[REQ {d}] GOAWAY exhausted retries (not a failure)", .{req_id});
+            return ProxyError.GoawayRetriesExhausted;
+        }
+        log.warn("[REQ {d}] H2 request failed after {d} retries", .{ req_id, attempts });
         return ProxyError.SendFailed;
-    };
+    }
     defer response.deinit();
+    defer pool.release(used_conn, true, ctx.io);
 
     // Update proxy state
     proxy_state.status_code = response.status;
     proxy_state.bytes_from_backend = @intCast(response.body.items.len);
 
-    // Release connection back to pool
-    pool.release(conn, true, ctx.io);
-
-    // Forward response to client
+    // Forward response to client (connection released via defer above)
     return forwardH2Response(ctx, proxy_state, &response, backend_idx, start_ns, req_id);
 }
 
