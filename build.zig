@@ -114,16 +114,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    integration_tests_mod.addImport("zzz", zzz_module);
-    integration_tests_mod.addImport("tls", tls_module);
-    const integration_tests = b.addTest(.{
+
+    // Add integration test as executable (for better output)
+    const integration_exe = b.addExecutable(.{
         .name = "integration_tests",
         .root_module = integration_tests_mod,
     });
-    const run_integration_tests = b.addRunArtifact(integration_tests);
-    // Integration tests need the binaries built first
-    run_integration_tests.step.dependOn(&build_test_backend_echo.step);
-    run_integration_tests.step.dependOn(&build_load_balancer.step);
+    const run_integration_exe = b.addRunArtifact(integration_exe);
+    run_integration_exe.step.dependOn(&build_test_backend_echo.step);
+    run_integration_exe.step.dependOn(&build_load_balancer.step);
+
+    const integration_test_step = b.step("test-integration", "Run integration tests");
+    integration_test_step.dependOn(&run_integration_exe.step);
 
     // Steps
     const build_all = b.step("build-all", "Build backends and load balancer");
@@ -135,9 +137,6 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
-
-    const integration_test_step = b.step("test-integration", "Run integration tests");
-    integration_test_step.dependOn(&run_integration_tests.step);
 
     const run_lb_step = b.step("run", "Run load balancer (use --mode mp|sp)");
     run_lb_step.dependOn(&run_load_balancer_cmd.step);
