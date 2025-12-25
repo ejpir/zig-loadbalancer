@@ -76,7 +76,11 @@ pub fn httpRequest(
 
     try posix.connect(sock, &addr.any, addr.getOsSockLen());
 
-    _ = try posix.send(sock, request.items, 0);
+    var sent: usize = 0;
+    while (sent < request.items.len) {
+        const n = try posix.send(sock, request.items[sent..], 0);
+        sent += n;
+    }
 
     // Read response
     var response = std.ArrayList(u8).init(allocator);
@@ -105,7 +109,10 @@ pub fn getJsonString(allocator: std.mem.Allocator, json: []const u8, field: []co
     defer parsed.deinit();
 
     const value = parsed.value.object.get(field) orelse return error.FieldNotFound;
-    return allocator.dupe(u8, value.string);
+    return switch (value) {
+        .string => |s| allocator.dupe(u8, s),
+        else => error.FieldNotString,
+    };
 }
 
 /// Parse JSON response and get an integer field
@@ -146,7 +153,10 @@ pub fn getHeader(allocator: std.mem.Allocator, json: []const u8, header: []const
     var iter = headers.iterator();
     while (iter.next()) |entry| {
         if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, header)) {
-            return allocator.dupe(u8, entry.value_ptr.string);
+            return switch (entry.value_ptr.*) {
+                .string => |s| allocator.dupe(u8, s),
+                else => error.HeaderNotString,
+            };
         }
     }
     return error.HeaderNotFound;
