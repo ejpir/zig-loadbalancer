@@ -1,119 +1,24 @@
 /// Universal Socket Abstraction for HTTP/HTTPS
 ///
 /// Simplified socket wrapper using Zig 0.16's std.Io for async operations.
-/// Supports TLS via ianic/tls.zig for reliable HTTPS connections.
+/// Supports TLS via tls.zig module for reliable HTTPS connections.
 const std = @import("std");
 const log = std.log.scoped(.ultra_sock);
 
 const Io = std.Io;
-const tls = @import("tls");
+const tls_mod = @import("tls.zig");
+const tls = tls_mod.tls_lib;
 
 const config_mod = @import("../core/config.zig");
+
+// Re-export TlsOptions for external use
+pub const TlsOptions = tls_mod.TlsOptions;
 
 /// Protocol type
 pub const Protocol = enum {
     http,
     https,
 };
-
-/// TLS configuration options
-pub const TlsOptions = struct {
-    /// Certificate authority verification mode
-    pub const CaVerification = union(enum) {
-        /// No CA verification - INSECURE, for local dev only
-        none,
-        /// Use system trust store (default when DEFAULT_TLS_VERIFY_CA = true)
-        system,
-        /// Use custom certificate bundle
-        custom: tls.config.cert.Bundle,
-    };
-
-    /// Host verification mode
-    pub const HostVerification = union(enum) {
-        /// No hostname verification - INSECURE
-        none,
-        /// Verify against connection host (default when DEFAULT_TLS_VERIFY_HOST = true)
-        from_connection,
-        /// Verify against explicit hostname
-        explicit: []const u8,
-    };
-
-    ca: CaVerification = .system,
-    host: HostVerification = .from_connection,
-    /// ALPN protocols to negotiate (e.g., "h2", "http/1.1")
-    /// First protocol in list is preferred.
-    alpn_protocols: []const []const u8 = &.{},
-
-    /// Create TlsOptions from config.zig defaults
-    /// Uses DEFAULT_TLS_VERIFY_CA and DEFAULT_TLS_VERIFY_HOST
-    pub fn fromDefaults() TlsOptions {
-        return .{
-            .ca = if (config_mod.DEFAULT_TLS_VERIFY_CA) .system else .none,
-            .host = if (config_mod.DEFAULT_TLS_VERIFY_HOST) .from_connection else .none,
-        };
-    }
-
-    /// Get TLS options based on runtime config
-    /// Returns insecure() if --insecure flag was used, otherwise production()
-    pub fn fromRuntime() TlsOptions {
-        return if (config_mod.isInsecureTls()) insecure() else production();
-    }
-
-    /// Production preset: full verification with system trust store
-    pub fn production() TlsOptions {
-        return .{
-            .ca = .system,
-            .host = .from_connection,
-        };
-    }
-
-    /// Insecure preset: skip all verification (local dev only)
-    /// Still sends SNI (required for virtual hosts/CDNs), just doesn't verify certificate hostname
-    pub fn insecure() TlsOptions {
-        return .{
-            .ca = .none,
-            .host = .from_connection, // Send SNI for routing, skip verification via ca = .none
-        };
-    }
-
-    /// Check if this config skips verification (inlined - called during connection setup)
-    pub inline fn isInsecure(self: TlsOptions) bool {
-        return self.ca == .none;
-    }
-
-    /// Production preset with HTTP/2 ALPN negotiation
-    pub fn productionWithHttp2() TlsOptions {
-        return .{
-            .ca = .system,
-            .host = .from_connection,
-            .alpn_protocols = &.{ "h2", "http/1.1" },
-        };
-    }
-
-    /// Insecure preset with HTTP/2 ALPN (local dev only)
-    /// Still sends SNI (required for virtual hosts/CDNs), just doesn't verify certificate hostname
-    pub fn insecureWithHttp2() TlsOptions {
-        return .{
-            .ca = .none,
-            .host = .from_connection, // Send SNI for routing, skip verification via ca = .none
-            .alpn_protocols = &.{ "h2", "http/1.1" },
-        };
-    }
-
-    /// Get TLS options with HTTP/2 based on runtime config
-    pub fn fromRuntimeWithHttp2() TlsOptions {
-        return if (config_mod.isInsecureTls()) insecureWithHttp2() else productionWithHttp2();
-    }
-};
-
-/// UltraSock - A socket abstraction for HTTP/HTTPS connections
-/// Threadlocal TLS buffers avoid allocation during handshake
-threadlocal var tls_input_buffer: [tls.input_buffer_len]u8 = undefined;
-threadlocal var tls_output_buffer: [tls.output_buffer_len]u8 = undefined;
-
-/// Global CA bundle (loaded once at startup)
-var global_ca_bundle: ?tls.config.cert.Bundle = null;
-var ca_bundle_loaded: bool = false;
 
 pub const UltraSock = struct {
     /// Negotiated application protocol (copy-safe enum, not slice pointer)
@@ -137,6 +42,14 @@ pub const UltraSock = struct {
     // TLS diagnostic for capturing negotiated ALPN
     tls_diagnostic: tls.config.Client.Diagnostic = .{},
     negotiated_protocol: AppProtocol = .unknown,
+
+    // Cached read timeout for restoration after temporary changes
+    read_timeout_ms: u32 = 1000, // Default 1 second
+
+    /// Get the current read timeout in milliseconds
+    pub fn getReadTimeout(self: *const UltraSock) u32 {
+        return self.read_timeout_ms;
+    }
 
     /// Initialize a new UltraSock with default TLS options (production)
     pub fn init(protocol: Protocol, host: []const u8, port: u16) UltraSock {
@@ -163,23 +76,59 @@ pub const UltraSock = struct {
 
     /// Connect to the backend server using std.Io (async, properly handles errors)
     pub fn connect(self: *UltraSock, io: Io) !void {
-        if (self.connected) return;
+        const trace_enabled = config_mod.isTlsTraceEnabled();
+        const tls_log = std.log.scoped(.tls_trace);
+
+        if (self.connected) {
+            if (trace_enabled) {
+                tls_log.debug("connect: already connected to {s}:{}", .{ self.host, self.port });
+            }
+            return;
+        }
+
+        if (trace_enabled) {
+            tls_log.info(">>> TCP connect starting: {s}:{} ({s})", .{
+                self.host,
+                self.port,
+                @tagName(self.protocol),
+            });
+        }
 
         // Resolve address - first try as IP, then DNS resolution
         const addr = Io.net.IpAddress.parse(self.host, self.port) catch blk: {
             // Not a raw IP, try DNS resolution using getaddrinfo
+            if (trace_enabled) {
+                tls_log.debug("  Resolving DNS for {s}...", .{self.host});
+            }
             const resolved = resolveDns(self.host, self.port) catch {
-                log.err("Failed to resolve hostname: {s}", .{self.host});
+                if (trace_enabled) {
+                    tls_log.err("!!! DNS resolution failed for {s}", .{self.host});
+                } else {
+                    log.err("Failed to resolve hostname: {s}", .{self.host});
+                }
                 return error.InvalidAddress;
             };
+            if (trace_enabled) {
+                tls_log.debug("  DNS resolved {s}", .{self.host});
+            }
             break :blk resolved;
         };
 
         // Connect using std.Io
+        if (trace_enabled) {
+            tls_log.debug("  TCP connecting to {s}:{}...", .{ self.host, self.port });
+        }
         self.stream = addr.connect(io, .{ .mode = .stream }) catch {
+            if (trace_enabled) {
+                tls_log.err("!!! TCP connect failed to {s}:{}", .{ self.host, self.port });
+            }
             return error.ConnectionFailed;
         };
         errdefer self.closeStream();
+
+        if (trace_enabled) {
+            tls_log.info("<<< TCP connected to {s}:{}", .{ self.host, self.port });
+        }
 
         self.io = io;
 
@@ -189,6 +138,72 @@ pub const UltraSock = struct {
         }
 
         self.connected = true;
+    }
+
+    /// Connect with custom TLS buffers (for concurrent HTTP/2 connections).
+    /// Use this instead of connect() when multiple connections may be created concurrently.
+    pub fn connectWithBuffers(self: *UltraSock, io: Io, input_buf: []u8, output_buf: []u8) !void {
+        const trace_enabled = config_mod.isTlsTraceEnabled();
+        const tls_log = std.log.scoped(.tls_trace);
+
+        if (self.connected) {
+            if (trace_enabled) {
+                tls_log.debug("connectWithBuffers: already connected to {s}:{}", .{ self.host, self.port });
+            }
+            return;
+        }
+
+        if (trace_enabled) {
+            tls_log.info(">>> TCP connect (with buffers) starting: {s}:{} ({s})", .{
+                self.host,
+                self.port,
+                @tagName(self.protocol),
+            });
+        }
+
+        const addr = Io.net.IpAddress.parse(self.host, self.port) catch blk: {
+            if (trace_enabled) {
+                tls_log.debug("  Resolving DNS for {s}...", .{self.host});
+            }
+            const resolved = resolveDns(self.host, self.port) catch {
+                if (trace_enabled) {
+                    tls_log.err("!!! DNS resolution failed for {s}", .{self.host});
+                } else {
+                    log.err("Failed to resolve hostname: {s}", .{self.host});
+                }
+                return error.InvalidAddress;
+            };
+            if (trace_enabled) {
+                tls_log.debug("  DNS resolved {s}", .{self.host});
+            }
+            break :blk resolved;
+        };
+
+        if (trace_enabled) {
+            tls_log.debug("  TCP connecting to {s}:{}...", .{ self.host, self.port });
+        }
+        self.stream = addr.connect(io, .{ .mode = .stream }) catch {
+            if (trace_enabled) {
+                tls_log.err("!!! TCP connect failed to {s}:{}", .{ self.host, self.port });
+            }
+            return error.ConnectionFailed;
+        };
+        errdefer self.closeStream();
+
+        if (trace_enabled) {
+            tls_log.info("<<< TCP connected to {s}:{}", .{ self.host, self.port });
+        }
+
+        self.io = io;
+
+        if (self.protocol == .https) {
+            try self.performTlsHandshakeWithBuffers(io, input_buf, output_buf);
+        }
+
+        self.connected = true;
+        if (trace_enabled) {
+            tls_log.info("=== Connection fully established: {s}:{} ===", .{ self.host, self.port });
+        }
     }
 
     /// Resolve hostname using getaddrinfo (blocking)
@@ -272,36 +287,66 @@ pub const UltraSock = struct {
 
     /// Perform TLS handshake using ianic/tls.zig (zero allocation)
     fn performTlsHandshake(self: *UltraSock, io: Io) !void {
+        // Use threadlocal buffers from tls module - OK for single connection at a time
+        return self.performTlsHandshakeWithBuffers(io, &tls_mod.input_buffer, &tls_mod.output_buffer);
+    }
+
+    /// Perform TLS handshake with custom buffers.
+    /// Use this for concurrent connections to avoid threadlocal buffer corruption.
+    pub fn performTlsHandshakeWithBuffers(
+        self: *UltraSock,
+        io: Io,
+        input_buf: []u8,
+        output_buf: []u8,
+    ) !void {
         const stream = self.stream orelse return error.SocketNotInitialized;
 
-        try ensureCaBundleLoaded(io, self.tls_options.ca);
-
-        const input_buf = &tls_input_buffer;
-        const output_buf = &tls_output_buffer;
+        try tls_mod.ensureCaBundleLoaded(io, self.tls_options.ca);
 
         self.stream_reader = stream.reader(io, input_buf);
         self.stream_writer = stream.writer(io, output_buf);
         self.has_reader_writer = true;
 
         const now = try Io.Clock.real.now(io);
-        log.debug("Starting TLS handshake with {s}:{}", .{ self.host, self.port });
+        const tls_log = std.log.scoped(.tls_trace);
+        const trace_enabled = config_mod.isTlsTraceEnabled();
+
+        if (trace_enabled) {
+            tls_log.info(">>> TLS handshake starting: {s}:{}", .{ self.host, self.port });
+        } else {
+            log.debug("Starting TLS handshake with {s}:{}", .{ self.host, self.port });
+        }
 
         // Reset diagnostic for this connection
         self.tls_diagnostic = .{};
 
-        const client_opts = try buildTlsClientOptions(
+        const client_opts = try tls_mod.buildClientOptions(
             self.tls_options,
             self.host,
             now,
             &self.tls_diagnostic,
         );
 
+        if (trace_enabled) {
+            // Log requested ALPN protocols
+            if (self.tls_options.alpn_protocols.len > 0) {
+                tls_log.debug("  Requesting ALPN: {}", .{self.tls_options.alpn_protocols.len});
+                for (self.tls_options.alpn_protocols) |proto| {
+                    tls_log.debug("    - {s}", .{proto});
+                }
+            }
+        }
+
         self.tls_conn = tls.client(
             &self.stream_reader.interface,
             &self.stream_writer.interface,
             client_opts,
         ) catch |err| {
-            log.err("TLS handshake failed: {}", .{err});
+            if (trace_enabled) {
+                tls_log.err("!!! TLS handshake FAILED: {} for {s}:{}", .{ err, self.host, self.port });
+            } else {
+                log.err("TLS handshake failed: {}", .{err});
+            }
             return error.TlsHandshakeFailed;
         };
 
@@ -315,18 +360,9 @@ pub const UltraSock = struct {
         // Log TLS connection details
         const cipher_name = @tagName(self.tls_conn.?.cipher);
 
-        if (config_mod.isTlsTraceEnabled()) {
-            // Detailed TLS trace logging
-            const tls_log = std.log.scoped(.tls_trace);
-
-            // Determine TLS version from cipher suite
-            // TLS 1.3 ciphers: AES_128_GCM_SHA256, AES_256_GCM_SHA384, CHACHA20_POLY1305_SHA256
-            // TLS 1.2 ciphers: ECDHE_* or RSA_*
-            const tls_version: []const u8 = if (std.mem.startsWith(u8, cipher_name, "AES_") or
-                std.mem.startsWith(u8, cipher_name, "CHACHA20_"))
-                "TLS 1.3"
-            else
-                "TLS 1.2";
+        if (trace_enabled) {
+            // Detailed TLS trace logging from Diagnostic struct
+            const diag = &self.tls_diagnostic;
 
             // CA verification mode
             const ca_mode: []const u8 = switch (self.tls_options.ca) {
@@ -344,78 +380,91 @@ pub const UltraSock = struct {
 
             tls_log.info("=== TLS Handshake Complete ===", .{});
             tls_log.info("  Host: {s}:{}", .{ self.host, self.port });
-            tls_log.info("  Version: {s}", .{tls_version});
+            tls_log.info("  TLS Version: {s}", .{@tagName(diag.tls_version)});
             tls_log.info("  Cipher Suite: {s}", .{cipher_name});
+            tls_log.info("  Named Group: {s}", .{@tagName(diag.named_group)});
+            tls_log.info("  Signature Scheme: {s}", .{@tagName(diag.signature_scheme)});
+            if (@intFromEnum(diag.client_signature_scheme) != 0) {
+                tls_log.info("  Client Signature: {s}", .{@tagName(diag.client_signature_scheme)});
+            }
             tls_log.info("  ALPN Protocol: {s}", .{@tagName(self.negotiated_protocol)});
+            if (diag.negotiated_alpn) |alpn| {
+                tls_log.info("  ALPN Raw: {s}", .{alpn});
+            }
+            tls_log.info("  Session Resumption: {}", .{diag.is_session_resumption});
             tls_log.info("  CA Verification: {s}", .{ca_mode});
             tls_log.info("  Host Verification: {s}", .{host_mode});
-            if (ca_bundle_loaded) {
-                if (global_ca_bundle) |bundle| {
-                    tls_log.info("  CA Certificates: {} loaded", .{bundle.map.count()});
-                }
+            if (tls_mod.getGlobalCaBundle()) |bundle| {
+                tls_log.info("  CA Certificates: {} loaded", .{bundle.map.count()});
             }
+            tls_log.info("  Max Server Record: {} bytes", .{diag.max_server_record_len});
+            tls_log.info("  Max Server Cleartext: {} bytes", .{diag.max_server_cleartext_len});
+            tls_log.info("  Max Client Record: {} bytes", .{diag.max_client_record_len});
         } else {
             const alpn_name = @tagName(self.negotiated_protocol);
             log.info("TLS established {s}:{} ({s}, {s})", .{ self.host, self.port, cipher_name, alpn_name });
         }
     }
 
-    /// Ensure CA bundle is loaded (only once per process)
-    fn ensureCaBundleLoaded(io: Io, ca_mode: TlsOptions.CaVerification) !void {
-        if (ca_mode == .system and !ca_bundle_loaded) {
-            global_ca_bundle =
-                tls.config.cert.fromSystem(std.heap.page_allocator, io) catch |err| {
-                    log.err("Failed to load system CA bundle: {}", .{err});
-                    return error.CaBundleLoadFailed;
-                };
-            ca_bundle_loaded = true;
-            const cert_count = global_ca_bundle.?.map.count();
-            log.info("Loaded {} certificates from system trust store", .{cert_count});
-        }
-    }
-
-    /// Build TLS client options from verification settings
-    fn buildTlsClientOptions(
-        tls_options: TlsOptions,
-        host: []const u8,
-        now: Io.Timestamp,
-        diagnostic: ?*tls.config.Client.Diagnostic,
-    ) !tls.config.Client {
-        return tls.config.Client{
-            .host = switch (tls_options.host) {
-                .none => "",
-                .from_connection => host,
-                .explicit => |h| h,
-            },
-            .root_ca = switch (tls_options.ca) {
-                .none => .{},
-                .system => global_ca_bundle.?,
-                .custom => |bundle| bundle,
-            },
-            .insecure_skip_verify = tls_options.ca == .none,
-            .now = now,
-            .alpn_protocols = tls_options.alpn_protocols,
-            .diagnostic = diagnostic,
-        };
-    }
-
     /// Send all data over the socket
     pub fn send_all(self: *UltraSock, io: Io, data: []const u8) !usize {
-        if (!self.connected) return error.NotConnected;
+        const trace_enabled = config_mod.isTlsTraceEnabled();
+        const tls_log = std.log.scoped(.tls_trace);
+
+        if (!self.connected) {
+            if (trace_enabled) {
+                tls_log.warn("!!! send_all: not connected to {s}:{}, has_tls={}, has_stream={}", .{
+                    self.host,
+                    self.port,
+                    self.tls_conn != null,
+                    self.stream != null,
+                });
+            } else {
+                log.debug("send_all: sock not connected, has_tls={}, has_stream={}", .{
+                    self.tls_conn != null,
+                    self.stream != null,
+                });
+            }
+            return error.NotConnected;
+        }
 
         if (self.tls_conn) |*conn| {
-            // TLS: write through encrypted channel (uses io context from handshake)
+            // TLS: Update io context on existing writer to preserve buffer state.
+            // Creating new writer would lose partially-written TLS records.
+            // Just updating io field allows async yield/resume with correct coroutine.
+            if (self.has_reader_writer) {
+                self.stream_writer.io = io;
+                conn.output = &self.stream_writer.interface;
+            }
+
+            if (trace_enabled) {
+                tls_log.debug(">>> TLS send_all: {} bytes to {s}:{}", .{ data.len, self.host, self.port });
+            }
+
             conn.writeAll(data) catch |err| {
                 self.connected = false;
-                log.debug("TLS write error: {}", .{err});
+                if (trace_enabled) {
+                    tls_log.err("!!! TLS write error: {} for {s}:{} ({} bytes)", .{ err, self.host, self.port, data.len });
+                } else {
+                    log.debug("TLS write error: {}", .{err});
+                }
                 return error.BrokenPipe;
             };
+
+            if (trace_enabled) {
+                tls_log.debug("<<< TLS send_all: {} bytes sent to {s}:{}", .{ data.len, self.host, self.port });
+            }
             return data.len;
         } else {
             // Plain HTTP
             const stream = self.stream orelse return error.SocketNotInitialized;
             var write_buf: [4096]u8 = undefined;
             var writer = stream.writer(io, &write_buf);
+
+            if (trace_enabled) {
+                tls_log.debug(">>> Plain send_all: {} bytes to {s}:{}", .{ data.len, self.host, self.port });
+            }
+
             writer.interface.writeAll(data) catch {
                 self.connected = false;
                 return error.BrokenPipe;
@@ -424,6 +473,10 @@ pub const UltraSock = struct {
                 self.connected = false;
                 return error.BrokenPipe;
             };
+
+            if (trace_enabled) {
+                tls_log.debug("<<< Plain send_all: {} bytes sent to {s}:{}", .{ data.len, self.host, self.port });
+            }
             return data.len;
         }
     }
@@ -435,19 +488,49 @@ pub const UltraSock = struct {
 
     /// Receive data from the socket
     pub fn recv(self: *UltraSock, io: Io, buffer: []u8) !usize {
-        if (!self.connected) return error.NotConnected;
+        const trace_enabled = config_mod.isTlsTraceEnabled();
+        const tls_log = std.log.scoped(.tls_trace);
+
+        if (!self.connected) {
+            if (trace_enabled) {
+                tls_log.warn("!!! recv: not connected to {s}:{}", .{ self.host, self.port });
+            }
+            return error.NotConnected;
+        }
 
         if (self.tls_conn) |*conn| {
-            // TLS: read from decrypted channel (uses io context from handshake)
+            // TLS: Update io context on existing reader to preserve buffer state.
+            // Creating new reader would lose partially-read TLS records -> TlsBadRecordMac.
+            // Just updating io field allows async yield/resume with correct coroutine.
+            if (self.has_reader_writer) {
+                self.stream_reader.io = io;
+                conn.input = &self.stream_reader.interface;
+            }
+
+            if (trace_enabled) {
+                tls_log.debug(">>> TLS recv: waiting for data from {s}:{} (buffer {} bytes)", .{ self.host, self.port, buffer.len });
+            }
+
             const n = conn.read(buffer) catch |err| {
                 self.connected = false;
-                if (err == error.EndOfStream) return 0;
-                log.debug("TLS read error: {}", .{err});
+                if (err == error.EndOfStream) {
+                    if (trace_enabled) {
+                        tls_log.info("<<< TLS recv: EndOfStream from {s}:{}", .{ self.host, self.port });
+                    }
+                    return 0;
+                }
+                // Don't log - caller handles this (idle timeouts are expected for pooled connections)
                 return error.ReadFailed;
             };
             if (n == 0) {
                 self.connected = false;
+                if (trace_enabled) {
+                    tls_log.info("<<< TLS recv: 0 bytes (EOF) from {s}:{}", .{ self.host, self.port });
+                }
+            } else if (trace_enabled) {
+                tls_log.debug("<<< TLS recv: {} bytes from {s}:{}", .{ n, self.host, self.port });
             }
+            config_mod.hexDump("TLS recv", buffer[0..n]);
             return n;
         } else {
             // Plain HTTP
@@ -463,8 +546,45 @@ pub const UltraSock = struct {
             if (n == 0) {
                 self.connected = false;
             }
+            config_mod.hexDump("recv", buffer[0..n]);
             return n;
         }
+    }
+
+    /// Receive with timeout - returns error.Timeout if no data within timeout_ms
+    /// For TLS: uses regular recv (TLS doesn't support raw socket timeout)
+    /// For plain: uses socket receiveTimeout directly
+    ///
+    /// Note: For TLS, timeout is approximate - we rely on the reader task's
+    /// periodic timeout checks between recv calls.
+    pub fn recvWithTimeout(self: *UltraSock, io: Io, buffer: []u8, timeout_ms: u32) !usize {
+        if (!self.connected) {
+            return error.NotConnected;
+        }
+
+        // TLS path: can't use raw socket timeout (corrupts TLS state)
+        // Just use regular recv - timeout handled at reader task level
+        if (self.tls_conn != null) {
+            return self.recv(io, buffer);
+        }
+
+        // Plain socket path - use receiveTimeout directly
+        if (self.stream) |stream| {
+            const duration = Io.Clock.Duration{
+                .raw = Io.Duration.fromMilliseconds(@as(i64, timeout_ms)),
+                .clock = .real,
+            };
+            const timeout = Io.Timeout{ .duration = duration };
+            const msg = stream.socket.receiveTimeout(io, buffer, timeout) catch |err| {
+                if (err == error.Timeout) {
+                    return error.Timeout;
+                }
+                self.connected = false;
+                return error.ReadFailed;
+            };
+            return msg.data.len;
+        }
+        return error.NotConnected;
     }
 
     /// Get the TLS connection (for direct access to writeAll/read/next)
@@ -477,11 +597,55 @@ pub const UltraSock = struct {
 
     /// Fix TLS connection pointers after struct copy.
     /// Must be called after copying UltraSock to update internal TLS pointers.
+    /// NOTE: This only fixes TLS input/output pointers. For full fix including
+    /// stream reader/writer, use fixAllPointersAfterCopy(io) instead.
     pub fn fixTlsPointersAfterCopy(self: *UltraSock) void {
         if (self.tls_conn != null and self.has_reader_writer) {
             // Update TLS connection to point to THIS struct's reader/writer.
             self.tls_conn.?.input = &self.stream_reader.interface;
             self.tls_conn.?.output = &self.stream_writer.interface;
+        }
+    }
+
+    /// Fix ALL pointers after struct copy, including stream reader/writer.
+    /// This is the comprehensive fix required after UltraSock is copied.
+    /// Must be called with io context to reinitialize reader/writer.
+    pub fn fixAllPointersAfterCopy(self: *UltraSock, io: Io) void {
+        if (self.stream) |stream| {
+            if (self.has_reader_writer) {
+                // Reinitialize reader/writer using threadlocal buffers from tls module
+                self.stream_reader = stream.reader(io, &tls_mod.input_buffer);
+                self.stream_writer = stream.writer(io, &tls_mod.output_buffer);
+            }
+            if (self.tls_conn != null) {
+                // Update TLS connection to point to the new reader/writer
+                self.tls_conn.?.input = &self.stream_reader.interface;
+                self.tls_conn.?.output = &self.stream_writer.interface;
+            }
+        }
+    }
+
+    /// Fix pointers with CUSTOM buffers instead of threadlocal ones.
+    /// Critical for HTTP/2 connection pooling with concurrent multiplexing.
+    /// Threadlocal buffers are shared between all connections on the same thread,
+    /// causing data corruption when multiple connections are active concurrently.
+    pub fn fixPointersWithBuffers(
+        self: *UltraSock,
+        io: Io,
+        input_buf: []u8,
+        output_buf: []u8,
+    ) void {
+        if (self.stream) |stream| {
+            if (self.has_reader_writer) {
+                // Reinitialize reader/writer with per-connection buffers
+                self.stream_reader = stream.reader(io, input_buf);
+                self.stream_writer = stream.writer(io, output_buf);
+            }
+            if (self.tls_conn != null) {
+                // Update TLS connection to point to the new reader/writer
+                self.tls_conn.?.input = &self.stream_reader.interface;
+                self.tls_conn.?.output = &self.stream_writer.interface;
+            }
         }
     }
 
@@ -495,22 +659,107 @@ pub const UltraSock = struct {
 
     /// Free TLS resources (zero deallocation - resources are threadlocal/global)
     fn freeTlsResources(self: *UltraSock) void {
-        // Close TLS connection gracefully
-        if (self.tls_conn) |*conn| {
-            conn.close() catch {};
-            self.tls_conn = null;
-        }
-
-        // Reset embedded reader/writer flag
+        // Skip TLS graceful shutdown (close_notify) - just release resources.
+        // Peer detects closure via TCP FIN. This avoids timeout issues with
+        // servers expecting bidirectional TLS shutdown (e.g., Python asyncio SSL).
+        // Industry standard for high-performance proxies (nginx, HAProxy).
+        self.tls_conn = null;
         self.has_reader_writer = false;
 
         // Note: CA bundle is global (never freed during runtime)
         // Note: I/O buffers are threadlocal (never freed during runtime)
     }
 
-    /// Close the socket directly via posix (safe for pooled connections)
-    pub fn close_blocking(self: *UltraSock) void {
+    /// Send TLS close_notify alert without closing the socket
+    /// Use this for graceful shutdown - allows peer to send their close_notify back
+    /// Only sends if socket is still connected - if recv failed, TLS state may be corrupt
+    pub fn sendCloseNotify(self: *UltraSock, io: Io) void {
+        const trace_enabled = config_mod.isTlsTraceEnabled();
+        const tls_log = std.log.scoped(.tls_trace);
+
+        // MUST check connected - if recv failed, TLS cipher state may be corrupt
+        // Trying to encrypt close_notify with corrupt cipher causes panic
+        if (!self.connected) {
+            if (trace_enabled) {
+                tls_log.debug("Skipping close_notify: socket disconnected for {s}:{}", .{ self.host, self.port });
+            }
+            return;
+        }
+
+        if (self.has_reader_writer) {
+            if (self.tls_conn) |*conn| {
+                // Update io context for the writer
+                self.stream_writer.io = io;
+                conn.output = &self.stream_writer.interface;
+
+                // Send close_notify alert (graceful TLS shutdown)
+                if (trace_enabled) {
+                    tls_log.info(">>> Sending TLS close_notify to {s}:{}", .{ self.host, self.port });
+                } else {
+                    log.debug("Sending TLS close_notify", .{});
+                }
+                conn.close() catch |err| {
+                    if (trace_enabled) {
+                        tls_log.warn("!!! TLS close_notify failed: {} for {s}:{}", .{ err, self.host, self.port });
+                    } else {
+                        log.debug("TLS close_notify failed: {}", .{err});
+                    }
+                };
+                if (trace_enabled) {
+                    tls_log.info("<<< TLS close_notify sent to {s}:{}", .{ self.host, self.port });
+                }
+            }
+        } else if (trace_enabled) {
+            tls_log.debug("Skipping close_notify: has_rw={}, has_tls={}", .{
+                self.has_reader_writer,
+                self.tls_conn != null,
+            });
+        }
+    }
+
+    /// Close the socket with proper TLS shutdown (async version)
+    /// Sends close_notify alert before closing TCP connection
+    pub fn closeAsync(self: *UltraSock, io: Io) void {
+        if (config_mod.isTlsTraceEnabled()) {
+            const tls_log = std.log.scoped(.tls_trace);
+            tls_log.info(">>> closeAsync starting for {s}:{}", .{ self.host, self.port });
+        }
+        self.sendCloseNotify(io);
         self.freeTlsResources();
+        self.closeStream();
+        self.io = null;
+        self.connected = false;
+        if (config_mod.isTlsTraceEnabled()) {
+            const tls_log = std.log.scoped(.tls_trace);
+            tls_log.info("<<< closeAsync complete for {s}:{}", .{ self.host, self.port });
+        }
+    }
+
+    /// Close socket without sending close_notify (for use after sendCloseNotify)
+    pub fn closeSocketOnly(self: *UltraSock) void {
+        if (config_mod.isTlsTraceEnabled()) {
+            const tls_log = std.log.scoped(.tls_trace);
+            tls_log.info(">>> closeSocketOnly for {s}:{} (no close_notify)", .{ self.host, self.port });
+        }
+        self.freeTlsResources();
+        self.closeStream();
+        self.io = null;
+        self.connected = false;
+    }
+
+    /// Close the socket directly via posix (safe for pooled connections)
+    /// WARNING: Does not send TLS close_notify - use closeAsync when Io is available
+    pub fn close_blocking(self: *UltraSock) void {
+        // Only attempt graceful TLS close if connection is still healthy
+        // Skip if already disconnected (TLS state may be corrupted)
+        if (self.connected and self.has_reader_writer) {
+            self.fixTlsPointersAfterCopy();
+            self.freeTlsResources();
+        } else {
+            // Just null out TLS without graceful close
+            self.tls_conn = null;
+            self.has_reader_writer = false;
+        }
         self.closeStream();
         self.io = null;
         self.connected = false;
@@ -544,6 +793,8 @@ pub const UltraSock = struct {
         ) catch {
             return error.SetTimeoutFailed;
         };
+        // Cache the timeout for getReadTimeout()
+        self.read_timeout_ms = timeout_ms;
     }
 
     /// Set write timeout on socket (in milliseconds)
@@ -658,7 +909,7 @@ pub const UltraSock = struct {
     /// Check if socket has pending data or is in bad state
     /// Returns true if connection should NOT be reused
     /// Uses poll() with zero timeout for non-blocking check
-    pub fn hasStaleData(self: *UltraSock) bool {
+    pub fn hasStaleData(self: *const UltraSock) bool {
         const stream = self.stream orelse return true; // No stream = stale
         const fd = stream.socket.handle;
 

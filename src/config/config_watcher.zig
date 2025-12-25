@@ -160,7 +160,7 @@ pub const FileWatcher = struct {
 
     /// Initialize inotify-based watcher (Linux)
     fn initInotify(path: []const u8) !Self {
-        const inotify_fd = try posix.inotify_init1(.{ .CLOEXEC = true });
+        const inotify_fd = try posix.inotify_init1(std.os.linux.IN.CLOEXEC);
         errdefer posix.close(inotify_fd);
 
         const mask: u32 = std.os.linux.IN.MODIFY | std.os.linux.IN.MOVE_SELF | std.os.linux.IN.DELETE_SELF;

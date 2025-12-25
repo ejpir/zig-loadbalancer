@@ -37,12 +37,19 @@ pub const SharedBackend = extern struct {
     /// Padding for alignment
     _padding: [1]u8 = undefined,
 
-    /// Get host as slice
+    /// Get host as slice (strips scheme if present)
     pub fn getHost(self: *const SharedBackend) []const u8 {
         // Find null terminator
         var len: usize = 0;
         while (len < MAX_HOST_LEN and self.host[len] != 0) : (len += 1) {}
-        return self.host[0..len];
+        const host = self.host[0..len];
+        // Strip scheme prefix for DNS resolution
+        if (std.mem.startsWith(u8, host, "https://")) {
+            return host[8..];
+        } else if (std.mem.startsWith(u8, host, "http://")) {
+            return host[7..];
+        }
+        return host;
     }
 
     /// Set host from slice

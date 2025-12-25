@@ -29,6 +29,7 @@ const config_watcher = @import("src/config/config_watcher.zig");
 const metrics = @import("src/metrics/mod.zig");
 const mp = @import("src/multiprocess/mod.zig");
 const health = @import("src/health/probe.zig");
+const H2ConnectionPool = @import("src/http/http2/pool.zig").H2ConnectionPool;
 
 const SharedHealthState = shared_region.SharedHealthState;
 
@@ -40,7 +41,10 @@ pub const std_options: std.Options = .{
     .logFn = runtimeLogFn, // Custom log function respects runtime level
 };
 
-/// Custom log function that respects runtime log level
+/// Start time for relative timestamps
+var start_time: ?std.time.Instant = null;
+
+/// Custom log function that respects runtime log level and adds relative timestamps
 fn runtimeLogFn(
     comptime level: std.log.Level,
     comptime scope: @EnumLiteral(),
@@ -48,7 +52,26 @@ fn runtimeLogFn(
     args: anytype,
 ) void {
     if (@intFromEnum(level) > @intFromEnum(runtime_log_level)) return;
-    std.log.defaultLog(level, scope, format, args);
+
+    // Get relative time in ms since first log
+    const rel_ms: u64 = blk: {
+        const now = std.time.Instant.now() catch break :blk 0;
+        if (start_time == null) {
+            start_time = now;
+            break :blk 0;
+        }
+        break :blk now.since(start_time.?) / std.time.ns_per_ms;
+    };
+
+    const level_txt = comptime level.asText();
+    const scope_txt = if (@tagName(scope).len > 0) @tagName(scope) else "default";
+
+    // Format: [+1234ms] level(scope): message
+    std.debug.print("[+{d:>6}ms] {s}({s}): " ++ format ++ "\n", .{
+        rel_ms,
+        level_txt,
+        scope_txt,
+    } ++ args);
 }
 
 // ============================================================================
@@ -199,9 +222,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                     const backend_host = try allocator.dupe(u8, backend_str[0..colon]);
                     const port_str = backend_str[colon + 1 ..];
                     const backend_port = try std.fmt.parseInt(u16, port_str, 10);
+                    // Detect https:// scheme for TLS backends
+                    const use_tls = std.mem.startsWith(u8, backend_host, "https://") or backend_port == 443;
                     try backend_list.append(
                         allocator,
-                        .{ .host = backend_host, .port = backend_port },
+                        .{ .host = backend_host, .port = backend_port, .use_tls = use_tls },
                     );
                 }
                 i += 1;
@@ -544,7 +569,7 @@ fn workerMain(
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    // Connection pool
+    // Connection pool (with allocator for HTTP/2 multiplexing)
     var connection_pool = simple_pool.SimpleConnectionPool{};
     defer connection_pool.deinit();
 
@@ -569,6 +594,10 @@ fn workerMain(
     });
     worker_state.setWorkerId(worker_id);
     worker_state.setSharedRegion(region);
+
+    // Initialize HTTP/2 connection pool (TigerBeetle style)
+    var h2_pool_new = H2ConnectionPool.init(backends.items, allocator);
+    worker_state.h2_pool = &h2_pool_new;
 
     log.info("Worker {d}: Starting with {d} backends (shared health)", .{
         worker_id,
@@ -599,6 +628,14 @@ fn workerMain(
     var threaded: Io.Threaded = .init(allocator);
     defer threaded.deinit();
     const io = threaded.io();
+
+    // CRITICAL: Increase async_limit to prevent synchronous fallback deadlock
+    // Default is CPU cores - 1. With HTTP/2 multiplexing, each connection spawns
+    // a reader task. If async_limit is exceeded, Io.async runs synchronously,
+    // blocking the request coroutine forever (reader waits for data, request
+    // never gets to wait on its condition).
+    // Set to unlimited so reader tasks always spawn asynchronously.
+    threaded.setAsyncLimit(.unlimited);
 
     // Set CPU affinity after Io.Threaded.init
     setCpuAffinity(worker_id) catch {};
@@ -707,7 +744,7 @@ fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
         log.info("Config watcher started: {s}", .{path});
     }
 
-    // Connection pool
+    // Connection pool (with allocator for HTTP/2 multiplexing)
     var connection_pool = simple_pool.SimpleConnectionPool{};
     defer connection_pool.deinit();
 
@@ -732,6 +769,10 @@ fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
     worker_state.setWorkerId(0);
     worker_state.setSharedRegion(region);
 
+    // Initialize HTTP/2 connection pool (TigerBeetle style)
+    var h2_pool_sp = H2ConnectionPool.init(backends.items, allocator);
+    worker_state.h2_pool = &h2_pool_sp;
+
     // Start health probe thread
     const health_thread = health.startHealthProbes(&worker_state, 0) catch |err| {
         log.err("Failed to start health probes: {s}", .{@errorName(err)});
@@ -746,6 +787,10 @@ fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
     var threaded: Io.Threaded = .init(allocator);
     defer threaded.deinit();
     const io = threaded.io();
+
+    // CRITICAL: Increase async_limit to prevent synchronous fallback deadlock
+    // See comment in workerMain for details.
+    threaded.setAsyncLimit(.unlimited);
 
     // Router
     var router = switch (lb_config.strategy) {

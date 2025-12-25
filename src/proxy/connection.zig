@@ -1,8 +1,7 @@
 /// Connection Acquisition for Streaming Proxy (TigerStyle)
 ///
-/// Handles connection acquisition from pool or fresh creation.
-/// Uses generic implementation to deduplicate BackendServer vs SharedBackend paths.
-/// Supports both HTTP/1.1 and HTTP/2 via ALPN negotiation.
+/// Handles HTTP/1.1 connection acquisition from pool or fresh creation.
+/// HTTP/2 connections are handled separately via streamingProxyHttp2.
 ///
 /// TigerStyle compliance:
 /// - Functions <70 lines
@@ -29,11 +28,12 @@ pub const ProxyError = @import("handler.zig").ProxyError;
 const MAX_BACKENDS = config.MAX_BACKENDS;
 
 // ============================================================================
-// Generic Connection Acquisition
+// Generic Connection Acquisition (HTTP/1.1 only)
 // ============================================================================
 
 /// Acquire connection for any backend type (BackendServer or SharedBackend).
 /// Uses duck typing - backend must have: .getHost(), .port, .isHttps()
+/// Note: HTTPS/HTTP2 backends should use streamingProxyHttp2 directly.
 pub fn acquireConnection(
     comptime BackendT: type,
     ctx: *const http.Context,
@@ -45,7 +45,7 @@ pub fn acquireConnection(
     // Prevent bitmap overflow in circuit breaker health tracking.
     std.debug.assert(backend_idx < MAX_BACKENDS);
 
-    // Try pool first
+    // Try HTTP/1.1 pool first
     const pool_result = state.connection_pool.getConnection(backend_idx);
 
     if (pool_result) |pooled_sock_const| {
@@ -60,7 +60,6 @@ pub fn acquireConnection(
         std.debug.assert(pooled_sock.stream != null);
 
         // Build proxy_state, then get tls_conn_ptr from COPIED sock (not local).
-        // Pooled connections preserve their protocol from initial negotiation.
         var proxy_state = ProxyState{
             .sock = pooled_sock,
             .from_pool = true,
@@ -84,17 +83,19 @@ pub fn acquireConnection(
     metrics.global_metrics.recordPoolMissForBackend(backend_idx);
     log.debug("[REQ {d}] POOL MISS backend={d}", .{ req_id, backend_idx });
 
-    // Use HTTP/2 ALPN for HTTPS backends (enables protocol negotiation)
-    // UltraSock.fromBackendServerWithHttp2 uses duck typing (anytype) so any backend type works
+    // Create fresh connection
     var sock = UltraSock.fromBackendServerWithHttp2(backend);
     sock.connect(ctx.io) catch {
         sock.close_blocking();
         return ProxyError.BackendUnavailable;
     };
 
+    // Enable TCP keepalive to detect dead connections (replaces SO_RCVTIMEO)
+    sock.enableKeepalive() catch {};
+
     // Log negotiated protocol
     if (sock.isHttp2()) {
-        log.debug("[REQ {d}] HTTP/2 negotiated with backend {d}", .{ req_id, backend_idx });
+        log.debug("[REQ {d}] HTTP/2 negotiated (non-pooled) with backend {d}", .{ req_id, backend_idx });
     }
 
     // TigerStyle: pair assertion - validate fresh connection.
@@ -103,13 +104,12 @@ pub fn acquireConnection(
         return ProxyError.ConnectionFailed;
     }
 
-    // Build proxy_state, then get tls_conn_ptr from COPIED sock (not local).
-    // is_http2 is set based on ALPN negotiation result.
+    // Build proxy_state for HTTP/1.1 or non-pooled HTTP/2
     const negotiated_http2 = sock.isHttp2();
     var proxy_state = ProxyState{
         .sock = sock,
         .from_pool = false,
-        .can_return_to_pool = true,
+        .can_return_to_pool = !negotiated_http2, // HTTP/2 without pool can't go to HTTP/1.1 pool
         .is_tls = sock.isTls(),
         .is_http2 = negotiated_http2,
         .tls_conn_ptr = null, // Set after copy to avoid dangling pointer.

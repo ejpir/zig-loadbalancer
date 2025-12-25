@@ -85,11 +85,11 @@ fn probeBackend(backend: *const types.BackendServer, config: Config, io: Io) boo
     // Create UltraSock from backend - use HTTP/1.1 only for health probes
     // Health probes are simple and don't benefit from HTTP/2 complexity
     var sock = UltraSock.fromBackendServer(backend);
-    defer sock.close_blocking();
 
     // Connect (handles DNS resolution and TLS handshake)
     sock.connect(io) catch |err| {
         log.debug("Probe connect failed for {s}:{d}: {}", .{ host, backend.port, err });
+        sock.closeAsync(io); // Proper TLS shutdown with close_notify
         return false;
     };
 
@@ -99,10 +99,14 @@ fn probeBackend(backend: *const types.BackendServer, config: Config, io: Io) boo
         &request_buf,
         "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n",
         .{ config.health_path, host, backend.port },
-    ) catch return false;
+    ) catch {
+        sock.closeAsync(io);
+        return false;
+    };
 
     _ = sock.send_all(io, request) catch |err| {
         log.debug("Probe send failed for {s}:{d}: {}", .{ host, backend.port, err });
+        sock.closeAsync(io);
         return false;
     };
 
@@ -110,10 +114,14 @@ fn probeBackend(backend: *const types.BackendServer, config: Config, io: Io) boo
     var buffer: [512]u8 = undefined;
     const n = sock.recv(io, &buffer) catch |err| {
         log.debug("Probe recv failed for {s}:{d}: {}", .{ host, backend.port, err });
+        sock.closeAsync(io);
         return false;
     };
 
-    if (n == 0) return false;
+    if (n == 0) {
+        sock.closeAsync(io);
+        return false;
+    }
 
     // Check for 2xx status
     const response = buffer[0..n];
@@ -127,6 +135,7 @@ fn probeBackend(backend: *const types.BackendServer, config: Config, io: Io) boo
         log.debug("Probe failed for {s}:{d}: non-2xx response", .{ host, backend.port });
     }
 
+    sock.closeAsync(io); // Proper TLS shutdown with close_notify
     return is_healthy;
 }
 

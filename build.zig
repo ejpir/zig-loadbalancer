@@ -72,12 +72,16 @@ pub fn build(b: *std.Build) void {
     });
     const build_test_backend_echo = b.addInstallArtifact(test_backend_echo, .{});
 
+    // Sanitizer option for debugging
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable Thread Sanitizer") orelse false;
+
     // Unified Load Balancer (main entry point)
     const load_balancer_mod = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true, // Required for DNS resolution (getaddrinfo)
+        .sanitize_thread = sanitize_thread,
     });
     load_balancer_mod.addImport("zzz", zzz_module);
     load_balancer_mod.addImport("tls", tls_module);

@@ -52,7 +52,7 @@ fn add_example(
     });
 
     if (link_libc) {
-        example.linkLibC();
+        example.root_module.link_libc = true;
     }
 
     example.root_module.addImport("zzz", zzz_module);
