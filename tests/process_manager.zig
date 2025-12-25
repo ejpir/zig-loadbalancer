@@ -3,7 +3,6 @@
 //! Handles spawning and cleanup of backend/load balancer processes.
 
 const std = @import("std");
-const posix = std.posix;
 const test_utils = @import("test_utils.zig");
 
 pub const Process = struct {
@@ -50,6 +49,10 @@ pub const ProcessManager = struct {
         child.stderr_behavior = .Ignore;
 
         try child.spawn();
+        errdefer {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        }
 
         try self.processes.append(.{
             .child = child,
@@ -65,12 +68,21 @@ pub const ProcessManager = struct {
         var args = std.ArrayList([]const u8).init(self.allocator);
         defer args.deinit();
 
+        // Track strings we allocate so we can free them
+        var allocated_strings = std.ArrayList([]const u8).init(self.allocator);
+        defer {
+            for (allocated_strings.items) |s| self.allocator.free(s);
+            allocated_strings.deinit();
+        }
+
         try args.append("./zig-out/bin/load_balancer");
         try args.append("--port");
 
         var lb_port_buf: [8]u8 = undefined;
         const lb_port_str = try std.fmt.bufPrint(&lb_port_buf, "{d}", .{test_utils.LB_PORT});
-        try args.append(try self.allocator.dupe(u8, lb_port_str));
+        const lb_port_dup = try self.allocator.dupe(u8, lb_port_str);
+        try allocated_strings.append(lb_port_dup);
+        try args.append(lb_port_dup);
 
         // Use single-process mode for easier testing
         try args.append("--mode");
@@ -80,7 +92,9 @@ pub const ProcessManager = struct {
             try args.append("--backend");
             var buf: [32]u8 = undefined;
             const backend_str = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{port});
-            try args.append(try self.allocator.dupe(u8, backend_str));
+            const backend_dup = try self.allocator.dupe(u8, backend_str);
+            try allocated_strings.append(backend_dup);
+            try args.append(backend_dup);
         }
 
         var child = std.process.Child.init(args.items, self.allocator);
@@ -89,6 +103,10 @@ pub const ProcessManager = struct {
         child.stderr_behavior = .Ignore;
 
         try child.spawn();
+        errdefer {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        }
 
         try self.processes.append(.{
             .child = child,
