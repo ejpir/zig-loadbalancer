@@ -40,6 +40,12 @@ pub const H2ConnectionPool = struct {
     backends: []const BackendServer,
     allocator: std.mem.Allocator,
 
+    /// Per-backend mutex to prevent concurrent connection creation race
+    /// CANNOT be atomic: protects multi-step sequence (check empty → create → store)
+    /// Without this, multiple coroutines see "empty" before any assigns,
+    /// leading to duplicate connections and memory leaks
+    backend_mutex: [MAX_BACKENDS]Io.Mutex,
+
     const Self = @This();
 
     /// Initialize pool with backend servers
@@ -49,6 +55,7 @@ pub const H2ConnectionPool = struct {
             .slot_state = undefined,
             .backends = backends,
             .allocator = allocator,
+            .backend_mutex = [_]Io.Mutex{.init} ** MAX_BACKENDS,
         };
 
         // Initialize all slots to empty
@@ -64,80 +71,87 @@ pub const H2ConnectionPool = struct {
 
     /// Get or create connection for backend
     ///
-    /// Strategy:
-    /// 1. Scan for available connection in this backend's slots
-    /// 2. If found and healthy, mark in_use and return
-    /// 3. If found but stale, destroy and create fresh
+    /// Strategy for HTTP/2 MULTIPLEXING:
+    /// 1. Lock per-backend mutex (prevents concurrent creation race)
+    /// 2. Scan for available connection with room for more streams
+    /// 3. If found and healthy, return it (stays available for more requests)
     /// 4. If not found, find empty slot and create fresh
-    /// 5. Connect (TLS + HTTP/2 handshake)
+    /// 5. Unlock mutex on return
     pub fn getOrCreate(self: *Self, backend_idx: u32, io: Io) !*H2Connection {
         std.debug.assert(backend_idx < self.backends.len);
 
-        // Phase 1: Scan for existing available connection
+        // Lock per-backend mutex to prevent concurrent creation race
+        // Critical: without this, multiple coroutines see "empty" before any assigns
+        try self.backend_mutex[backend_idx].lock(io);
+        defer self.backend_mutex[backend_idx].unlock(io);
+
+        // Phase 1: Find existing connection with room for more streams
         for (&self.slot_state[backend_idx], &self.slots[backend_idx], 0..) |*state, *slot, i| {
             if (state.* == .available) {
                 if (slot.*) |conn| {
-                    // Check if connection is stale/dead
+                    // Skip stale connections - DON'T destroy here!
+                    // Other requests may still hold references. Let release() handle cleanup.
                     if (self.isConnectionStale(conn)) {
-                        log.debug("Connection stale, destroying: backend={d} slot={d}", .{ backend_idx, i });
-                        // CRITICAL: Clear slot FIRST to prevent other coroutines from seeing stale pointer
-                        slot.* = null;
-                        state.* = .empty;
-                        self.destroyConnection(conn, io);
-                        continue; // Will create fresh in Phase 2
+                        log.debug("Connection stale, skipping: backend={d} slot={d}", .{ backend_idx, i });
+                        continue;
                     }
 
-                    // Connection healthy, mark in_use and return
-                    state.* = .in_use;
-                    // Reset to aggressive timeout for active request handling
-                    conn.sock.setReadTimeout(500) catch {};
-                    log.debug("Reusing connection: backend={d} slot={d}", .{ backend_idx, i });
-                    return conn;
+                    // Check actual slot availability (8 stream slots per connection)
+                    if (conn.h2_client.findFreeSlot() != null) {
+                        const new_refs = conn.ref_count.fetchAdd(1, .acq_rel) + 1;
+                        log.debug("Reusing connection: backend={d} slot={d} streams={d} refs={d}", .{ backend_idx, i, conn.h2_client.active_streams.load(.acquire), new_refs });
+                        return conn;
+                    }
                 }
             }
         }
 
-        // Phase 2: No available connection, find empty slot and create fresh
+        // Phase 2: Create new connection in empty slot
         for (&self.slot_state[backend_idx], &self.slots[backend_idx], 0..) |*state, *slot, i| {
             if (state.* == .empty) {
-                std.debug.assert(slot.* == null);
-
-                // Create fresh connection
                 const conn = try self.createFreshConnection(backend_idx, io);
-                errdefer self.destroyConnection(conn, io);
-
-                // Store in slot, mark in_use
+                conn.ref_count.store(1, .release); // First user
                 slot.* = conn;
-                state.* = .in_use;
-                log.debug("Created fresh connection: backend={d} slot={d}", .{ backend_idx, i });
+                state.* = .available;
+                log.debug("Created fresh connection: backend={d} slot={d} refs=1", .{ backend_idx, i });
                 return conn;
             }
         }
 
-        // Pool exhausted
+        // All slots full - handler will retry on TooManyStreams
         log.warn("Connection pool exhausted: backend={d}", .{backend_idx});
         return error.PoolExhausted;
     }
 
     /// Release connection back to pool
     ///
+    /// Decrements ref_count. Only destroys when ref_count hits 0.
     /// If success=true and connection healthy: mark available for reuse
     /// If success=false or connection dead: destroy and mark empty
     pub fn release(self: *Self, conn: *H2Connection, success: bool, io: Io) void {
         const backend_idx = conn.backend_idx;
         std.debug.assert(backend_idx < self.backends.len);
 
-        // Find slot containing this connection
+        // Atomically decrement reference count and get previous value
+        // This is safe for concurrent releases - only the one that gets prev_refs=1 proceeds to destroy
+        const prev_refs = conn.ref_count.fetchSub(1, .acq_rel);
+        std.debug.assert(prev_refs > 0); // Must have had at least 1 ref
+
+        // If other users still have references (prev was > 1, now > 0), just return
+        if (prev_refs > 1) {
+            log.debug("Connection released, refs remaining: backend={d} refs={d}", .{ backend_idx, prev_refs - 1 });
+            return;
+        }
+
+        // We were the last user (prev_refs == 1, now 0) - find slot and decide fate
         for (&self.slot_state[backend_idx], &self.slots[backend_idx]) |*state, *slot| {
             if (slot.* == conn) {
+
+                // Last user - decide whether to keep or destroy
                 if (success and conn.isReady() and !self.isConnectionStale(conn)) {
                     // Connection healthy - return to pool for reuse
-                    // HTTP/2 multiplexing makes connection reuse highly valuable
                     log.debug("Returning connection to pool: backend={d}", .{backend_idx});
                     conn.last_used_ns = currentTimeNs();
-                    // Set longer timeout for idle pooled connection (30 seconds)
-                    // This allows the reader to wait for GOAWAY without triggering false errors
-                    conn.sock.setReadTimeout(30_000) catch {};
                     state.* = .available;
                 } else {
                     // Failed, dead, or stale - destroy
@@ -186,8 +200,9 @@ pub const H2ConnectionPool = struct {
             &conn.tls_output_buffer,
         );
 
-        // Set aggressive timeout for fresh connection
-        conn.sock.setReadTimeout(500) catch {};
+        // Enable TCP keepalive to detect dead connections (replaces SO_RCVTIMEO)
+        // OS will send probes and close dead connections automatically
+        conn.sock.enableKeepalive() catch {};
 
         // Perform HTTP/2 handshake (send preface + SETTINGS)
         try conn.connect(io);
@@ -197,6 +212,7 @@ pub const H2ConnectionPool = struct {
     }
 
     /// Check if connection is stale or dead
+    /// Returns true if connection should NOT be used for NEW requests
     fn isConnectionStale(self: *Self, conn: *H2Connection) bool {
         _ = self;
 
@@ -205,9 +221,10 @@ pub const H2ConnectionPool = struct {
             return true;
         }
 
-        // Never destroy connections with active streams
-        if (conn.h2_client.active_streams > 0) {
-            return false;
+        // GOAWAY = no new streams allowed (existing streams can complete)
+        // Must check BEFORE active_streams - we can't send NEW requests even if conn is busy
+        if (conn.goaway_received) {
+            return true;
         }
 
         // Check basic connectivity
@@ -215,12 +232,13 @@ pub const H2ConnectionPool = struct {
             return true;
         }
 
-        // Check GOAWAY received
-        if (conn.goaway_received) {
-            return true;
+        // Skip idle timeout check if connection has active streams
+        // Active connections are obviously not "idle"
+        if (conn.h2_client.active_streams.load(.acquire) > 0) {
+            return false;
         }
 
-        // Check idle timeout
+        // Check idle timeout (only for connections with no active streams)
         const now_ns = currentTimeNs();
         const idle_ns = now_ns - conn.last_used_ns;
         if (idle_ns > IDLE_TIMEOUT_NS) {

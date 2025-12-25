@@ -629,6 +629,14 @@ fn workerMain(
     defer threaded.deinit();
     const io = threaded.io();
 
+    // CRITICAL: Increase async_limit to prevent synchronous fallback deadlock
+    // Default is CPU cores - 1. With HTTP/2 multiplexing, each connection spawns
+    // a reader task. If async_limit is exceeded, Io.async runs synchronously,
+    // blocking the request coroutine forever (reader waits for data, request
+    // never gets to wait on its condition).
+    // Set to unlimited so reader tasks always spawn asynchronously.
+    threaded.setAsyncLimit(.unlimited);
+
     // Set CPU affinity after Io.Threaded.init
     setCpuAffinity(worker_id) catch {};
 
@@ -779,6 +787,10 @@ fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
     var threaded: Io.Threaded = .init(allocator);
     defer threaded.deinit();
     const io = threaded.io();
+
+    // CRITICAL: Increase async_limit to prevent synchronous fallback deadlock
+    // See comment in workerMain for details.
+    threaded.setAsyncLimit(.unlimited);
 
     // Router
     var router = switch (lb_config.strategy) {
