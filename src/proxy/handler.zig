@@ -55,6 +55,7 @@ pub const ProxyError = error{
     ReadFailed,
     Timeout,
     EmptyResponse,
+    PoolExhausted, // Local resource issue, not a backend failure
     InvalidResponse,
     /// HTTP/2 GOAWAY exhausted retries - NOT a backend health failure
     /// Server gracefully closed connection, just need fresh connection
@@ -212,8 +213,8 @@ inline fn proxyWithFailover(
             trace_span.setIntAttribute("http.status_code", 200);
             return response;
         } else |err| {
-            // GOAWAY exhaustion is NOT a backend failure - just connection-level flow control
-            if (err != ProxyError.GoawayRetriesExhausted) {
+            // GOAWAY/PoolExhausted are NOT backend failures - just connection-level issues
+            if (err != ProxyError.GoawayRetriesExhausted and err != ProxyError.PoolExhausted) {
                 state.recordFailure(primary_idx);
             }
             trace_span.addEvent("primary_backend_failed");
@@ -227,8 +228,8 @@ inline fn proxyWithFailover(
             trace_span.setIntAttribute("http.status_code", 200);
             return response;
         } else |err| {
-            // GOAWAY exhaustion is NOT a backend failure - just connection-level flow control
-            if (err != ProxyError.GoawayRetriesExhausted) {
+            // GOAWAY/PoolExhausted are NOT backend failures - just connection-level issues
+            if (err != ProxyError.GoawayRetriesExhausted and err != ProxyError.PoolExhausted) {
                 state.recordFailure(primary_idx);
             }
             trace_span.addEvent("primary_backend_failed");
@@ -254,8 +255,8 @@ inline fn proxyWithFailover(
                 trace_span.setIntAttribute("http.status_code", 200);
                 return response;
             } else |failover_err| {
-                // GOAWAY exhaustion is NOT a backend failure
-                if (failover_err != ProxyError.GoawayRetriesExhausted) {
+                // GOAWAY/PoolExhausted are NOT backend failures
+                if (failover_err != ProxyError.GoawayRetriesExhausted and failover_err != ProxyError.PoolExhausted) {
                     state.recordFailure(failover_idx);
                 }
                 const err_name = @errorName(failover_err);
@@ -273,8 +274,8 @@ inline fn proxyWithFailover(
                 trace_span.setIntAttribute("http.status_code", 200);
                 return response;
             } else |failover_err| {
-                // GOAWAY exhaustion is NOT a backend failure
-                if (failover_err != ProxyError.GoawayRetriesExhausted) {
+                // GOAWAY/PoolExhausted are NOT backend failures
+                if (failover_err != ProxyError.GoawayRetriesExhausted and failover_err != ProxyError.PoolExhausted) {
                     state.recordFailure(failover_idx);
                 }
                 const err_name = @errorName(failover_err);
@@ -794,6 +795,10 @@ fn streamingProxyHttp2(
         const conn = pool.getOrCreate(backend_idx, ctx.io, &h2_span) catch |err| {
             log.warn("[REQ {d}] H2 pool getOrCreate failed: {}", .{ req_id, err });
             h2_span.setError("Pool getOrCreate failed");
+            // PoolExhausted is a local resource issue, not a backend failure
+            if (err == error.PoolExhausted) {
+                return ProxyError.PoolExhausted;
+            }
             return ProxyError.ConnectionFailed;
         };
 

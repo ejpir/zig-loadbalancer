@@ -30,7 +30,7 @@
 
 ## Span Hierarchy (Implemented)
 
-### HTTP/2 (HTTPS) Path
+### HTTP/2 (HTTPS) Path - New Connection (8 spans)
 ```
 proxy_request (root, SERVER span)
 ├─ http.method, http.url, http.status_code
@@ -46,19 +46,19 @@ proxy_request (root, SERVER span)
     ├─ http.status_code, http.response_content_length
     ├─ h2.retry_count
     │
-    ├── dns_resolution (INTERNAL)
+    ├── dns_resolution (INTERNAL)        ← only on new connection
     │   └─ dns.hostname
     │
-    ├── tcp_connect (INTERNAL)
+    ├── tcp_connect (INTERNAL)           ← only on new connection
     │   ├─ net.peer.name
     │   └─ net.peer.port
     │
-    ├── tls_handshake (INTERNAL)
+    ├── tls_handshake (INTERNAL)         ← only on new connection
     │   ├─ tls.server_name
     │   ├─ tls.cipher
     │   └─ tls.alpn
     │
-    ├── h2_handshake (INTERNAL)
+    ├── h2_handshake (INTERNAL)          ← only on new connection
     │   └─ HTTP/2 preface + SETTINGS exchange
     │
     └── response_streaming (INTERNAL)
@@ -68,7 +68,17 @@ proxy_request (root, SERVER span)
         └─ http.body.had_error
 ```
 
-### HTTP/1.1 Path
+### HTTP/2 (HTTPS) Path - Reused Connection (4 spans)
+```
+proxy_request (root, SERVER span)
+├── backend_selection (INTERNAL)
+└── backend_request_h2 (CLIENT)
+    └── response_streaming (INTERNAL)
+```
+Connection spans (dns, tcp, tls, h2_handshake) only appear when creating fresh connections.
+H2 multiplexing reuses existing connections for subsequent requests.
+
+### HTTP/1.1 Path - New Connection
 ```
 proxy_request (root, SERVER span)
 ├─ http.method, http.url, http.status_code
@@ -78,14 +88,14 @@ proxy_request (root, SERVER span)
 │
 ├── backend_connection (INTERNAL)
 │   │
-│   ├── dns_resolution (INTERNAL)
+│   ├── dns_resolution (INTERNAL)        ← only on new connection
 │   │   └─ dns.hostname
 │   │
-│   ├── tcp_connect (INTERNAL)
+│   ├── tcp_connect (INTERNAL)           ← only on new connection
 │   │   ├─ net.peer.name
 │   │   └─ net.peer.port
 │   │
-│   └── tls_handshake (INTERNAL, if HTTPS)
+│   └── tls_handshake (INTERNAL, if HTTPS) ← only on new connection
 │       ├─ tls.server_name, tls.cipher, tls.alpn
 │
 ├── backend_request (CLIENT)
@@ -222,3 +232,26 @@ open http://localhost:16686
 - Response streaming spans
 - Proper parent-child span relationships
 - Span attributes following OpenTelemetry semantic conventions
+
+## Performance Characteristics
+
+**Non-blocking Architecture:**
+- Uses `BatchingProcessor` with background export thread
+- Request path: quick span clone + queue append (~microseconds)
+- Background thread: batched HTTP export every 5s or 512 spans
+- Request handling never blocks on OTLP HTTP export
+
+**SDK Fixes Applied:**
+- Added `Span.clone()` for deep copying (attributes, events, links)
+- `BatchingProcessor.onEnd()` deep clones spans to take ownership
+- Prevents use-after-free when original span is cleaned up
+- Mutex unlocked during HTTP export for concurrency
+
+**Configuration:**
+```zig
+BatchingProcessor.init(allocator, exporter, .{
+    .max_queue_size = 2048,           // Max spans in queue
+    .scheduled_delay_millis = 5000,   // Export every 5 seconds
+    .max_export_batch_size = 512,     // Or when 512 spans accumulated
+});
+```

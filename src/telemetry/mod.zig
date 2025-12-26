@@ -30,7 +30,7 @@ const TelemetryState = struct {
     allocator: std.mem.Allocator,
     config: *otel.otlp.ConfigOptions,
     exporter: *otel.trace.OTLPExporter,
-    processor: otel.trace.SimpleProcessor,
+    processor: *otel.trace.BatchingProcessor, // Background thread, non-blocking
     provider: *otel.trace.TracerProvider,
     tracer: *otel.api.trace.TracerImpl,
     prng: *std.Random.DefaultPrng, // Keep PRNG alive on heap
@@ -39,6 +39,10 @@ const TelemetryState = struct {
 /// Initialize the telemetry system with an OTLP endpoint.
 /// Endpoint should be in "host:port" format (e.g., "localhost:4318").
 pub fn init(allocator: std.mem.Allocator, endpoint: []const u8) !void {
+    // TigerBeetle: validate inputs
+    std.debug.assert(endpoint.len > 0);
+    std.debug.assert(endpoint.len < 256); // Reasonable endpoint length
+
     if (global_state != null) {
         log.warn("Telemetry already initialized", .{});
         return;
@@ -71,12 +75,21 @@ pub fn init(allocator: std.mem.Allocator, endpoint: []const u8) !void {
     const provider = try otel.trace.TracerProvider.init(allocator, id_gen);
     errdefer provider.shutdown();
 
-    // Create simple processor - exports spans immediately (synchronously)
-    // Store it in state FIRST so the pointer is stable
-    state.processor = otel.trace.SimpleProcessor.init(allocator, exporter.asSpanExporter());
+    // Create batching processor - exports spans in background thread (non-blocking)
+    // Config: batch up to 512 spans, export every 5 seconds or when batch full
+    const processor = try otel.trace.BatchingProcessor.init(allocator, exporter.asSpanExporter(), .{
+        .max_queue_size = 2048,
+        .scheduled_delay_millis = 5000, // Export every 5 seconds
+        .max_export_batch_size = 512, // Or when 512 spans accumulated
+    });
+    errdefer {
+        processor.asSpanProcessor().shutdown() catch {};
+        processor.deinit();
+    }
 
-    // Add the processor to the provider - use pointer to state.processor, not a stack copy
-    try provider.addSpanProcessor(state.processor.asSpanProcessor());
+    // Add the processor to the provider
+    try provider.addSpanProcessor(processor.asSpanProcessor());
+    state.processor = processor;
 
     // Get a tracer for the load balancer
     const tracer = try provider.getTracer(.{
@@ -98,12 +111,17 @@ pub fn init(allocator: std.mem.Allocator, endpoint: []const u8) !void {
 }
 
 /// Shutdown the telemetry system
+/// Flushes pending spans and waits for background thread to complete.
 pub fn deinit() void {
     const state = global_state orelse return;
     const allocator = state.allocator;
 
     // Shutdown provider (which shuts down processors and exports pending spans)
     state.provider.shutdown();
+
+    // Shutdown and cleanup batching processor (waits for background thread)
+    state.processor.asSpanProcessor().shutdown() catch {};
+    state.processor.deinit();
 
     // Clean up config and exporter
     state.exporter.deinit();
@@ -267,6 +285,10 @@ pub fn startInternalSpan(name: []const u8) Span {
 
 /// Start a child span with a parent span
 pub fn startChildSpan(parent: *Span, name: []const u8, kind: SpanKind) Span {
+    // TigerBeetle: validate inputs
+    std.debug.assert(name.len > 0);
+    std.debug.assert(name.len < 128); // Reasonable span name length
+
     const state = global_state orelse return Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
 
     // Get parent context
