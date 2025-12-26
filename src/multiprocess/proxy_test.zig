@@ -70,9 +70,6 @@ test "buildRequestHeaders: GET request without body" {
     try testing.expect(std.mem.indexOf(u8, headers, "User-Agent: TestClient/1.0\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, headers, "Accept: application/json\r\n") != null);
 
-    // Verify Connection header
-    try testing.expect(std.mem.indexOf(u8, headers, "Connection: keep-alive\r\n") != null);
-
     // Verify no Content-Length for GET without body
     try testing.expect(std.mem.indexOf(u8, headers, "Content-Length:") == null);
 
@@ -209,8 +206,8 @@ test "buildRequestHeaders: hop-by-hop headers are filtered" {
     try testing.expect(std.mem.indexOf(u8, headers, "User-Agent: TestClient/1.0\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, headers, "Accept: text/html\r\n") != null);
 
-    // Verify proxy adds its own Connection: keep-alive
-    try testing.expect(std.mem.indexOf(u8, headers, "Connection: keep-alive\r\n") != null);
+    // Verify Connection header is NOT added (hop-by-hop, HTTP/1.1 is keep-alive by default)
+    try testing.expect(std.mem.indexOf(u8, headers, "Connection:") == null);
 
 }
 

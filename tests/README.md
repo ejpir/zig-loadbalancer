@@ -1,208 +1,138 @@
 # Load Balancer Integration Tests
 
-This directory contains end-to-end integration tests for the load balancer.
+This directory contains end-to-end integration tests for the load balancer, written entirely in Zig.
 
 ## Overview
 
-The integration tests verify the complete request/response flow through the load balancer, including:
+The integration tests verify the complete request/response flow through the load balancer:
 
-- Request forwarding (GET, POST, PUT)
+- Request forwarding (GET, POST, PUT, PATCH)
 - Request body forwarding
 - Header forwarding (including filtering hop-by-hop headers)
 - Load balancing (round-robin distribution)
-- Connection pooling
 - Multiple sequential requests
-
-## Prerequisites
-
-- Built binaries: `zig build build-all`
-- `jq` for JSON parsing: `brew install jq` (macOS) or `apt-get install jq` (Linux)
-- `nc` (netcat) for port checking (usually pre-installed)
 
 ## Running Tests
 
-### Quick Test
-
-Run a quick sanity check to verify basic functionality:
+Build and run the integration tests:
 
 ```bash
-./tests/quick_test.sh
+zig build test-integration
 ```
-
-This will:
-1. Start one test backend
-2. Test the backend directly
-3. Start the load balancer
-4. Test through the load balancer
-
-### Full Integration Test Suite
-
-Run the comprehensive test suite:
-
-```bash
-./tests/run_integration_tests.sh
-```
-
-This will run all tests including:
-- GET request forwarding
-- POST request with JSON body
-- Custom header forwarding
-- Multiple sequential requests
-- Round-robin load balancing across 3 backends
 
 Expected output:
 ```
-========================================
-Load Balancer Integration Tests
-========================================
+╔══════════════════════════════════════╗
+║   Load Balancer Integration Tests   ║
+╚══════════════════════════════════════╝
 
-[INFO] Starting basic tests (single backend)...
-[INFO] Started backend backend1 on port 19001 (PID: 12345)
-[INFO] Started load balancer on port 18080 (PID: 12346)
-[INFO] Testing GET request forwarding
-[PASS] GET request forwarded correctly
-[INFO] Testing POST request with JSON body
-[PASS] POST request with JSON body forwarded correctly
-[INFO] Testing custom header forwarding
-[PASS] Custom headers forwarded correctly
-[INFO] Testing multiple sequential requests
-[PASS] Multiple sequential requests work correctly
-[INFO] Testing round-robin load balancing
-[PASS] Round-robin distributes requests evenly (3/3/3)
+Basic Proxy Functionality
+  ✓ forwards GET requests correctly
+  ✓ forwards POST requests with JSON body
+  ✓ forwards PUT requests with body
+  ✓ forwards PATCH requests with body
+  ✓ returns complete response structure
 
-========================================
-All tests passed!
-========================================
+  5 passed, 0 failed
+
+Header Handling
+  ✓ forwards Content-Type header
+  ✓ forwards custom X-* headers
+  ✓ forwards Authorization header
+  ✓ filters hop-by-hop headers
+  ✓ includes Host header to backend
+
+  5 passed, 0 failed
+
+Body Forwarding
+  ✓ handles empty POST body
+  ✓ handles large body (1KB)
+  ✓ preserves JSON body exactly
+  ✓ handles binary data
+  ✓ sets Content-Length correctly
+  ✓ handles multiple sequential POSTs
+
+  6 passed, 0 failed
+
+Load Balancing
+  ✓ distributes requests with round-robin (3/3/3)
+  ✓ reaches all configured backends
+
+  2 passed, 0 failed
+
+════════════════════════════════════════
+✓ All test suites passed!
 ```
 
-## Test Components
+## Test Architecture
 
-### Test Backend Echo Server (`test_backend_echo.zig`)
+### Test Harness (`harness.zig`)
 
-A specialized backend server that echoes back request details in JSON format:
-- Server ID
-- HTTP method
-- Request URI
-- All headers
-- Request body
-- Body length
+A minimal Jest-like test framework providing:
+- `describe`/`it` semantics
+- `beforeAll`/`afterAll` lifecycle hooks
+- Colorized output
+- Pass/fail counting
 
-This allows tests to verify that the load balancer correctly forwards all request components.
+### Test Utilities (`test_utils.zig`)
 
-### Integration Test Script (`run_integration_tests.sh`)
+HTTP client helpers:
+- `waitForPort()` - Wait for a server to accept connections
+- `httpRequest()` - Make HTTP requests and get responses
+- JSON parsing helpers for response validation
 
-A bash script that:
-1. Starts test backend servers
-2. Starts the load balancer
-3. Makes HTTP requests using `curl`
-4. Verifies responses using `jq`
-5. Cleans up all processes
+### Process Manager (`process_manager.zig`)
 
-### Test Coverage
+Manages backend and load balancer processes:
+- Spawns test backends on ports 19001-19003
+- Spawns load balancer on port 18080
+- Handles cleanup on test completion
 
-**Basic Functionality:**
-- ✅ GET requests proxied correctly
-- ✅ POST requests with JSON body forwarded correctly
-- ✅ Custom headers forwarded
-- ✅ Hop-by-hop headers NOT forwarded
-- ✅ Multiple sequential requests work
+### Test Suites (`suites/`)
 
-**Load Balancing:**
-- ✅ Round-robin distributes requests evenly across backends
-- ✅ All backends receive traffic
-
-**Connection Pooling:**
-- ✅ Multiple requests reuse connections
-- ✅ No connection leaks
+- `basic.zig` - Basic HTTP method forwarding
+- `headers.zig` - Header handling and filtering
+- `body.zig` - Request body forwarding
+- `load_balancing.zig` - Round-robin distribution
 
 ## Test Ports
 
-The tests use the following ports:
-- Load Balancer: `18080`
-- Backend 1: `19001`
-- Backend 2: `19002`
-- Backend 3: `19003`
-
-Make sure these ports are available before running tests.
-
-## Troubleshooting
-
-### Port Already in Use
-
-If you see connection errors, check for processes using the test ports:
-
-```bash
-# Check ports
-lsof -i :18080
-lsof -i :19001
-
-# Kill any stuck processes
-killall test_backend_echo load_balancer_sp
-```
-
-### Tests Fail with "command not found: jq"
-
-Install jq:
-
-```bash
-# macOS
-brew install jq
-
-# Linux
-sudo apt-get install jq
-```
-
-### Tests Timeout
-
-Increase the `STARTUP_DELAY_MS` in the test script if servers are slow to start:
-
-```bash
-# Edit tests/run_integration_tests.sh
-STARTUP_DELAY_MS=1000  # Increase from 500 to 1000
-```
+| Component | Port |
+|-----------|------|
+| Load Balancer | 18080 |
+| Backend 1 | 19001 |
+| Backend 2 | 19002 |
+| Backend 3 | 19003 |
 
 ## Adding New Tests
 
-To add a new test case:
+1. Create a test function in the appropriate suite:
 
-1. Add a test function following the pattern:
-```bash
-test_my_feature() {
-    info "Testing my feature"
+```zig
+fn testMyFeature(allocator: std.mem.Allocator) !void {
+    const response = try test_utils.httpRequest(
+        allocator, "GET", test_utils.LB_PORT, "/my-path", null, null
+    );
+    defer allocator.free(response);
 
-    # Make request
-    local response=$(curl -s http://localhost:$LB_PORT/)
+    const body = try test_utils.extractJsonBody(response);
+    const method = try test_utils.getJsonString(allocator, body, "method");
+    defer allocator.free(method);
 
-    # Verify response
-    local result=$(echo "$response" | jq -r '.some_field')
-    if [ "$result" != "expected" ]; then
-        fail "My feature" "Expected 'expected', got '$result'"
-    fi
-
-    pass "My feature works correctly"
+    try std.testing.expectEqualStrings("GET", method);
 }
 ```
 
-2. Call the function from `main()`:
-```bash
-main() {
-    # ... existing setup ...
-    test_my_feature
-    # ...
-}
-```
+2. Add the test to the suite's `tests` array:
 
-## CI/CD Integration
-
-To integrate with CI/CD pipelines:
-
-```yaml
-# Example GitHub Actions
-- name: Build
-  run: zig build build-all
-
-- name: Run Integration Tests
-  run: ./tests/run_integration_tests.sh
+```zig
+pub const suite = harness.Suite{
+    .name = "My Suite",
+    .tests = &.{
+        harness.it("tests my feature", testMyFeature),
+        // ...
+    },
+};
 ```
 
 ## Manual Testing
@@ -210,11 +140,14 @@ To integrate with CI/CD pipelines:
 For manual testing with curl:
 
 ```bash
-# Start backend
+# Build all components
+zig build
+
+# Start backend manually
 ./zig-out/bin/test_backend_echo --port 19001 --id backend1 &
 
 # Start load balancer
-./zig-out/bin/load_balancer_sp --port 18080 --backend 127.0.0.1:19001 &
+./zig-out/bin/load_balancer --port 18080 --mode sp --backend 127.0.0.1:19001 &
 
 # Test GET
 curl http://localhost:18080/
@@ -225,5 +158,5 @@ curl -X POST -H "Content-Type: application/json" \
   http://localhost:18080/
 
 # Clean up
-killall test_backend_echo load_balancer_sp
+killall test_backend_echo load_balancer
 ```
