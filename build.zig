@@ -18,6 +18,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("vendor/tls/src/root.zig"),
     });
 
+    // OpenTelemetry SDK module (zig-o11y/opentelemetry-sdk - distributed tracing)
+    const otel_module = b.dependency("opentelemetry", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("sdk");
+
     // Backend 1
     const backend1_mod = b.createModule(.{
         .root_source_file = b.path("tests/fixtures/backend1.zig"),
@@ -85,6 +91,7 @@ pub fn build(b: *std.Build) void {
     });
     load_balancer_mod.addImport("zzz", zzz_module);
     load_balancer_mod.addImport("tls", tls_module);
+    load_balancer_mod.addImport("opentelemetry", otel_module);
     const load_balancer = b.addExecutable(.{
         .name = "load_balancer",
         .root_module = load_balancer_mod,

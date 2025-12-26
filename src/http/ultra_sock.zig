@@ -10,6 +10,7 @@ const tls_mod = @import("tls.zig");
 const tls = tls_mod.tls_lib;
 
 const config_mod = @import("../core/config.zig");
+const telemetry = @import("../telemetry/mod.zig");
 
 // Re-export TlsOptions for external use
 pub const TlsOptions = tls_mod.TlsOptions;
@@ -45,6 +46,9 @@ pub const UltraSock = struct {
 
     // Cached read timeout for restoration after temporary changes
     read_timeout_ms: u32 = 1000, // Default 1 second
+
+    // Optional parent span for tracing connection phases
+    trace_span: ?*telemetry.Span = null,
 
     /// Get the current read timeout in milliseconds
     pub fn getReadTimeout(self: *const UltraSock) u32 {
@@ -97,10 +101,19 @@ pub const UltraSock = struct {
         // Resolve address - first try as IP, then DNS resolution
         const addr = Io.net.IpAddress.parse(self.host, self.port) catch blk: {
             // Not a raw IP, try DNS resolution using getaddrinfo
+            // DNS resolution span
+            var dns_span = if (self.trace_span) |parent|
+                telemetry.startChildSpan(parent, "dns_resolution", .Internal)
+            else
+                telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+            defer dns_span.end();
+            dns_span.setStringAttribute("dns.hostname", self.host);
+
             if (trace_enabled) {
                 tls_log.debug("  Resolving DNS for {s}...", .{self.host});
             }
             const resolved = resolveDns(self.host, self.port) catch {
+                dns_span.setBoolAttribute("dns.success", false);
                 if (trace_enabled) {
                     tls_log.err("!!! DNS resolution failed for {s}", .{self.host});
                 } else {
@@ -108,22 +121,33 @@ pub const UltraSock = struct {
                 }
                 return error.InvalidAddress;
             };
+            dns_span.setBoolAttribute("dns.success", true);
             if (trace_enabled) {
                 tls_log.debug("  DNS resolved {s}", .{self.host});
             }
             break :blk resolved;
         };
 
-        // Connect using std.Io
+        // TCP connect span
+        var tcp_span = if (self.trace_span) |parent|
+            telemetry.startChildSpan(parent, "tcp_connect", .Internal)
+        else
+            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+        defer tcp_span.end();
+        tcp_span.setStringAttribute("net.peer.name", self.host);
+        tcp_span.setIntAttribute("net.peer.port", @intCast(self.port));
+
         if (trace_enabled) {
             tls_log.debug("  TCP connecting to {s}:{}...", .{ self.host, self.port });
         }
         self.stream = addr.connect(io, .{ .mode = .stream }) catch {
+            tcp_span.setBoolAttribute("tcp.success", false);
             if (trace_enabled) {
                 tls_log.err("!!! TCP connect failed to {s}:{}", .{ self.host, self.port });
             }
             return error.ConnectionFailed;
         };
+        tcp_span.setBoolAttribute("tcp.success", true);
         errdefer self.closeStream();
 
         if (trace_enabled) {
@@ -162,10 +186,19 @@ pub const UltraSock = struct {
         }
 
         const addr = Io.net.IpAddress.parse(self.host, self.port) catch blk: {
+            // DNS resolution span
+            var dns_span = if (self.trace_span) |parent|
+                telemetry.startChildSpan(parent, "dns_resolution", .Internal)
+            else
+                telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+            defer dns_span.end();
+            dns_span.setStringAttribute("dns.hostname", self.host);
+
             if (trace_enabled) {
                 tls_log.debug("  Resolving DNS for {s}...", .{self.host});
             }
             const resolved = resolveDns(self.host, self.port) catch {
+                dns_span.setBoolAttribute("dns.success", false);
                 if (trace_enabled) {
                     tls_log.err("!!! DNS resolution failed for {s}", .{self.host});
                 } else {
@@ -173,21 +206,33 @@ pub const UltraSock = struct {
                 }
                 return error.InvalidAddress;
             };
+            dns_span.setBoolAttribute("dns.success", true);
             if (trace_enabled) {
                 tls_log.debug("  DNS resolved {s}", .{self.host});
             }
             break :blk resolved;
         };
 
+        // TCP connect span
+        var tcp_span = if (self.trace_span) |parent|
+            telemetry.startChildSpan(parent, "tcp_connect", .Internal)
+        else
+            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+        defer tcp_span.end();
+        tcp_span.setStringAttribute("net.peer.name", self.host);
+        tcp_span.setIntAttribute("net.peer.port", @intCast(self.port));
+
         if (trace_enabled) {
             tls_log.debug("  TCP connecting to {s}:{}...", .{ self.host, self.port });
         }
         self.stream = addr.connect(io, .{ .mode = .stream }) catch {
+            tcp_span.setBoolAttribute("tcp.success", false);
             if (trace_enabled) {
                 tls_log.err("!!! TCP connect failed to {s}:{}", .{ self.host, self.port });
             }
             return error.ConnectionFailed;
         };
+        tcp_span.setBoolAttribute("tcp.success", true);
         errdefer self.closeStream();
 
         if (trace_enabled) {
@@ -301,6 +346,14 @@ pub const UltraSock = struct {
     ) !void {
         const stream = self.stream orelse return error.SocketNotInitialized;
 
+        // TLS handshake span
+        var tls_span = if (self.trace_span) |parent|
+            telemetry.startChildSpan(parent, "tls_handshake", .Internal)
+        else
+            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+        defer tls_span.end();
+        tls_span.setStringAttribute("tls.server_name", self.host);
+
         try tls_mod.ensureCaBundleLoaded(io, self.tls_options.ca);
 
         self.stream_reader = stream.reader(io, input_buf);
@@ -342,6 +395,8 @@ pub const UltraSock = struct {
             &self.stream_writer.interface,
             client_opts,
         ) catch |err| {
+            tls_span.setBoolAttribute("tls.success", false);
+            tls_span.setStringAttribute("tls.error", @errorName(err));
             if (trace_enabled) {
                 tls_log.err("!!! TLS handshake FAILED: {} for {s}:{}", .{ err, self.host, self.port });
             } else {
@@ -349,16 +404,20 @@ pub const UltraSock = struct {
             }
             return error.TlsHandshakeFailed;
         };
+        tls_span.setBoolAttribute("tls.success", true);
 
         // Convert ALPN to copy-safe enum (TigerStyle: no dangling pointers after copy)
         if (self.tls_diagnostic.negotiated_alpn) |alpn| {
             self.negotiated_protocol = if (std.mem.eql(u8, alpn, "h2")) .http2 else .http1_1;
+            tls_span.setStringAttribute("tls.alpn", alpn);
         } else {
             self.negotiated_protocol = .http1_1;
+            tls_span.setStringAttribute("tls.alpn", "http/1.1");
         }
 
         // Log TLS connection details
         const cipher_name = @tagName(self.tls_conn.?.cipher);
+        tls_span.setStringAttribute("tls.cipher", cipher_name);
 
         if (trace_enabled) {
             // Detailed TLS trace logging from Diagnostic struct

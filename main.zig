@@ -16,6 +16,8 @@ const log = std.log.scoped(.lb);
 const zzz = @import("zzz");
 const http = zzz.HTTP;
 
+const telemetry = @import("src/telemetry/mod.zig");
+
 const Io = std.Io;
 const Server = http.Server;
 const Router = http.Router;
@@ -120,6 +122,7 @@ const Config = struct {
     insecure_tls: bool = false, // Skip TLS verification (for testing only)
     trace: bool = false, // Enable hex/ASCII payload tracing
     tls_trace: bool = false, // Enable detailed TLS handshake tracing
+    otel_endpoint: ?[]const u8 = null, // OTLP endpoint for OpenTelemetry tracing
 };
 
 // ============================================================================
@@ -146,6 +149,7 @@ fn printUsage() void {
         \\    -k, --insecure          Skip TLS certificate verification (testing only)
         \\    -t, --trace             Dump raw request/response payloads (hex + ASCII)
         \\    --tls-trace             Show detailed TLS handshake info (cipher, version, CA)
+        \\    --otel-endpoint <H:P>   OTLP endpoint for OpenTelemetry tracing (e.g. localhost:4318)
         \\    --upgrade-fd <FD>       Inherit socket fd for binary hot reload (internal)
         \\    --help                  Show this help
         \\
@@ -175,6 +179,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     var insecure_tls: bool = false;
     var trace: bool = false;
     var tls_trace: bool = false;
+    var otel_endpoint: ?[]const u8 = null;
 
     var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
     errdefer backend_list.deinit(allocator);
@@ -273,6 +278,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             trace = true;
         } else if (std.mem.eql(u8, arg, "--tls-trace")) {
             tls_trace = true;
+        } else if (std.mem.eql(u8, arg, "--otel-endpoint")) {
+            if (i + 1 < args.len) {
+                otel_endpoint = try allocator.dupe(u8, args[i + 1]);
+                i += 1;
+            }
         } else if (std.mem.eql(u8, arg, "--upgrade-fd")) {
             if (i + 1 < args.len) {
                 upgrade_fd = try std.fmt.parseInt(posix.fd_t, args[i + 1], 10);
@@ -294,6 +304,11 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     // Notify if TLS trace mode is enabled
     if (tls_trace) {
         std.debug.print("TLS-TRACE: Detailed TLS handshake info enabled\n", .{});
+    }
+
+    // Notify if OpenTelemetry tracing is enabled
+    if (otel_endpoint) |endpoint| {
+        std.debug.print("OTEL: OpenTelemetry tracing enabled, endpoint: {s}\n", .{endpoint});
     }
 
     // Use default mode if not specified
@@ -338,6 +353,7 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         .insecure_tls = insecure_tls,
         .trace = trace,
         .tls_trace = tls_trace,
+        .otel_endpoint = otel_endpoint,
         .lbConfig = .{
             .worker_count = worker_count,
             .port = port,
@@ -354,6 +370,11 @@ fn freeConfig(allocator: std.mem.Allocator, config: Config) void {
         allocator.free(backend.host);
     }
     allocator.free(config.lbConfig.backends);
+
+    // Free the otel_endpoint if it was allocated
+    if (config.otel_endpoint) |endpoint| {
+        allocator.free(endpoint);
+    }
 }
 
 // ============================================================================
@@ -380,6 +401,14 @@ pub fn main() !void {
 
     // Set runtime TLS trace mode
     config_mod.setTlsTraceEnabled(config.tls_trace);
+
+    // Initialize OpenTelemetry tracing if endpoint is provided
+    if (config.otel_endpoint) |endpoint| {
+        telemetry.init(allocator, endpoint) catch |err| {
+            log.err("Failed to initialize telemetry: {s}", .{@errorName(err)});
+        };
+    }
+    defer telemetry.deinit();
 
     // Validate configuration
     try config.lbConfig.validate();
