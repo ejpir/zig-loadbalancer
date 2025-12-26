@@ -19,7 +19,6 @@
 
 const std = @import("std");
 const otel = @import("opentelemetry");
-const context = otel.api.context;
 
 const log = std.log.scoped(.telemetry);
 
@@ -149,11 +148,11 @@ pub const SpanKind = enum {
 };
 
 /// Span wrapper for easier use with parent-child relationships
+/// Optimized to avoid Context serialization allocations
 pub const Span = struct {
     inner: ?otel.api.trace.Span,
     tracer: ?*otel.api.trace.TracerImpl,
     allocator: std.mem.Allocator,
-    parent_ctx: ?context.Context,
 
     const Self = @This();
 
@@ -199,16 +198,15 @@ pub const Span = struct {
         }
     }
 
-    /// Get this span's context for creating child spans
-    pub fn getContext(self: *Self) ?context.Context {
+    /// Get this span's SpanContext directly (no allocation)
+    pub fn getSpanContext(self: *Self) ?otel.api.trace.SpanContext {
         if (self.inner) |*span| {
-            const span_context = span.getContext();
-            return otel.api.trace.insertSpanContext(self.allocator, span_context) catch null;
+            return span.getContext();
         }
         return null;
     }
 
-    /// End the span and clean up context
+    /// End the span
     pub fn end(self: *Self) void {
         if (self.inner) |*span| {
             if (self.tracer) |tracer| {
@@ -216,83 +214,74 @@ pub const Span = struct {
             }
             span.deinit();
         }
-        // Clean up parent context if we created one
-        if (self.parent_ctx) |*ctx| {
-            otel.api.trace.freeSerializedSpanContext(self.allocator, ctx.*);
-            ctx.deinit();
-        }
         self.inner = null;
-        self.parent_ctx = null;
     }
 };
 
 /// Start a new server span (for incoming requests)
 pub fn startServerSpan(name: []const u8) Span {
-    const state = global_state orelse return Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+    const state = global_state orelse return Span{ .inner = null, .tracer = null, .allocator = undefined };
 
     const span = state.tracer.startSpan(state.allocator, name, .{
         .kind = .Server,
     }) catch |err| {
         log.debug("Failed to start span: {}", .{err});
-        return Span{ .inner = null, .tracer = null, .allocator = state.allocator, .parent_ctx = null };
+        return Span{ .inner = null, .tracer = null, .allocator = state.allocator };
     };
 
     return Span{
         .inner = span,
         .tracer = state.tracer,
         .allocator = state.allocator,
-        .parent_ctx = null,
     };
 }
 
 /// Start a new client span (for outgoing requests to backends)
 pub fn startClientSpan(name: []const u8) Span {
-    const state = global_state orelse return Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+    const state = global_state orelse return Span{ .inner = null, .tracer = null, .allocator = undefined };
 
     const span = state.tracer.startSpan(state.allocator, name, .{
         .kind = .Client,
     }) catch |err| {
         log.debug("Failed to start span: {}", .{err});
-        return Span{ .inner = null, .tracer = null, .allocator = state.allocator, .parent_ctx = null };
+        return Span{ .inner = null, .tracer = null, .allocator = state.allocator };
     };
 
     return Span{
         .inner = span,
         .tracer = state.tracer,
         .allocator = state.allocator,
-        .parent_ctx = null,
     };
 }
 
 /// Start a new internal span
 pub fn startInternalSpan(name: []const u8) Span {
-    const state = global_state orelse return Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+    const state = global_state orelse return Span{ .inner = null, .tracer = null, .allocator = undefined };
 
     const span = state.tracer.startSpan(state.allocator, name, .{
         .kind = .Internal,
     }) catch |err| {
         log.debug("Failed to start span: {}", .{err});
-        return Span{ .inner = null, .tracer = null, .allocator = state.allocator, .parent_ctx = null };
+        return Span{ .inner = null, .tracer = null, .allocator = state.allocator };
     };
 
     return Span{
         .inner = span,
         .tracer = state.tracer,
         .allocator = state.allocator,
-        .parent_ctx = null,
     };
 }
 
-/// Start a child span with a parent span
+/// Start a child span with a parent span (fast path - no Context allocation)
 pub fn startChildSpan(parent: *Span, name: []const u8, kind: SpanKind) Span {
     // TigerBeetle: validate inputs
     std.debug.assert(name.len > 0);
     std.debug.assert(name.len < 128); // Reasonable span name length
 
-    const state = global_state orelse return Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+    const state = global_state orelse return Span{ .inner = null, .tracer = null, .allocator = undefined };
 
-    // Get parent context
-    const parent_ctx = parent.getContext() orelse {
+    // Get parent SpanContext directly (no allocation!)
+    const parent_span_ctx = parent.getSpanContext() orelse {
         // If no parent context, create a standalone span
         return switch (kind) {
             .Server => startServerSpan(name),
@@ -307,22 +296,18 @@ pub fn startChildSpan(parent: *Span, name: []const u8, kind: SpanKind) Span {
         .Internal => .Internal,
     };
 
+    // Use parent_span_context (fast path) instead of parent_context (slow path)
     const span = state.tracer.startSpan(state.allocator, name, .{
         .kind = otel_kind,
-        .parent_context = parent_ctx,
+        .parent_span_context = parent_span_ctx,
     }) catch |err| {
         log.debug("Failed to start child span: {}", .{err});
-        // Clean up parent context on failure
-        var ctx_copy = parent_ctx;
-        otel.api.trace.freeSerializedSpanContext(state.allocator, ctx_copy);
-        ctx_copy.deinit();
-        return Span{ .inner = null, .tracer = null, .allocator = state.allocator, .parent_ctx = null };
+        return Span{ .inner = null, .tracer = null, .allocator = state.allocator };
     };
 
     return Span{
         .inner = span,
         .tracer = state.tracer,
         .allocator = state.allocator,
-        .parent_ctx = parent_ctx,
     };
 }

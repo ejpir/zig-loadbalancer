@@ -211,7 +211,7 @@ pub const H2ConnectionPool = struct {
         var h2_handshake_span = if (trace_span) |parent|
             telemetry.startChildSpan(parent, "h2_handshake", .Internal)
         else
-            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined };
         defer h2_handshake_span.end();
         try conn.connect(io);
         h2_handshake_span.setOk();

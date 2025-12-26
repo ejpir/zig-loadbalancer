@@ -105,7 +105,7 @@ pub const UltraSock = struct {
             var dns_span = if (self.trace_span) |parent|
                 telemetry.startChildSpan(parent, "dns_resolution", .Internal)
             else
-                telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+                telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined };
             defer dns_span.end();
             dns_span.setStringAttribute("dns.hostname", self.host);
 
@@ -132,7 +132,7 @@ pub const UltraSock = struct {
         var tcp_span = if (self.trace_span) |parent|
             telemetry.startChildSpan(parent, "tcp_connect", .Internal)
         else
-            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined };
         defer tcp_span.end();
         tcp_span.setStringAttribute("net.peer.name", self.host);
         tcp_span.setIntAttribute("net.peer.port", @intCast(self.port));
@@ -190,7 +190,7 @@ pub const UltraSock = struct {
             var dns_span = if (self.trace_span) |parent|
                 telemetry.startChildSpan(parent, "dns_resolution", .Internal)
             else
-                telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+                telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined };
             defer dns_span.end();
             dns_span.setStringAttribute("dns.hostname", self.host);
 
@@ -217,7 +217,7 @@ pub const UltraSock = struct {
         var tcp_span = if (self.trace_span) |parent|
             telemetry.startChildSpan(parent, "tcp_connect", .Internal)
         else
-            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined };
         defer tcp_span.end();
         tcp_span.setStringAttribute("net.peer.name", self.host);
         tcp_span.setIntAttribute("net.peer.port", @intCast(self.port));
@@ -350,7 +350,7 @@ pub const UltraSock = struct {
         var tls_span = if (self.trace_span) |parent|
             telemetry.startChildSpan(parent, "tls_handshake", .Internal)
         else
-            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined };
         defer tls_span.end();
         tls_span.setStringAttribute("tls.server_name", self.host);
 

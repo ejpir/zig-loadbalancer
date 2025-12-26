@@ -761,7 +761,7 @@ fn streamingProxyHttp2(
     var h2_span = if (proxy_state.trace_span) |trace_span|
         telemetry.startChildSpan(trace_span, "backend_request_h2", .Client)
     else
-        telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined, .parent_ctx = null };
+        telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined };
     defer h2_span.end();
 
     h2_span.setStringAttribute("http.method", @tagName(ctx.request.method orelse .GET));
