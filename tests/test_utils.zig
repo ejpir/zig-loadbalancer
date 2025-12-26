@@ -15,6 +15,10 @@ pub const BACKEND3_PORT: u16 = 19003;
 pub const LB_PORT: u16 = 18080;
 pub const LB_H2_PORT: u16 = 18081; // Load balancer port for HTTP/2 tests
 pub const OTLP_PORT: u16 = 14318; // Mock OTLP collector port
+pub const WAF_LB_PORT: u16 = 18082; // Load balancer port for WAF tests
+pub const WAF_SHADOW_LB_PORT: u16 = 18083; // Load balancer port for WAF shadow mode tests
+pub const WAF_BACKEND_PORT: u16 = 19004; // Backend port for WAF tests
+pub const WAF_SHADOW_BACKEND_PORT: u16 = 19005; // Backend port for WAF shadow mode tests
 
 /// Wait for a port to accept connections
 pub fn waitForPort(port: u16, timeout_ms: u64) !void {

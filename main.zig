@@ -17,6 +17,7 @@ const zzz = @import("zzz");
 const http = zzz.HTTP;
 
 const telemetry = @import("src/telemetry/mod.zig");
+const waf = @import("src/waf/mod.zig");
 
 const Io = std.Io;
 const Server = http.Server;
@@ -37,6 +38,36 @@ const SharedHealthState = shared_region.SharedHealthState;
 
 /// Runtime log level (can be changed via --loglevel)
 var runtime_log_level: std.log.Level = .info;
+
+/// Global WAF state (shared across all workers via mmap)
+/// This is pointer-stable because it's placed in mmap'd shared memory before fork
+var global_waf_state: ?*waf.WafState = null;
+
+/// Global WAF config (loaded from JSON, immutable after init)
+var global_waf_config: waf.WafConfig = .{};
+
+/// WAF allocator (for config parsing)
+var waf_allocator: ?std.mem.Allocator = null;
+
+/// Get the global WAF engine for request checking
+/// Returns null if WAF is disabled or not configured
+pub fn getWafEngine() ?waf.WafEngine {
+    if (!global_waf_config.enabled) return null;
+    if (global_waf_state) |state| {
+        return waf.WafEngine.init(state, &global_waf_config);
+    }
+    return null;
+}
+
+/// Check if WAF is enabled and configured
+pub fn isWafEnabled() bool {
+    return global_waf_config.enabled and global_waf_state != null;
+}
+
+/// Get WAF config (for read-only access)
+pub fn getWafConfig() *const waf.WafConfig {
+    return &global_waf_config;
+}
 
 pub const std_options: std.Options = .{
     .log_level = .debug, // Compile-time max level (allows all)
@@ -123,6 +154,10 @@ const Config = struct {
     trace: bool = false, // Enable hex/ASCII payload tracing
     tls_trace: bool = false, // Enable detailed TLS handshake tracing
     otel_endpoint: ?[]const u8 = null, // OTLP endpoint for OpenTelemetry tracing
+    // WAF configuration
+    waf_config_path: ?[]const u8 = null, // Path to WAF JSON config
+    waf_shadow_mode: bool = false, // Force shadow mode (log only, don't block)
+    waf_disabled: bool = false, // Disable WAF entirely
 };
 
 // ============================================================================
@@ -151,6 +186,9 @@ fn printUsage() void {
         \\    --tls-trace             Show detailed TLS handshake info (cipher, version, CA)
         \\    --otel-endpoint <H:P>   OTLP endpoint for OpenTelemetry tracing (e.g. localhost:4318)
         \\    --upgrade-fd <FD>       Inherit socket fd for binary hot reload (internal)
+        \\    --waf <PATH>            Path to WAF configuration JSON file
+        \\    --waf-shadow            Force WAF shadow mode (log only, don't block)
+        \\    --waf-disabled          Disable WAF entirely
         \\    --help                  Show this help
         \\
         \\HOT RELOAD:
@@ -161,6 +199,7 @@ fn printUsage() void {
         \\    load_balancer --mode mp --port 8080 --backend 127.0.0.1:9001
         \\    load_balancer -m sp -p 8080 -b 127.0.0.1:9001 -b 127.0.0.1:9002
         \\    load_balancer -m mp -c backends.json  # Hot reload on file change
+        \\    load_balancer -m sp --waf waf.json    # Enable WAF with config
         \\
     , .{});
 }
@@ -180,6 +219,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     var trace: bool = false;
     var tls_trace: bool = false;
     var otel_endpoint: ?[]const u8 = null;
+    var waf_config_path: ?[]const u8 = null;
+    var waf_shadow_mode: bool = false;
+    var waf_disabled: bool = false;
 
     var backend_list: std.ArrayListUnmanaged(BackendDef) = .empty;
     errdefer backend_list.deinit(allocator);
@@ -288,6 +330,15 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 upgrade_fd = try std.fmt.parseInt(posix.fd_t, args[i + 1], 10);
                 i += 1;
             }
+        } else if (std.mem.eql(u8, arg, "--waf")) {
+            if (i + 1 < args.len) {
+                waf_config_path = try allocator.dupe(u8, args[i + 1]);
+                i += 1;
+            }
+        } else if (std.mem.eql(u8, arg, "--waf-shadow")) {
+            waf_shadow_mode = true;
+        } else if (std.mem.eql(u8, arg, "--waf-disabled")) {
+            waf_disabled = true;
         }
     }
 
@@ -309,6 +360,17 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
     // Notify if OpenTelemetry tracing is enabled
     if (otel_endpoint) |endpoint| {
         std.debug.print("OTEL: OpenTelemetry tracing enabled, endpoint: {s}\n", .{endpoint});
+    }
+
+    // Notify about WAF configuration
+    if (waf_disabled) {
+        std.debug.print("WAF: Disabled via --waf-disabled\n", .{});
+    } else if (waf_config_path) |path| {
+        if (waf_shadow_mode) {
+            std.debug.print("WAF: Shadow mode enabled (log only), config: {s}\n", .{path});
+        } else {
+            std.debug.print("WAF: Enabled, config: {s}\n", .{path});
+        }
     }
 
     // Use default mode if not specified
@@ -354,6 +416,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         .trace = trace,
         .tls_trace = tls_trace,
         .otel_endpoint = otel_endpoint,
+        .waf_config_path = waf_config_path,
+        .waf_shadow_mode = waf_shadow_mode,
+        .waf_disabled = waf_disabled,
         .lbConfig = .{
             .worker_count = worker_count,
             .port = port,
@@ -374,6 +439,11 @@ fn freeConfig(allocator: std.mem.Allocator, config: Config) void {
     // Free the otel_endpoint if it was allocated
     if (config.otel_endpoint) |endpoint| {
         allocator.free(endpoint);
+    }
+
+    // Free the WAF config path if it was allocated
+    if (config.waf_config_path) |path| {
+        allocator.free(path);
     }
 }
 
@@ -410,6 +480,34 @@ pub fn main() !void {
     }
     defer telemetry.deinit();
 
+    // Initialize WAF if configured
+    if (!config.waf_disabled) {
+        if (config.waf_config_path) |path| {
+            waf_allocator = allocator;
+            global_waf_config = waf.WafConfig.loadFromFile(allocator, path) catch |err| {
+                log.err("Failed to load WAF config from '{s}': {s}", .{ path, @errorName(err) });
+                return err;
+            };
+            // Apply shadow mode override from CLI
+            if (config.waf_shadow_mode) {
+                global_waf_config.shadow_mode = true;
+            }
+            log.info("WAF config loaded: enabled={}, shadow_mode={}, rules={d}", .{
+                global_waf_config.enabled,
+                global_waf_config.shadow_mode,
+                global_waf_config.rate_limits.len,
+            });
+        }
+    } else {
+        // WAF explicitly disabled
+        global_waf_config.enabled = false;
+    }
+    defer {
+        if (waf_allocator != null) {
+            global_waf_config.deinit();
+        }
+    }
+
     // Validate configuration
     try config.lbConfig.validate();
 
@@ -444,6 +542,17 @@ fn runMultiProcess(allocator: std.mem.Allocator, config: Config) !void {
     var shared_allocator = shared_region.SharedRegionAllocator{};
     const region = try shared_allocator.init();
     defer shared_allocator.deinit();
+
+    // Initialize WAF state on heap (too large for stack: ~4MB)
+    // For multi-process, this should ideally be in shared memory (mmap)
+    // but for now we allocate on heap (each worker gets a copy after fork)
+    const waf_state_ptr = try allocator.create(waf.WafState);
+    waf_state_ptr.* = waf.WafState.init();
+    global_waf_state = waf_state_ptr;
+    defer if (!global_waf_config.enabled) allocator.destroy(waf_state_ptr);
+    if (global_waf_config.enabled) {
+        log.info("WAF state initialized ({d} bytes)", .{@sizeOf(waf.WafState)});
+    }
 
     // Initialize backends in shared region
     initSharedBackends(region, mutable_lb_config.backends);
@@ -756,6 +865,15 @@ fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
     defer _ = gpa.deinit();
 
     const lb_config = config.lbConfig;
+
+    // Initialize WAF state on heap (too large for stack: ~4MB)
+    const waf_state_ptr = try allocator.create(waf.WafState);
+    waf_state_ptr.* = waf.WafState.init();
+    global_waf_state = waf_state_ptr;
+    defer allocator.destroy(waf_state_ptr);
+    if (global_waf_config.enabled) {
+        log.info("WAF state initialized ({d} bytes)", .{@sizeOf(waf.WafState)});
+    }
 
     for (lb_config.backends, 0..) |b, idx| {
         log.info("  Backend {d}: {s}:{d}", .{ idx + 1, b.host, b.port });

@@ -39,6 +39,9 @@ pub const simd_parse = @import("internal/simd_parse.zig");
 // Core module tests
 pub const config = @import("core/config.zig");
 
+// WAF module tests
+pub const waf_state = @import("waf/state.zig");
+
 // Config module tests
 pub const config_watcher = @import("config/config_watcher.zig");
 
@@ -69,6 +72,7 @@ comptime {
     _ = http2_client;
     _ = simd_parse;
     _ = config;
+    _ = waf_state;
     _ = config_watcher;
     _ = component_integration_test;
     _ = proxy_io;

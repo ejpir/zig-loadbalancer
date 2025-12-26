@@ -323,4 +323,73 @@ pub const ProcessManager = struct {
         // Wait for health checks (backends need to be marked healthy)
         posix.nanosleep(2, 0);
     }
+
+    /// Start load balancer with WAF enabled
+    pub fn startLoadBalancerWithWaf(self: *ProcessManager, backend_ports: []const u16, waf_config_path: []const u8) !void {
+        try self.startLoadBalancerWithWafOnPort(backend_ports, waf_config_path, test_utils.LB_PORT);
+    }
+
+    /// Start load balancer with WAF enabled on a specific port
+    pub fn startLoadBalancerWithWafOnPort(self: *ProcessManager, backend_ports: []const u16, waf_config_path: []const u8, port: u16) !void {
+        var args: std.ArrayList([]const u8) = .empty;
+        defer args.deinit(self.allocator);
+
+        // Track strings we allocate so we can free them
+        var allocated_strings: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (allocated_strings.items) |s| self.allocator.free(s);
+            allocated_strings.deinit(self.allocator);
+        }
+
+        try args.append(self.allocator, "./zig-out/bin/load_balancer");
+        try args.append(self.allocator, "--port");
+
+        var lb_port_buf: [8]u8 = undefined;
+        const lb_port_str = try std.fmt.bufPrint(&lb_port_buf, "{d}", .{port});
+        const lb_port_dup = try self.allocator.dupe(u8, lb_port_str);
+        try allocated_strings.append(self.allocator, lb_port_dup);
+        try args.append(self.allocator, lb_port_dup);
+
+        // Use single-process mode for easier testing
+        try args.append(self.allocator, "--mode");
+        try args.append(self.allocator, "sp");
+
+        // Add WAF config path
+        try args.append(self.allocator, "--waf");
+        const waf_path_dup = try self.allocator.dupe(u8, waf_config_path);
+        try allocated_strings.append(self.allocator, waf_path_dup);
+        try args.append(self.allocator, waf_path_dup);
+
+        for (backend_ports) |backend_port| {
+            try args.append(self.allocator, "--backend");
+            var buf: [32]u8 = undefined;
+            const backend_str = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{backend_port});
+            const backend_dup = try self.allocator.dupe(u8, backend_str);
+            try allocated_strings.append(self.allocator, backend_dup);
+            try args.append(self.allocator, backend_dup);
+        }
+
+        var child = std.process.Child.init(args.items, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+
+        try child.spawn();
+        errdefer {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        }
+
+        try self.processes.append(self.allocator, .{
+            .child = child,
+            .name = try self.allocator.dupe(u8, "load_balancer_waf"),
+            .allocator = self.allocator,
+        });
+
+        // Wait for LB port
+        try test_utils.waitForPort(port, 10000);
+
+        // Wait for health checks (backends need to be marked healthy)
+        posix.nanosleep(2, 0);
+    }
 };

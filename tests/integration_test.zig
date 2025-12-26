@@ -13,6 +13,7 @@ const body = @import("suites/body.zig");
 const load_balancing = @import("suites/load_balancing.zig");
 const http2 = @import("suites/http2.zig");
 const otel = @import("suites/otel.zig");
+const waf = @import("suites/waf.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -30,6 +31,8 @@ pub fn main() !void {
         load_balancing.suite,
         http2.suite,
         otel.suite,
+        waf.suite,
+        waf.shadow_suite,
     };
 
     var suite_failures: usize = 0;

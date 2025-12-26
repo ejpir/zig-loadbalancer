@@ -18,6 +18,8 @@ const zzz = @import("zzz");
 const http = zzz.HTTP;
 
 const telemetry = @import("../telemetry/mod.zig");
+const main = @import("../../main.zig");
+const waf = @import("../waf/mod.zig");
 
 const config = @import("../core/config.zig");
 const types = @import("../core/types.zig");
@@ -123,13 +125,87 @@ pub fn generateHandler(
                 }
             }
 
-            // Start a trace span for this request
+            // Start a trace span for this request (before WAF so blocked requests are traced)
             const method = ctx.request.method orelse .GET;
             const uri = ctx.request.uri orelse "/";
             var span = telemetry.startServerSpan("proxy_request");
             defer span.end();
             span.setStringAttribute("http.method", @tagName(method));
             span.setStringAttribute("http.url", uri);
+
+            // WAF check - before any backend processing
+            if (main.getWafEngine()) |engine_val| {
+                // Make a mutable copy since check() requires *WafEngine
+                var engine = engine_val;
+
+                // Extract source IP from connection (use 0 if not available)
+                // In production, you'd extract this from the socket address
+                const source_ip: u32 = 0; // TODO: Extract from ctx.connection when available
+
+                // Build WAF request with body size for content-length validation
+                const waf_method = convertHttpMethod(ctx.request.method orelse .GET);
+                const body_len: ?usize = if (ctx.request.body) |b| b.len else null;
+                const waf_request = if (body_len) |len|
+                    waf.Request.withContentLength(
+                        waf_method,
+                        ctx.request.uri orelse "/",
+                        source_ip,
+                        len,
+                    )
+                else
+                    waf.Request.init(
+                        waf_method,
+                        ctx.request.uri orelse "/",
+                        source_ip,
+                    );
+
+                // Check WAF rules
+                const waf_result = engine.check(&waf_request);
+
+                // Add WAF attributes to span
+                span.setStringAttribute("waf.decision", if (waf_result.isBlocked()) "block" else if (waf_result.shouldLog()) "log_only" else "allow");
+                if (waf_result.reason != .none) {
+                    span.setStringAttribute("waf.reason", waf_result.reason.description());
+                }
+                if (waf_result.rule_name) |rule| {
+                    span.setStringAttribute("waf.rule", rule);
+                }
+
+                if (waf_result.isBlocked()) {
+                    // Request blocked by WAF
+                    log.warn("[W{d}] WAF blocked request: reason={s}, rule={s}", .{
+                        state.worker_id,
+                        waf_result.reason.description(),
+                        waf_result.rule_name orelse "N/A",
+                    });
+
+                    // Return appropriate status based on block reason
+                    const status: http.Status = switch (waf_result.reason) {
+                        .rate_limit => .@"Too Many Requests",
+                        .body_too_large => .@"Content Too Large",
+                        else => .Forbidden,
+                    };
+
+                    span.setIntAttribute("http.status_code", @intFromEnum(status));
+                    span.setError("WAF blocked");
+
+                    return ctx.response.apply(.{
+                        .status = status,
+                        .mime = http.Mime.JSON,
+                        .body = "{\"error\":\"blocked by WAF\"}",
+                    });
+                }
+
+                // Log if shadow mode decision was made
+                if (waf_result.shouldLog()) {
+                    log.info("[W{d}] WAF shadow: reason={s}, rule={s}", .{
+                        state.worker_id,
+                        waf_result.reason.description(),
+                        waf_result.rule_name orelse "N/A",
+                    });
+                    span.addEvent("waf_shadow_block");
+                }
+            }
 
             // Use dynamic backend count (from shared region if available)
             const backend_count = state.getBackendCount();
@@ -960,4 +1036,23 @@ fn streamingProxy_finalize(
     }
     log.debug("[REQ {d}] => .responded", .{req_id});
     return .responded;
+}
+
+// ============================================================================
+// WAF Helper Functions
+// ============================================================================
+
+/// Convert zzz HTTP method to WAF HTTP method
+fn convertHttpMethod(method: http.Method) waf.HttpMethod {
+    return switch (method) {
+        .GET => .GET,
+        .POST => .POST,
+        .PUT => .PUT,
+        .DELETE => .DELETE,
+        .PATCH => .PATCH,
+        .HEAD => .HEAD,
+        .OPTIONS => .OPTIONS,
+        .TRACE => .TRACE,
+        .CONNECT => .CONNECT,
+    };
 }
