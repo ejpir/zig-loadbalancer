@@ -5,7 +5,7 @@
     {
       "name": "test_limit",
       "path": "/*",
-      "limit": { "requests": 3, "period_sec": 60 },
+      "limit": { "requests": 200000, "period_sec": 60 },
       "burst": 0,
       "by": "ip",
       "action": "block"

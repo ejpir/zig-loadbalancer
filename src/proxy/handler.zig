@@ -387,6 +387,10 @@ inline fn proxyWithFailover(
         }
     }
 
+    // All backends exhausted - this IS an error (user gets 503)
+    log.err("[W{d}] All backends exhausted, returning 503", .{state.worker_id});
+    trace_span.setError("All backends exhausted");
+
     return ctx.response.apply(.{
         .status = .@"Service Unavailable",
         .mime = http.Mime.TEXT,
@@ -892,12 +896,13 @@ fn streamingProxyHttp2(
 
         // Get or create connection (pool handles everything: TLS, handshake, retry)
         const conn = pool.getOrCreate(backend_idx, ctx.io, &h2_span) catch |err| {
-            log.warn("[REQ {d}] H2 pool getOrCreate failed: {}", .{ req_id, err });
             h2_span.setError("Pool getOrCreate failed");
             // PoolExhausted is a local resource issue, not a backend failure
+            // Pool already logs at error level, so just return the error
             if (err == error.PoolExhausted) {
                 return ProxyError.PoolExhausted;
             }
+            log.err("[REQ {d}] H2 pool getOrCreate failed: {}", .{ req_id, err });
             return ProxyError.ConnectionFailed;
         };
 

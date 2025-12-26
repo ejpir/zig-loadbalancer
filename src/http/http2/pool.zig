@@ -119,8 +119,8 @@ pub const H2ConnectionPool = struct {
             }
         }
 
-        // All slots full - handler will retry on TooManyStreams
-        log.warn("Connection pool exhausted: backend={d}", .{backend_idx});
+        // All slots full - this is an error condition (causes 503s under load)
+        log.err("H2 pool exhausted: backend={d} (32 conns x 8 streams = 256 max concurrent)", .{backend_idx});
         return error.PoolExhausted;
     }
 
