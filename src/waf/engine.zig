@@ -40,6 +40,7 @@ pub const HttpMethod = config.HttpMethod;
 pub const RateLimitRule = config.RateLimitRule;
 pub const ipToBytes = config.ipToBytes;
 
+
 // =============================================================================
 // Request - Incoming HTTP Request Representation
 // =============================================================================
@@ -222,6 +223,109 @@ pub const WafEngine = struct {
         }
 
         // All checks passed
+        self.recordDecision(&rate_limit_result);
+        return self.applyMode(rate_limit_result);
+    }
+
+    /// Main entry point with OpenTelemetry tracing
+    ///
+    /// Creates child spans for each WAF check step, providing visibility
+    /// into the WAF decision process in Jaeger/OTLP.
+    ///
+    /// The telemetry_mod parameter uses duck typing - any module that provides
+    /// startChildSpan(span, name, kind) -> Span works.
+    ///
+    /// Span hierarchy:
+    ///   proxy_request (parent)
+    ///   └── waf.check
+    ///       ├── waf.validate_request
+    ///       ├── waf.rate_limit
+    ///       └── waf.burst_detection
+    pub fn checkWithSpan(
+        self: *WafEngine,
+        request: *const Request,
+        parent_span: anytype,
+        comptime telemetry_mod: type,
+    ) CheckResult {
+        // Create WAF check span as child of parent
+        var waf_span = telemetry_mod.startChildSpan(parent_span, "waf.check", .Internal);
+        defer waf_span.end();
+
+        // Fast path: WAF disabled
+        if (!self.waf_config.enabled) {
+            waf_span.setStringAttribute("waf.enabled", "false");
+            return CheckResult.allow();
+        }
+
+        // Extract real client IP (handles trusted proxies)
+        const client_ip = self.getClientIp(request);
+
+        // Step 1: Validate request (URI length, body size)
+        {
+            var validate_span = telemetry_mod.startChildSpan(&waf_span, "waf.validate_request", .Internal);
+            defer validate_span.end();
+
+            const validation_result = self.validateRequest(request);
+            validate_span.setStringAttribute("waf.step", "validate_request");
+            validate_span.setBoolAttribute("waf.passed", validation_result.decision == .allow);
+
+            if (validation_result.decision != .allow) {
+                validate_span.setStringAttribute("waf.reason", validation_result.reason.description());
+                waf_span.setStringAttribute("waf.blocked_by", "validate_request");
+                self.recordDecision(&validation_result);
+                return self.applyMode(validation_result);
+            }
+        }
+
+        // Step 2: Check rate limits
+        const rate_limit_result = blk: {
+            var rate_span = telemetry_mod.startChildSpan(&waf_span, "waf.rate_limit", .Internal);
+            defer rate_span.end();
+
+            const result = self.checkRateLimit(request, client_ip);
+            rate_span.setStringAttribute("waf.step", "rate_limit");
+            rate_span.setBoolAttribute("waf.passed", result.decision == .allow);
+
+            if (result.tokens_remaining) |remaining| {
+                rate_span.setIntAttribute("waf.tokens_remaining", @intCast(remaining));
+            }
+            if (result.rule_name) |rule| {
+                rate_span.setStringAttribute("waf.rule", rule);
+            }
+
+            if (result.decision != .allow) {
+                rate_span.setStringAttribute("waf.reason", result.reason.description());
+                waf_span.setStringAttribute("waf.blocked_by", "rate_limit");
+                self.recordDecision(&result);
+                break :blk self.applyMode(result);
+            }
+            break :blk result;
+        };
+
+        // Early return if rate limited
+        if (rate_limit_result.decision != .allow) {
+            return rate_limit_result;
+        }
+
+        // Step 3: Check for burst behavior (sudden velocity spike)
+        if (self.waf_config.burst_detection_enabled) {
+            var burst_span = telemetry_mod.startChildSpan(&waf_span, "waf.burst_detection", .Internal);
+            defer burst_span.end();
+
+            const burst_result = self.checkBurst(client_ip);
+            burst_span.setStringAttribute("waf.step", "burst_detection");
+            burst_span.setBoolAttribute("waf.passed", burst_result.decision == .allow);
+
+            if (burst_result.decision != .allow) {
+                burst_span.setStringAttribute("waf.reason", burst_result.reason.description());
+                waf_span.setStringAttribute("waf.blocked_by", "burst_detection");
+                self.recordDecision(&burst_result);
+                return self.applyMode(burst_result);
+            }
+        }
+
+        // All checks passed
+        waf_span.setStringAttribute("waf.result", "allow");
         self.recordDecision(&rate_limit_result);
         return self.applyMode(rate_limit_result);
     }

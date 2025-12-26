@@ -176,10 +176,10 @@ pub fn generateHandler(
                         source_ip,
                     );
 
-                // Check WAF rules
-                const waf_result = engine.check(&waf_request);
+                // Check WAF rules (with tracing - creates child spans for each step)
+                const waf_result = engine.checkWithSpan(&waf_request, &span, telemetry);
 
-                // Add WAF attributes to span
+                // Add WAF summary attributes to parent span
                 const client_ip_str = formatIpv4(source_ip);
                 span.setStringAttribute("waf.decision", if (waf_result.isBlocked()) "block" else if (waf_result.shouldLog()) "log_only" else "allow");
                 span.setStringAttribute("waf.client_ip", client_ip_str);

@@ -483,26 +483,28 @@ JSON Lines output for machine parsing.
 │       │                                                          │
 │       ▼                                                          │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │  telemetry/mod.zig:startServerSpan()                        ││
+│  │  engine.checkWithSpan(&request, &span, telemetry)           ││
 │  │                                                             ││
-│  │  tracer.startSpan(name, .{                                  ││
-│  │      .kind = .Server,                                       ││
-│  │      .attributes = [...],                                   ││
-│  │  })                                                         ││
+│  │  Creates child spans for each WAF step:                     ││
+│  │                                                             ││
+│  │  proxy_request (Server)                                     ││
+│  │  └── waf.check (Internal)                                   ││
+│  │      ├── waf.validate_request (Internal)                    ││
+│  │      │   └─ waf.step: "validate_request"                    ││
+│  │      │   └─ waf.passed: true/false                          ││
+│  │      ├── waf.rate_limit (Internal)                          ││
+│  │      │   └─ waf.step: "rate_limit"                          ││
+│  │      │   └─ waf.passed: true/false                          ││
+│  │      │   └─ waf.tokens_remaining: 42                        ││
+│  │      │   └─ waf.rule: "api_rate_limit"                      ││
+│  │      └── waf.burst_detection (Internal)                     ││
+│  │          └─ waf.step: "burst_detection"                     ││
+│  │          └─ waf.passed: true/false                          ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                                                                  │
-│  span.setStringAttribute("http.method", "GET");                 │
-│  span.setStringAttribute("http.url", "/api/users");             │
-│                                                                  │
-│  // After WAF check                                              │
+│  // Summary attributes on parent span                            │
 │  span.setStringAttribute("waf.decision", "allow");              │
 │  span.setStringAttribute("waf.client_ip", "192.168.1.1");       │
-│  span.setStringAttribute("waf.reason", "none");                 │
-│                                                                  │
-│  // On blocked request                                           │
-│  span.setStringAttribute("waf.decision", "block");              │
-│  span.setStringAttribute("waf.reason", "rate_limit");           │
-│  span.setStringAttribute("waf.rule", "login_bruteforce");       │
 │                                                                  │
 │  span.end();  // Automatically queued for batch export          │
 └─────────────────────────────────────────────────────────────────┘
@@ -521,12 +523,17 @@ JSON Lines output for machine parsing.
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Jaeger UI                                    │
 │                                                                  │
-│  Trace: proxy_request                                            │
-│  ├─ Service: zzz-load-balancer                                  │
-│  ├─ Attributes:                                                 │
-│  │   ├─ http.method: GET                                        │
-│  │   ├─ http.url: /api/users                                    │
-│  │   ├─ waf.decision: block                                     │
+│  Trace: proxy_request [12.5ms]                                   │
+│  ├─ waf.check [0.8ms]                                           │
+│  │   ├─ waf.validate_request [0.05ms]                           │
+│  │   ├─ waf.rate_limit [0.5ms]                                  │
+│  │   └─ waf.burst_detection [0.2ms]                             │
+│  └─ backend_request [11.2ms]                                    │
+│                                                                  │
+│  Span Attributes:                                                │
+│  ├─ http.method: GET                                            │
+│  ├─ http.url: /api/users                                        │
+│  ├─ waf.decision: block                                         │
 │  │   ├─ waf.client_ip: 192.168.1.100                            │
 │  │   ├─ waf.reason: rate_limit                                  │
 │  │   └─ waf.rule: api_rate_limit                                │
@@ -535,6 +542,8 @@ JSON Lines output for machine parsing.
 ```
 
 ### Span Attributes Reference
+
+**Parent Span (proxy_request):**
 
 | Attribute | Type | Description |
 |-----------|------|-------------|
@@ -547,6 +556,19 @@ JSON Lines output for machine parsing.
 | `waf.rule` | string | Rule name if blocked |
 | `backend.host` | string | Backend server address |
 | `backend.port` | int | Backend server port |
+
+**WAF Child Spans (waf.check, waf.validate_request, waf.rate_limit, waf.burst_detection):**
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `waf.step` | string | Current step name |
+| `waf.passed` | bool | Whether this step passed |
+| `waf.tokens_remaining` | int | Remaining rate limit tokens (rate_limit only) |
+| `waf.rule` | string | Matched rule name (rate_limit only) |
+| `waf.reason` | string | Block reason if failed |
+| `waf.blocked_by` | string | Which step blocked (on waf.check span) |
+| `waf.result` | string | Final result "allow" (on waf.check span) |
+| `waf.enabled` | string | "false" if WAF disabled (fast path) |
 
 ---
 
