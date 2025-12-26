@@ -13,28 +13,43 @@ pub const BACKEND1_PORT: u16 = 19001;
 pub const BACKEND2_PORT: u16 = 19002;
 pub const BACKEND3_PORT: u16 = 19003;
 pub const LB_PORT: u16 = 18080;
+pub const LB_H2_PORT: u16 = 18081; // Load balancer port for HTTP/2 tests
 
 /// Wait for a port to accept connections
 pub fn waitForPort(port: u16, timeout_ms: u64) !void {
-    const start = std.time.milliTimestamp();
-    const deadline = start + @as(i64, @intCast(timeout_ms));
+    const start = std.time.Instant.now() catch return error.TimerUnavailable;
+    const timeout_ns = timeout_ms * std.time.ns_per_ms;
 
-    while (std.time.milliTimestamp() < deadline) {
+    while (true) {
         if (tryConnect(port)) {
             return;
         }
-        std.time.sleep(100 * std.time.ns_per_ms);
+        const now = std.time.Instant.now() catch return error.TimerUnavailable;
+        if (now.since(start) >= timeout_ns) {
+            return error.PortTimeout;
+        }
+        posix.nanosleep(0, 100 * std.time.ns_per_ms);
     }
-    return error.PortTimeout;
 }
 
 fn tryConnect(port: u16) bool {
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch return false;
+    const sock = posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch return false;
     defer posix.close(sock);
 
-    posix.connect(sock, &addr.any, addr.getOsSockLen()) catch return false;
+    // Create sockaddr_in for 127.0.0.1
+    const addr: posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1
+    };
+
+    posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) catch return false;
     return true;
+}
+
+/// Wait for a TLS port to accept connections (same as waitForPort but with longer default wait)
+pub fn waitForTlsPort(port: u16, timeout_ms: u64) !void {
+    // TLS ports may take longer to become ready
+    return waitForPort(port, timeout_ms);
 }
 
 /// Make an HTTP request and return the response body
@@ -47,34 +62,50 @@ pub fn httpRequest(
     body: ?[]const u8,
 ) ![]const u8 {
     // Build request
-    var request = std.ArrayList(u8).init(allocator);
-    defer request.deinit();
+    var request: std.ArrayList(u8) = .empty;
+    defer request.deinit(allocator);
 
-    try request.writer().print("{s} {s} HTTP/1.1\r\n", .{ method, path });
-    try request.writer().print("Host: {s}:{d}\r\n", .{ TEST_HOST, port });
+    // Request line
+    const request_line = try std.fmt.allocPrint(allocator, "{s} {s} HTTP/1.1\r\n", .{ method, path });
+    defer allocator.free(request_line);
+    try request.appendSlice(allocator, request_line);
+
+    // Host header
+    const host_header = try std.fmt.allocPrint(allocator, "Host: {s}:{d}\r\n", .{ TEST_HOST, port });
+    defer allocator.free(host_header);
+    try request.appendSlice(allocator, host_header);
 
     if (headers) |hdrs| {
         for (hdrs) |h| {
-            try request.writer().print("{s}: {s}\r\n", .{ h[0], h[1] });
+            const hdr = try std.fmt.allocPrint(allocator, "{s}: {s}\r\n", .{ h[0], h[1] });
+            defer allocator.free(hdr);
+            try request.appendSlice(allocator, hdr);
         }
     }
 
     if (body) |b| {
-        try request.writer().print("Content-Length: {d}\r\n", .{b.len});
+        const cl = try std.fmt.allocPrint(allocator, "Content-Length: {d}\r\n", .{b.len});
+        defer allocator.free(cl);
+        try request.appendSlice(allocator, cl);
     }
 
-    try request.appendSlice("Connection: close\r\n\r\n");
+    try request.appendSlice(allocator, "Connection: close\r\n\r\n");
 
     if (body) |b| {
-        try request.appendSlice(b);
+        try request.appendSlice(allocator, b);
     }
 
     // Connect and send
-    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
-    const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP);
     defer posix.close(sock);
 
-    try posix.connect(sock, &addr.any, addr.getOsSockLen());
+    // Create sockaddr_in for 127.0.0.1
+    const addr: posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1
+    };
+
+    try posix.connect(sock, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
 
     var sent: usize = 0;
     while (sent < request.items.len) {
@@ -83,17 +114,17 @@ pub fn httpRequest(
     }
 
     // Read response
-    var response = std.ArrayList(u8).init(allocator);
-    errdefer response.deinit();
+    var response: std.ArrayList(u8) = .empty;
+    errdefer response.deinit(allocator);
 
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = try posix.recv(sock, &buf, 0);
         if (n == 0) break;
-        try response.appendSlice(buf[0..n]);
+        try response.appendSlice(allocator, buf[0..n]);
     }
 
-    return response.toOwnedSlice();
+    return response.toOwnedSlice(allocator);
 }
 
 /// Extract JSON body from HTTP response
@@ -158,6 +189,52 @@ pub fn getHeader(allocator: std.mem.Allocator, json: []const u8, header: []const
                 else => error.HeaderNotString,
             };
         }
+    }
+    return error.HeaderNotFound;
+}
+
+/// Extract HTTP status code from response
+pub fn getResponseStatusCode(response: []const u8) !u16 {
+    // Find first line: "HTTP/1.1 200 OK\r\n"
+    const line_end = std.mem.indexOf(u8, response, "\r\n") orelse return error.InvalidResponse;
+    const status_line = response[0..line_end];
+
+    // Find first space after HTTP version
+    const first_space = std.mem.indexOf(u8, status_line, " ") orelse return error.InvalidResponse;
+    const after_space = status_line[first_space + 1 ..];
+
+    // Find second space (end of status code)
+    const second_space = std.mem.indexOf(u8, after_space, " ") orelse after_space.len;
+    const status_str = after_space[0..second_space];
+
+    return std.fmt.parseInt(u16, status_str, 10) catch error.InvalidResponse;
+}
+
+/// Get response header value (from HTTP headers, not JSON body)
+pub fn getResponseHeaderValue(response: []const u8, header_name: []const u8) ![]const u8 {
+    const separator = "\r\n\r\n";
+    const header_end = std.mem.indexOf(u8, response, separator) orelse return error.NoBodyFound;
+    const headers_section = response[0..header_end];
+
+    // Search for the header (case-insensitive)
+    var line_start: usize = 0;
+    while (std.mem.indexOfPos(u8, headers_section, line_start, "\r\n")) |line_end| {
+        const line = headers_section[line_start..line_end];
+
+        // Find colon
+        if (std.mem.indexOf(u8, line, ":")) |colon_pos| {
+            const name = line[0..colon_pos];
+            if (std.ascii.eqlIgnoreCase(name, header_name)) {
+                // Skip colon and any leading whitespace
+                var value_start = colon_pos + 1;
+                while (value_start < line.len and line[value_start] == ' ') {
+                    value_start += 1;
+                }
+                return line[value_start..];
+            }
+        }
+
+        line_start = line_end + 2;
     }
     return error.HeaderNotFound;
 }

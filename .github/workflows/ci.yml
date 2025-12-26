@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master, fixrace]
+    branches: [main, master, fixrace, fixconflict]
   pull_request:
     branches: [main, master]
 
@@ -41,6 +41,46 @@ jobs:
 
       - name: Run unit tests
         run: zig build test
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: ~/zig
+          key: zig-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig
+        run: |
+          if [ ! -d ~/zig ]; then
+            mkdir -p ~/zig
+            curl -L ${{ env.ZIG_URL }} | tar -xJ -C ~/zig --strip-components=1
+          fi
+          echo "$HOME/zig" >> $GITHUB_PATH
+
+      - name: Patch ecdsa.zig for API compatibility
+        run: sed -i 's/mem\.trimLeft/mem.trimStart/g' ~/zig/lib/std/crypto/ecdsa.zig
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies for HTTP/2 tests
+        run: |
+          python -m venv tests/.venv
+          source tests/.venv/bin/activate
+          pip install hypercorn
+
+      - name: Build all binaries
+        run: zig build build-all
+
+      - name: Run integration tests
+        run: zig build test-integration
 
   release-build:
     runs-on: ubuntu-latest

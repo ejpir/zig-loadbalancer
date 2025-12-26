@@ -97,6 +97,25 @@ fn testHostHeaderPresent(allocator: std.mem.Allocator) !void {
     try std.testing.expect(std.mem.indexOf(u8, host, "127.0.0.1") != null);
 }
 
+fn testResponseContentTypeForwarded(allocator: std.mem.Allocator) !void {
+    // Backend echo server always returns application/json
+    const response = try utils.httpRequest(allocator, "GET", utils.LB_PORT, "/", null, null);
+    defer allocator.free(response);
+
+    // Check the actual HTTP response headers (not JSON body)
+    const content_type = try utils.getResponseHeaderValue(response, "Content-Type");
+    try std.testing.expect(std.mem.indexOf(u8, content_type, "application/json") != null);
+}
+
+fn testResponseStatusCodeForwarded(allocator: std.mem.Allocator) !void {
+    // Backend returns 200 OK for normal requests
+    const response = try utils.httpRequest(allocator, "GET", utils.LB_PORT, "/", null, null);
+    defer allocator.free(response);
+
+    const status = try utils.getResponseStatusCode(response);
+    try std.testing.expectEqual(@as(u16, 200), status);
+}
+
 pub const suite = harness.Suite{
     .name = "Header Handling",
     .before_all = beforeAll,
@@ -107,5 +126,7 @@ pub const suite = harness.Suite{
         harness.it("forwards Authorization header", testAuthorizationHeaderForwarded),
         harness.it("filters hop-by-hop headers", testHopByHopHeadersFiltered),
         harness.it("includes Host header to backend", testHostHeaderPresent),
+        harness.it("forwards response Content-Type", testResponseContentTypeForwarded),
+        harness.it("forwards response status code", testResponseStatusCodeForwarded),
     },
 };

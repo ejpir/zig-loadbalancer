@@ -114,10 +114,8 @@ pub fn buildRequestHeaders(
         pos += @intCast(content_len_header.len);
     }
 
-    // Write Connection: keep-alive
-    const conn_header = "Connection: keep-alive\r\n";
-    @memcpy(buffer[pos..][0..conn_header.len], conn_header);
-    pos += conn_header.len;
+    // Note: Don't add Connection header - HTTP/1.1 is keep-alive by default,
+    // and hop-by-hop headers should not be forwarded (RFC 2616 Section 13.5.1)
 
     // End headers with \r\n
     buffer[pos] = '\r';

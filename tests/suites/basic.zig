@@ -1,6 +1,7 @@
 //! Basic proxy functionality tests.
 //!
-//! Tests HTTP method forwarding: GET, POST, PUT, PATCH
+//! Tests HTTP method forwarding: GET, POST, PUT, PATCH, DELETE
+//! Tests URI handling: query strings, deep paths
 
 const std = @import("std");
 const harness = @import("../harness.zig");
@@ -100,6 +101,42 @@ fn testResponseStructure(allocator: std.mem.Allocator) !void {
     _ = try utils.hasHeader(allocator, body, "Host");
 }
 
+fn testDeleteRequest(allocator: std.mem.Allocator) !void {
+    const response = try utils.httpRequest(allocator, "DELETE", utils.LB_PORT, "/api/resource/789", null, null);
+    defer allocator.free(response);
+
+    const body = try utils.extractJsonBody(response);
+    const method = try utils.getJsonString(allocator, body, "method");
+    defer allocator.free(method);
+    const uri = try utils.getJsonString(allocator, body, "uri");
+    defer allocator.free(uri);
+
+    try std.testing.expectEqualStrings("DELETE", method);
+    try std.testing.expectEqualStrings("/api/resource/789", uri);
+}
+
+fn testQueryStringForwarding(allocator: std.mem.Allocator) !void {
+    const response = try utils.httpRequest(allocator, "GET", utils.LB_PORT, "/search?q=hello&page=2&sort=desc", null, null);
+    defer allocator.free(response);
+
+    const body = try utils.extractJsonBody(response);
+    const uri = try utils.getJsonString(allocator, body, "uri");
+    defer allocator.free(uri);
+
+    try std.testing.expectEqualStrings("/search?q=hello&page=2&sort=desc", uri);
+}
+
+fn testDeepPathForwarding(allocator: std.mem.Allocator) !void {
+    const response = try utils.httpRequest(allocator, "GET", utils.LB_PORT, "/api/v1/users/123/posts/456/comments", null, null);
+    defer allocator.free(response);
+
+    const body = try utils.extractJsonBody(response);
+    const uri = try utils.getJsonString(allocator, body, "uri");
+    defer allocator.free(uri);
+
+    try std.testing.expectEqualStrings("/api/v1/users/123/posts/456/comments", uri);
+}
+
 pub const suite = harness.Suite{
     .name = "Basic Proxy Functionality",
     .before_all = beforeAll,
@@ -109,6 +146,9 @@ pub const suite = harness.Suite{
         harness.it("forwards POST requests with JSON body", testPostRequest),
         harness.it("forwards PUT requests with body", testPutRequest),
         harness.it("forwards PATCH requests with body", testPatchRequest),
+        harness.it("forwards DELETE requests", testDeleteRequest),
+        harness.it("forwards query strings correctly", testQueryStringForwarding),
+        harness.it("forwards deep paths correctly", testDeepPathForwarding),
         harness.it("returns complete response structure", testResponseStructure),
     },
 };
