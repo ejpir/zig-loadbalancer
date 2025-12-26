@@ -78,6 +78,19 @@ pub fn build(b: *std.Build) void {
     });
     const build_test_backend_echo = b.addInstallArtifact(test_backend_echo, .{});
 
+    // Mock OTLP collector (receives traces for integration tests)
+    const mock_otlp_collector_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fixtures/mock_otlp_collector.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mock_otlp_collector_mod.addImport("zzz", zzz_module);
+    const mock_otlp_collector = b.addExecutable(.{
+        .name = "mock_otlp_collector",
+        .root_module = mock_otlp_collector_mod,
+    });
+    const build_mock_otlp_collector = b.addInstallArtifact(mock_otlp_collector, .{});
+
     // Sanitizer option for debugging
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable Thread Sanitizer") orelse false;
 
@@ -129,6 +142,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_integration_exe = b.addRunArtifact(integration_exe);
     run_integration_exe.step.dependOn(&build_test_backend_echo.step);
+    run_integration_exe.step.dependOn(&build_mock_otlp_collector.step);
     run_integration_exe.step.dependOn(&build_load_balancer.step);
 
     const integration_test_step = b.step("test-integration", "Run integration tests");
@@ -140,6 +154,7 @@ pub fn build(b: *std.Build) void {
     build_all.dependOn(&build_backend2.step);
     build_all.dependOn(&build_backend_proxy.step);
     build_all.dependOn(&build_test_backend_echo.step);
+    build_all.dependOn(&build_mock_otlp_collector.step);
     build_all.dependOn(&build_load_balancer.step);
 
     const test_step = b.step("test", "Run unit tests");

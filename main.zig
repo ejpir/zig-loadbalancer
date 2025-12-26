@@ -698,6 +698,9 @@ fn workerMain(
     defer mp_server.deinit();
 
     try mp_server.serve(io, &router, &socket);
+
+    // Clean up H2 connection pool on shutdown
+    h2_pool_new.deinit(io);
 }
 
 // ============================================================================
@@ -846,6 +849,9 @@ fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
     defer sp_server.deinit();
 
     try sp_server.serve(io, &router, &socket);
+
+    // Clean up H2 connection pool on shutdown
+    h2_pool_sp.deinit(io);
 }
 
 fn setupSignalHandlers() void {

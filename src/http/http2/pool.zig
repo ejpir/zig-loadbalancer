@@ -21,7 +21,7 @@ const TlsOptions = ultra_sock_mod.TlsOptions;
 const BackendServer = @import("../../core/types.zig").BackendServer;
 const telemetry = @import("../../telemetry/mod.zig");
 
-const MAX_CONNECTIONS_PER_BACKEND: usize = 16;
+const MAX_CONNECTIONS_PER_BACKEND: usize = 32;
 const MAX_BACKENDS: usize = 64;
 
 /// Idle timeout for connections (30 seconds in nanoseconds)
