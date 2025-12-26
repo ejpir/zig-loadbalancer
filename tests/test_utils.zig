@@ -14,6 +14,11 @@ pub const BACKEND2_PORT: u16 = 19002;
 pub const BACKEND3_PORT: u16 = 19003;
 pub const LB_PORT: u16 = 18080;
 pub const LB_H2_PORT: u16 = 18081; // Load balancer port for HTTP/2 tests
+pub const OTLP_PORT: u16 = 14318; // Mock OTLP collector port
+pub const WAF_LB_PORT: u16 = 18082; // Load balancer port for WAF tests
+pub const WAF_SHADOW_LB_PORT: u16 = 18083; // Load balancer port for WAF shadow mode tests
+pub const WAF_BACKEND_PORT: u16 = 19004; // Backend port for WAF tests
+pub const WAF_SHADOW_BACKEND_PORT: u16 = 19005; // Backend port for WAF shadow mode tests
 
 /// Wait for a port to accept connections
 pub fn waitForPort(port: u16, timeout_ms: u64) !void {
@@ -237,4 +242,44 @@ pub fn getResponseHeaderValue(response: []const u8, header_name: []const u8) ![]
         line_start = line_end + 2;
     }
     return error.HeaderNotFound;
+}
+
+/// Get trace count from mock OTLP collector
+pub fn getOtlpTraceCount(allocator: std.mem.Allocator) !i64 {
+    const response = try httpRequest(allocator, "GET", OTLP_PORT, "/traces", null, null);
+    defer allocator.free(response);
+
+    const body = try extractJsonBody(response);
+    return try getJsonInt(allocator, body, "trace_count");
+}
+
+/// Clear traces in mock OTLP collector
+pub fn clearOtlpTraces(allocator: std.mem.Allocator) !void {
+    const response = try httpRequest(allocator, "DELETE", OTLP_PORT, "/traces", null, null);
+    defer allocator.free(response);
+
+    const status = try getResponseStatusCode(response);
+    if (status != 200) {
+        return error.ClearFailed;
+    }
+}
+
+/// Wait for traces to be received by collector
+pub fn waitForTraces(allocator: std.mem.Allocator, min_count: i64, timeout_ms: u64) !void {
+    const start = std.time.Instant.now() catch return error.TimerUnavailable;
+    const timeout_ns = timeout_ms * std.time.ns_per_ms;
+
+    while (true) {
+        const count = getOtlpTraceCount(allocator) catch 0;
+        if (count >= min_count) {
+            return;
+        }
+
+        const now = std.time.Instant.now() catch return error.TimerUnavailable;
+        if (now.since(start) >= timeout_ns) {
+            return error.TraceTimeout;
+        }
+
+        posix.nanosleep(0, 100 * std.time.ns_per_ms);
+    }
 }

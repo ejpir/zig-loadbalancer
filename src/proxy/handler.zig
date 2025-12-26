@@ -17,6 +17,10 @@ const log = std.log.scoped(.mp);
 const zzz = @import("zzz");
 const http = zzz.HTTP;
 
+const telemetry = @import("../telemetry/mod.zig");
+const main = @import("../../main.zig");
+const waf = @import("../waf/mod.zig");
+
 const config = @import("../core/config.zig");
 const types = @import("../core/types.zig");
 const ultra_sock_mod = @import("../http/ultra_sock.zig");
@@ -53,11 +57,29 @@ pub const ProxyError = error{
     ReadFailed,
     Timeout,
     EmptyResponse,
+    PoolExhausted, // Local resource issue, not a backend failure
     InvalidResponse,
     /// HTTP/2 GOAWAY exhausted retries - NOT a backend health failure
     /// Server gracefully closed connection, just need fresh connection
     GoawayRetriesExhausted,
 };
+
+// ============================================================================
+// IP Address Formatting
+// ============================================================================
+
+/// Format an IPv4 address (u32 in host byte order) as a string
+/// Returns a static buffer - only valid until next call
+var ip_format_buf: [16]u8 = undefined;
+fn formatIpv4(ip: u32) []const u8 {
+    const len = std.fmt.bufPrint(&ip_format_buf, "{d}.{d}.{d}.{d}", .{
+        @as(u8, @truncate(ip >> 24)),
+        @as(u8, @truncate(ip >> 16)),
+        @as(u8, @truncate(ip >> 8)),
+        @as(u8, @truncate(ip)),
+    }) catch return "0.0.0.0";
+    return ip_format_buf[0..len.len];
+}
 
 // ============================================================================
 // Connection State (TigerStyle: explicit struct for clarity)
@@ -77,6 +99,8 @@ pub const ProxyState = struct {
     body_had_error: bool,
     client_write_error: bool,
     backend_wants_close: bool,
+    /// Parent span for tracing (optional, for creating child spans)
+    trace_span: ?*telemetry.Span,
 
     /// TigerStyle: assertion for valid state (called at multiple points).
     pub fn assertValid(self: *const ProxyState) void {
@@ -118,6 +142,94 @@ pub fn generateHandler(
                 }
             }
 
+            // Start a trace span for this request (before WAF so blocked requests are traced)
+            const method = ctx.request.method orelse .GET;
+            const uri = ctx.request.uri orelse "/";
+            var span = telemetry.startServerSpan("proxy_request");
+            defer span.end();
+            span.setStringAttribute("http.method", @tagName(method));
+            span.setStringAttribute("http.url", uri);
+
+            // WAF check - before any backend processing
+            if (main.getWafEngine()) |engine_val| {
+                // Make a mutable copy since check() requires *WafEngine
+                var engine = engine_val;
+
+                // Extract source IP from connection (use 0 if not available)
+                // In production, you'd extract this from the socket address
+                const source_ip: u32 = 0; // TODO: Extract from ctx.connection when available
+
+                // Build WAF request with body size for content-length validation
+                const waf_method = convertHttpMethod(ctx.request.method orelse .GET);
+                const body_len: ?usize = if (ctx.request.body) |b| b.len else null;
+                const waf_request = if (body_len) |len|
+                    waf.Request.withContentLength(
+                        waf_method,
+                        ctx.request.uri orelse "/",
+                        source_ip,
+                        len,
+                    )
+                else
+                    waf.Request.init(
+                        waf_method,
+                        ctx.request.uri orelse "/",
+                        source_ip,
+                    );
+
+                // Check WAF rules (with tracing - creates child spans for each step)
+                const waf_result = engine.checkWithSpan(&waf_request, &span, telemetry);
+
+                // Add WAF summary attributes to parent span
+                const client_ip_str = formatIpv4(source_ip);
+                span.setStringAttribute("waf.decision", if (waf_result.isBlocked()) "block" else if (waf_result.shouldLog()) "log_only" else "allow");
+                span.setStringAttribute("waf.client_ip", client_ip_str);
+                if (waf_result.reason != .none) {
+                    span.setStringAttribute("waf.reason", waf_result.reason.description());
+                }
+                if (waf_result.rule_name) |rule| {
+                    span.setStringAttribute("waf.rule", rule);
+                }
+
+                if (waf_result.isBlocked()) {
+                    // Request blocked by WAF
+                    log.warn("[W{d}] WAF BLOCKED: ip={s} uri={s} reason={s} rule={s}", .{
+                        state.worker_id,
+                        client_ip_str,
+                        ctx.request.uri orelse "/",
+                        waf_result.reason.description(),
+                        waf_result.rule_name orelse "N/A",
+                    });
+
+                    // Return appropriate status based on block reason
+                    const status: http.Status = switch (waf_result.reason) {
+                        .rate_limit => .@"Too Many Requests",
+                        .body_too_large => .@"Content Too Large",
+                        else => .Forbidden,
+                    };
+
+                    span.setIntAttribute("http.status_code", @intFromEnum(status));
+                    span.setError("WAF blocked");
+
+                    return ctx.response.apply(.{
+                        .status = status,
+                        .mime = http.Mime.JSON,
+                        .body = "{\"error\":\"blocked by WAF\"}",
+                    });
+                }
+
+                // Log if shadow mode decision was made
+                if (waf_result.shouldLog()) {
+                    log.info("[W{d}] WAF SHADOW: ip={s} uri={s} reason={s} rule={s}", .{
+                        state.worker_id,
+                        client_ip_str,
+                        ctx.request.uri orelse "/",
+                        waf_result.reason.description(),
+                        waf_result.rule_name orelse "N/A",
+                    });
+                    span.addEvent("waf_shadow_block");
+                }
+            }
+
             // Use dynamic backend count (from shared region if available)
             const backend_count = state.getBackendCount();
             std.debug.assert(backend_count <= MAX_BACKENDS);
@@ -129,6 +241,8 @@ pub fn generateHandler(
             });
 
             if (backend_count == 0) {
+                span.setError("No backends configured");
+                span.setIntAttribute("http.status_code", 503);
                 return ctx.response.apply(.{
                     .status = .@"Service Unavailable",
                     .mime = http.Mime.TEXT,
@@ -136,7 +250,17 @@ pub fn generateHandler(
                 });
             }
 
+            // Backend selection with tracing
+            var selection_span = telemetry.startChildSpan(&span, "backend_selection", .Internal);
+            selection_span.setIntAttribute("lb.backend_count", @intCast(backend_count));
+            selection_span.setIntAttribute("lb.healthy_count", @intCast(state.circuit_breaker.countHealthy()));
+            selection_span.setStringAttribute("lb.strategy", @tagName(strategy));
+
             const backend_idx = state.selectBackend(strategy) orelse {
+                selection_span.setError("No healthy backends");
+                selection_span.end();
+                span.setError("No backends available");
+                span.setIntAttribute("http.status_code", 503);
                 log.warn("[W{d}] selectBackend returned null", .{state.worker_id});
                 return ctx.response.apply(.{
                     .status = .@"Service Unavailable",
@@ -145,12 +269,26 @@ pub fn generateHandler(
                 });
             };
 
+            selection_span.setIntAttribute("lb.selected_backend", @intCast(backend_idx));
+            selection_span.setOk();
+            selection_span.end();
+
             // Prevent out-of-bounds access to backends array and bitmap.
             std.debug.assert(backend_idx < backend_count);
             std.debug.assert(backend_idx < MAX_BACKENDS);
 
             log.debug("[W{d}] Selected backend {d}", .{ state.worker_id, backend_idx });
-            return proxyWithFailover(ctx, @intCast(backend_idx), state);
+            const result = proxyWithFailover(ctx, @intCast(backend_idx), state, &span);
+
+            // Update parent span with final status
+            if (result) |response| {
+                span.setOk();
+                return response;
+            } else |err| {
+                span.setError(@errorName(err));
+                span.setIntAttribute("http.status_code", 503);
+                return err;
+            }
         }
     }.handle;
 }
@@ -160,6 +298,7 @@ inline fn proxyWithFailover(
     ctx: *const http.Context,
     primary_idx: u32,
     state: *WorkerState,
+    trace_span: *telemetry.Span,
 ) !http.Respond {
     // Prevent out-of-bounds access to backends array and bitmap.
     std.debug.assert(primary_idx < MAX_BACKENDS);
@@ -168,27 +307,31 @@ inline fn proxyWithFailover(
 
     // Try to get backend from shared region (hot reload) or fall back to local
     if (state.getSharedBackend(primary_idx)) |shared_backend| {
-        if (streamingProxyShared(ctx, shared_backend, primary_idx, state)) |response| {
+        if (streamingProxyShared(ctx, shared_backend, primary_idx, state, trace_span)) |response| {
             state.recordSuccess(primary_idx);
+            trace_span.setIntAttribute("http.status_code", 200);
             return response;
         } else |err| {
-            // GOAWAY exhaustion is NOT a backend failure - just connection-level flow control
-            if (err != ProxyError.GoawayRetriesExhausted) {
+            // GOAWAY/PoolExhausted are NOT backend failures - just connection-level issues
+            if (err != ProxyError.GoawayRetriesExhausted and err != ProxyError.PoolExhausted) {
                 state.recordFailure(primary_idx);
             }
+            trace_span.addEvent("primary_backend_failed");
             log.warn("[W{d}] Backend {d} failed: {s}", .{ state.worker_id, primary_idx + 1, @errorName(err) });
         }
     } else {
         // Fall back to local backends list
         const backends = state.backends;
-        if (streamingProxy(ctx, &backends.items[primary_idx], primary_idx, state)) |response| {
+        if (streamingProxy(ctx, &backends.items[primary_idx], primary_idx, state, trace_span)) |response| {
             state.recordSuccess(primary_idx);
+            trace_span.setIntAttribute("http.status_code", 200);
             return response;
         } else |err| {
-            // GOAWAY exhaustion is NOT a backend failure - just connection-level flow control
-            if (err != ProxyError.GoawayRetriesExhausted) {
+            // GOAWAY/PoolExhausted are NOT backend failures - just connection-level issues
+            if (err != ProxyError.GoawayRetriesExhausted and err != ProxyError.PoolExhausted) {
                 state.recordFailure(primary_idx);
             }
+            trace_span.addEvent("primary_backend_failed");
             log.warn("[W{d}] Backend {d} failed: {s}", .{ state.worker_id, primary_idx + 1, @errorName(err) });
         }
     }
@@ -200,16 +343,19 @@ inline fn proxyWithFailover(
 
         log.debug("[W{d}] Failing over to backend {d}", .{ state.worker_id, failover_idx + 1 });
         metrics.global_metrics.recordFailover();
+        trace_span.addEvent("failover_started");
+        trace_span.setIntAttribute("lb.failover_backend", @intCast(failover_idx));
 
         const failover_u32: u32 = @intCast(failover_idx);
 
         if (state.getSharedBackend(failover_idx)) |shared_backend| {
-            if (streamingProxyShared(ctx, shared_backend, failover_u32, state)) |response| {
+            if (streamingProxyShared(ctx, shared_backend, failover_u32, state, trace_span)) |response| {
                 state.recordSuccess(failover_idx);
+                trace_span.setIntAttribute("http.status_code", 200);
                 return response;
             } else |failover_err| {
-                // GOAWAY exhaustion is NOT a backend failure
-                if (failover_err != ProxyError.GoawayRetriesExhausted) {
+                // GOAWAY/PoolExhausted are NOT backend failures
+                if (failover_err != ProxyError.GoawayRetriesExhausted and failover_err != ProxyError.PoolExhausted) {
                     state.recordFailure(failover_idx);
                 }
                 const err_name = @errorName(failover_err);
@@ -222,12 +368,13 @@ inline fn proxyWithFailover(
         } else {
             const backends = state.backends;
             const backend = &backends.items[failover_idx];
-            if (streamingProxy(ctx, backend, failover_u32, state)) |response| {
+            if (streamingProxy(ctx, backend, failover_u32, state, trace_span)) |response| {
                 state.recordSuccess(failover_idx);
+                trace_span.setIntAttribute("http.status_code", 200);
                 return response;
             } else |failover_err| {
-                // GOAWAY exhaustion is NOT a backend failure
-                if (failover_err != ProxyError.GoawayRetriesExhausted) {
+                // GOAWAY/PoolExhausted are NOT backend failures
+                if (failover_err != ProxyError.GoawayRetriesExhausted and failover_err != ProxyError.PoolExhausted) {
                     state.recordFailure(failover_idx);
                 }
                 const err_name = @errorName(failover_err);
@@ -239,6 +386,10 @@ inline fn proxyWithFailover(
             }
         }
     }
+
+    // All backends exhausted - this IS an error (user gets 503)
+    log.err("[W{d}] All backends exhausted, returning 503", .{state.worker_id});
+    trace_span.setError("All backends exhausted");
 
     return ctx.response.apply(.{
         .status = .@"Service Unavailable",
@@ -272,6 +423,7 @@ inline fn streamingProxy(
     backend: *const types.BackendServer,
     backend_idx: u32,
     state: *WorkerState,
+    trace_span: *telemetry.Span,
 ) ProxyError!http.Respond {
     // Prevent bitmap overflow in circuit breaker health tracking.
     std.debug.assert(backend_idx < MAX_BACKENDS);
@@ -302,11 +454,17 @@ inline fn streamingProxy(
             .body_had_error = false,
             .client_write_error = false,
             .backend_wants_close = false,
+            .trace_span = trace_span,
         };
         return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
     }
 
-    // Phase 1: Acquire connection (HTTP/1.1 path only now).
+    // Phase 1: Acquire connection (HTTP/1.1 path only now) with tracing.
+    var conn_span = telemetry.startChildSpan(trace_span, "backend_connection", .Client);
+    conn_span.setStringAttribute("backend.host", backend.getHost());
+    conn_span.setIntAttribute("backend.port", @intCast(backend.port));
+    conn_span.setBoolAttribute("backend.tls", backend.isHttps());
+
     var proxy_state = proxy_connection.acquireConnection(
         types.BackendServer,
         ctx,
@@ -314,14 +472,22 @@ inline fn streamingProxy(
         backend_idx,
         state,
         req_id,
+        &conn_span,
     ) catch |err| {
+        conn_span.setError(@errorName(err));
+        conn_span.end();
         return err;
     };
+
+    conn_span.setBoolAttribute("connection.from_pool", proxy_state.from_pool);
+    conn_span.setOk();
+    conn_span.end();
 
     // Fix pointers after struct copy - TLS connection and stream reader/writer
     // have internal pointers that become dangling when UltraSock is copied by value.
     proxy_state.sock.fixAllPointersAfterCopy(ctx.io);
     proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
+    proxy_state.trace_span = trace_span;
 
     // TigerStyle: validate state after acquisition.
     proxy_state.assertValid();
@@ -331,6 +497,11 @@ inline fn streamingProxy(
         return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
     }
 
+    // Phase 2-5: Backend request/response with tracing
+    var request_span = telemetry.startChildSpan(trace_span, "backend_request", .Client);
+    request_span.setStringAttribute("http.method", @tagName(ctx.request.method orelse .GET));
+    request_span.setStringAttribute("http.url", ctx.request.uri orelse "/");
+
     // Phase 2: Send request (HTTP/1.1 path).
     proxy_request.sendRequest(
         types.BackendServer,
@@ -339,9 +510,13 @@ inline fn streamingProxy(
         &proxy_state,
         req_id,
     ) catch |err| {
+        request_span.setError(@errorName(err));
+        request_span.end();
         proxy_state.sock.close_blocking();
         return err;
     };
+
+    request_span.addEvent("request_sent");
 
     // Phase 3: Read and parse headers.
     // Safe undefined: buffer fully written by backend read before parsing.
@@ -356,9 +531,14 @@ inline fn streamingProxy(
         &header_end,
         req_id,
     ) catch |err| {
+        request_span.setError(@errorName(err));
+        request_span.end();
         proxy_state.sock.close_blocking();
         return err;
     };
+
+    request_span.addEvent("headers_received");
+    request_span.setIntAttribute("http.status_code", @intCast(proxy_state.status_code));
 
     // HTTP response must have headers, validate parse succeeded before forwarding.
     std.debug.assert(header_end > 0);
@@ -375,12 +555,33 @@ inline fn streamingProxy(
         msg_len,
         req_id,
     ) catch |err| {
+        request_span.setError(@errorName(err));
+        request_span.end();
         proxy_state.sock.close_blocking();
         return err;
     };
 
-    // Phase 5: Stream body.
+    // Phase 5: Stream body with tracing.
+    var body_span = telemetry.startChildSpan(&request_span, "response_streaming", .Internal);
+    body_span.setStringAttribute("http.body.type", @tagName(msg_len.type));
+    if (msg_len.type == .content_length) {
+        body_span.setIntAttribute("http.body.expected_length", @intCast(msg_len.length));
+    }
+
     proxy_io.streamBody(ctx, &proxy_state, header_end, header_len, msg_len, req_id);
+
+    body_span.setIntAttribute("http.body.bytes_transferred", @intCast(proxy_state.bytes_from_backend));
+    body_span.setBoolAttribute("http.body.had_error", proxy_state.body_had_error);
+    if (proxy_state.body_had_error) {
+        body_span.setError("body_transfer_error");
+    } else {
+        body_span.setOk();
+    }
+    body_span.end();
+
+    request_span.setIntAttribute("http.response_content_length", @intCast(proxy_state.bytes_from_backend));
+    request_span.setOk();
+    request_span.end();
 
     // Phase 6: Finalize and return connection.
     return streamingProxy_finalize(ctx, &proxy_state, state, backend_idx, start_ns, req_id);
@@ -392,6 +593,7 @@ inline fn streamingProxyShared(
     backend: *const shared_region.SharedBackend,
     backend_idx: u32,
     state: *WorkerState,
+    trace_span: *telemetry.Span,
 ) ProxyError!http.Respond {
     // Prevent bitmap overflow in circuit breaker health tracking.
     std.debug.assert(backend_idx < MAX_BACKENDS);
@@ -424,11 +626,17 @@ inline fn streamingProxyShared(
             .body_had_error = false,
             .client_write_error = false,
             .backend_wants_close = false,
+            .trace_span = trace_span,
         };
         return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
     }
 
-    // Phase 1: Acquire connection (HTTP/1.1 path only now).
+    // Phase 1: Acquire connection (HTTP/1.1 path only now) with tracing.
+    var conn_span = telemetry.startChildSpan(trace_span, "backend_connection", .Client);
+    conn_span.setStringAttribute("backend.host", backend.getHost());
+    conn_span.setIntAttribute("backend.port", @intCast(backend.port));
+    conn_span.setBoolAttribute("backend.tls", backend.isHttps());
+
     var proxy_state = proxy_connection.acquireConnection(
         shared_region.SharedBackend,
         ctx,
@@ -436,14 +644,22 @@ inline fn streamingProxyShared(
         backend_idx,
         state,
         req_id,
+        &conn_span,
     ) catch |err| {
+        conn_span.setError(@errorName(err));
+        conn_span.end();
         return err;
     };
+
+    conn_span.setBoolAttribute("connection.from_pool", proxy_state.from_pool);
+    conn_span.setOk();
+    conn_span.end();
 
     // Fix pointers after struct copy - TLS connection and stream reader/writer
     // have internal pointers that become dangling when UltraSock is copied by value.
     proxy_state.sock.fixAllPointersAfterCopy(ctx.io);
     proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
+    proxy_state.trace_span = trace_span;
 
     proxy_state.assertValid();
 
@@ -451,6 +667,11 @@ inline fn streamingProxyShared(
     if (proxy_state.is_http2) {
         return streamingProxyHttp2(ctx, backend, &proxy_state, state, backend_idx, start_ns, req_id);
     }
+
+    // Phase 2-5: Backend request/response with tracing
+    var request_span = telemetry.startChildSpan(trace_span, "backend_request", .Client);
+    request_span.setStringAttribute("http.method", @tagName(ctx.request.method orelse .GET));
+    request_span.setStringAttribute("http.url", ctx.request.uri orelse "/");
 
     // Phase 2: Send request (HTTP/1.1 path).
     proxy_request.sendRequest(
@@ -460,9 +681,13 @@ inline fn streamingProxyShared(
         &proxy_state,
         req_id,
     ) catch |err| {
+        request_span.setError(@errorName(err));
+        request_span.end();
         proxy_state.sock.close_blocking();
         return err;
     };
+
+    request_span.addEvent("request_sent");
 
     // Phase 3-6: Same as regular streamingProxy (backend-agnostic)
     var header_buffer: [MAX_HEADER_BYTES]u8 = undefined;
@@ -476,9 +701,14 @@ inline fn streamingProxyShared(
         &header_end,
         req_id,
     ) catch |err| {
+        request_span.setError(@errorName(err));
+        request_span.end();
         proxy_state.sock.close_blocking();
         return err;
     };
+
+    request_span.addEvent("headers_received");
+    request_span.setIntAttribute("http.status_code", @intCast(proxy_state.status_code));
 
     std.debug.assert(header_end > 0);
     std.debug.assert(header_end <= header_len);
@@ -493,11 +723,33 @@ inline fn streamingProxyShared(
         msg_len,
         req_id,
     ) catch |err| {
+        request_span.setError(@errorName(err));
+        request_span.end();
         proxy_state.sock.close_blocking();
         return err;
     };
 
+    // Stream body with tracing
+    var body_span = telemetry.startChildSpan(&request_span, "response_streaming", .Internal);
+    body_span.setStringAttribute("http.body.type", @tagName(msg_len.type));
+    if (msg_len.type == .content_length) {
+        body_span.setIntAttribute("http.body.expected_length", @intCast(msg_len.length));
+    }
+
     proxy_io.streamBody(ctx, &proxy_state, header_end, header_len, msg_len, req_id);
+
+    body_span.setIntAttribute("http.body.bytes_transferred", @intCast(proxy_state.bytes_from_backend));
+    body_span.setBoolAttribute("http.body.had_error", proxy_state.body_had_error);
+    if (proxy_state.body_had_error) {
+        body_span.setError("body_transfer_error");
+    } else {
+        body_span.setOk();
+    }
+    body_span.end();
+
+    request_span.setIntAttribute("http.response_content_length", @intCast(proxy_state.bytes_from_backend));
+    request_span.setOk();
+    request_span.end();
 
     return streamingProxy_finalize(ctx, &proxy_state, state, backend_idx, start_ns, req_id);
 }
@@ -518,8 +770,15 @@ fn forwardH2Response(
     backend_idx: u32,
     start_ns: ?std.time.Instant,
     req_id: u32,
+    parent_span: *telemetry.Span,
 ) ProxyError!http.Respond {
     const body = response.getBody();
+
+    // Create response streaming span
+    var body_span = telemetry.startChildSpan(parent_span, "response_streaming", .Internal);
+    defer body_span.end();
+    body_span.setStringAttribute("http.body.type", "h2_buffered");
+    body_span.setIntAttribute("http.body.length", @intCast(body.len));
 
     // Update proxy state with response info
     proxy_state.status_code = response.status;
@@ -573,6 +832,10 @@ fn forwardH2Response(
 
     metrics.global_metrics.recordRequest(duration_ms, proxy_state.status_code);
 
+    // Update span with result
+    body_span.setIntAttribute("http.body.bytes_written", @intCast(proxy_state.bytes_to_client));
+    body_span.setBoolAttribute("http.body.had_error", proxy_state.client_write_error);
+
     // Return response type
     if (proxy_state.client_write_error) {
         log.debug("[REQ {d}] => .close (client write error)", .{req_id});
@@ -597,8 +860,23 @@ fn streamingProxyHttp2(
 ) ProxyError!http.Respond {
     log.debug("[REQ {d}] HTTP/2 request to backend {d}", .{ req_id, backend_idx });
 
+    // Start HTTP/2 request span if we have a trace context
+    var h2_span = if (proxy_state.trace_span) |trace_span|
+        telemetry.startChildSpan(trace_span, "backend_request_h2", .Client)
+    else
+        telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined };
+    defer h2_span.end();
+
+    h2_span.setStringAttribute("http.method", @tagName(ctx.request.method orelse .GET));
+    h2_span.setStringAttribute("http.url", ctx.request.uri orelse "/");
+    h2_span.setStringAttribute("http.flavor", "2.0");
+    h2_span.setStringAttribute("backend.host", backend.getFullHost());
+
     // Get pool (must exist)
-    const pool = state.h2_pool orelse return ProxyError.ConnectionFailed;
+    const pool = state.h2_pool orelse {
+        h2_span.setError("No H2 pool");
+        return ProxyError.ConnectionFailed;
+    };
 
     // Retry loop for TooManyStreams (connection full, not broken)
     const h2_conn = @import("../http/http2/connection.zig");
@@ -617,10 +895,18 @@ fn streamingProxyHttp2(
         last_was_goaway = false;
 
         // Get or create connection (pool handles everything: TLS, handshake, retry)
-        const conn = pool.getOrCreate(backend_idx, ctx.io) catch |err| {
-            log.warn("[REQ {d}] H2 pool getOrCreate failed: {}", .{ req_id, err });
+        const conn = pool.getOrCreate(backend_idx, ctx.io, &h2_span) catch |err| {
+            h2_span.setError("Pool getOrCreate failed");
+            // PoolExhausted is a local resource issue, not a backend failure
+            // Pool already logs at error level, so just return the error
+            if (err == error.PoolExhausted) {
+                return ProxyError.PoolExhausted;
+            }
+            log.err("[REQ {d}] H2 pool getOrCreate failed: {}", .{ req_id, err });
             return ProxyError.ConnectionFailed;
         };
+
+        h2_span.addEvent("connection_acquired");
 
         // Make request (connection handles: send, reader spawn, await)
         response = conn.request(
@@ -633,6 +919,7 @@ fn streamingProxyHttp2(
             if (err == error.TooManyStreams) {
                 // Connection full (all 8 slots busy) - release as healthy and retry
                 log.debug("[REQ {d}] Connection full, retrying...", .{req_id});
+                h2_span.addEvent("retry_too_many_streams");
                 pool.release(conn, true, ctx.io);
                 continue;
             }
@@ -640,12 +927,14 @@ fn streamingProxyHttp2(
                 // GOAWAY received - get fresh connection and retry
                 // NOT a failure - just graceful connection shutdown
                 log.debug("[REQ {d}] GOAWAY, retrying on fresh connection", .{req_id});
+                h2_span.addEvent("retry_goaway");
                 pool.release(conn, false, ctx.io); // Destroy this conn, but NOT a backend failure
                 last_was_goaway = true;
                 continue;
             }
             // Other errors - connection is broken
             log.warn("[REQ {d}] H2 request failed: {}", .{ req_id, err });
+            h2_span.setError(@errorName(err));
             pool.release(conn, false, ctx.io);
             return ProxyError.SendFailed;
         };
@@ -659,6 +948,7 @@ fn streamingProxyHttp2(
             // GOAWAY exhausted retries - NOT a backend health failure
             // Server is healthy, just aggressively closing connections under load
             log.debug("[REQ {d}] GOAWAY exhausted retries (not a failure)", .{req_id});
+            h2_span.setError("GOAWAY retries exhausted");
             return ProxyError.GoawayRetriesExhausted;
         }
         log.warn("[REQ {d}] H2 request failed after {d} retries", .{ req_id, attempts });
@@ -671,8 +961,14 @@ fn streamingProxyHttp2(
     proxy_state.status_code = response.status;
     proxy_state.bytes_from_backend = @intCast(response.body.items.len);
 
+    // Update span with response info
+    h2_span.setIntAttribute("http.status_code", @intCast(response.status));
+    h2_span.setIntAttribute("http.response_content_length", @intCast(response.body.items.len));
+    h2_span.setIntAttribute("h2.retry_count", @intCast(attempts));
+    h2_span.setOk();
+
     // Forward response to client (connection released via defer above)
-    return forwardH2Response(ctx, proxy_state, &response, backend_idx, start_ns, req_id);
+    return forwardH2Response(ctx, proxy_state, &response, backend_idx, start_ns, req_id, &h2_span);
 }
 
 // ============================================================================
@@ -768,4 +1064,23 @@ fn streamingProxy_finalize(
     }
     log.debug("[REQ {d}] => .responded", .{req_id});
     return .responded;
+}
+
+// ============================================================================
+// WAF Helper Functions
+// ============================================================================
+
+/// Convert zzz HTTP method to WAF HTTP method
+fn convertHttpMethod(method: http.Method) waf.HttpMethod {
+    return switch (method) {
+        .GET => .GET,
+        .POST => .POST,
+        .PUT => .PUT,
+        .DELETE => .DELETE,
+        .PATCH => .PATCH,
+        .HEAD => .HEAD,
+        .OPTIONS => .OPTIONS,
+        .TRACE => .TRACE,
+        .CONNECT => .CONNECT,
+    };
 }

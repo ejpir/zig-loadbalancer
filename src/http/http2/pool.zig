@@ -19,8 +19,9 @@ const UltraSock = ultra_sock_mod.UltraSock;
 const Protocol = ultra_sock_mod.Protocol;
 const TlsOptions = ultra_sock_mod.TlsOptions;
 const BackendServer = @import("../../core/types.zig").BackendServer;
+const telemetry = @import("../../telemetry/mod.zig");
 
-const MAX_CONNECTIONS_PER_BACKEND: usize = 16;
+const MAX_CONNECTIONS_PER_BACKEND: usize = 32;
 const MAX_BACKENDS: usize = 64;
 
 /// Idle timeout for connections (30 seconds in nanoseconds)
@@ -77,7 +78,7 @@ pub const H2ConnectionPool = struct {
     /// 3. If found and healthy, return it (stays available for more requests)
     /// 4. If not found, find empty slot and create fresh
     /// 5. Unlock mutex on return
-    pub fn getOrCreate(self: *Self, backend_idx: u32, io: Io) !*H2Connection {
+    pub fn getOrCreate(self: *Self, backend_idx: u32, io: Io, trace_span: ?*telemetry.Span) !*H2Connection {
         std.debug.assert(backend_idx < self.backends.len);
 
         // Lock per-backend mutex to prevent concurrent creation race
@@ -109,7 +110,7 @@ pub const H2ConnectionPool = struct {
         // Phase 2: Create new connection in empty slot
         for (&self.slot_state[backend_idx], &self.slots[backend_idx], 0..) |*state, *slot, i| {
             if (state.* == .empty) {
-                const conn = try self.createFreshConnection(backend_idx, io);
+                const conn = try self.createFreshConnection(backend_idx, io, trace_span);
                 conn.ref_count.store(1, .release); // First user
                 slot.* = conn;
                 state.* = .available;
@@ -118,8 +119,8 @@ pub const H2ConnectionPool = struct {
             }
         }
 
-        // All slots full - handler will retry on TooManyStreams
-        log.warn("Connection pool exhausted: backend={d}", .{backend_idx});
+        // All slots full - this is an error condition (causes 503s under load)
+        log.err("H2 pool exhausted: backend={d} (32 conns x 8 streams = 256 max concurrent)", .{backend_idx});
         return error.PoolExhausted;
     }
 
@@ -175,7 +176,7 @@ pub const H2ConnectionPool = struct {
     }
 
     /// Create fresh connection with TLS and HTTP/2 handshake
-    fn createFreshConnection(self: *Self, backend_idx: u32, io: Io) !*H2Connection {
+    fn createFreshConnection(self: *Self, backend_idx: u32, io: Io, trace_span: ?*telemetry.Span) !*H2Connection {
         std.debug.assert(backend_idx < self.backends.len);
         const backend = &self.backends[backend_idx];
 
@@ -186,7 +187,9 @@ pub const H2ConnectionPool = struct {
         // Create socket from backend server
         const protocol: Protocol = if (backend.isHttps()) .https else .http;
         const tls_options = TlsOptions.fromRuntimeWithHttp2();
-        const sock = UltraSock.initWithTls(protocol, backend.getHost(), backend.port, tls_options);
+        var sock = UltraSock.initWithTls(protocol, backend.getHost(), backend.port, tls_options);
+        // Set trace span for detailed connection phase tracing (DNS, TCP, TLS)
+        sock.trace_span = trace_span;
 
         // Initialize H2Connection with per-connection buffers
         conn.* = try H2Connection.init(sock, backend_idx, self.allocator);
@@ -205,7 +208,13 @@ pub const H2ConnectionPool = struct {
         conn.sock.enableKeepalive() catch {};
 
         // Perform HTTP/2 handshake (send preface + SETTINGS)
+        var h2_handshake_span = if (trace_span) |parent|
+            telemetry.startChildSpan(parent, "h2_handshake", .Internal)
+        else
+            telemetry.Span{ .inner = null, .tracer = null, .allocator = undefined };
+        defer h2_handshake_span.end();
         try conn.connect(io);
+        h2_handshake_span.setOk();
 
         log.debug("Fresh H2 connection established: backend={d}", .{backend_idx});
         return conn;

@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "shadow_mode": false,
+  "rate_limits": [
+    {
+      "name": "test_limit",
+      "path": "/*",
+      "limit": { "requests": 200000, "period_sec": 60 },
+      "burst": 0,
+      "by": "ip",
+      "action": "block"
+    }
+  ],
+  "request_limits": {
+    "max_uri_length": 100,
+    "max_body_size": 1024
+  }
+}

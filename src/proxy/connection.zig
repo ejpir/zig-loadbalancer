@@ -20,6 +20,7 @@ const ultra_sock_mod = @import("../http/ultra_sock.zig");
 const UltraSock = ultra_sock_mod.UltraSock;
 const metrics = @import("../metrics/mod.zig");
 const WorkerState = @import("../lb/worker.zig").WorkerState;
+const telemetry = @import("../telemetry/mod.zig");
 
 // Re-export ProxyState for convenience
 pub const ProxyState = @import("handler.zig").ProxyState;
@@ -41,6 +42,7 @@ pub fn acquireConnection(
     backend_idx: u32,
     state: *WorkerState,
     req_id: u32,
+    trace_span: ?*telemetry.Span,
 ) ProxyError!ProxyState {
     // Prevent bitmap overflow in circuit breaker health tracking.
     std.debug.assert(backend_idx < MAX_BACKENDS);
@@ -73,6 +75,7 @@ pub fn acquireConnection(
             .body_had_error = false,
             .client_write_error = false,
             .backend_wants_close = false,
+            .trace_span = null, // Set by handler after acquisition.
         };
         proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
         return proxy_state;
@@ -85,6 +88,8 @@ pub fn acquireConnection(
 
     // Create fresh connection
     var sock = UltraSock.fromBackendServerWithHttp2(backend);
+    // Set trace span for detailed connection phase tracing (DNS, TCP, TLS)
+    sock.trace_span = trace_span;
     sock.connect(ctx.io) catch {
         sock.close_blocking();
         return ProxyError.BackendUnavailable;
@@ -119,6 +124,7 @@ pub fn acquireConnection(
         .body_had_error = false,
         .client_write_error = false,
         .backend_wants_close = false,
+        .trace_span = null, // Set by handler after acquisition.
     };
     proxy_state.tls_conn_ptr = proxy_state.sock.getTlsConnection();
     return proxy_state;

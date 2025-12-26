@@ -7,6 +7,9 @@
         .zzz = .{
             .path = "vendor/zzz.io",
         },
+        .opentelemetry = .{
+            .path = "vendor/otel",
+        },
     },
 
     .paths = .{
