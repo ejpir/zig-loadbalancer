@@ -65,6 +65,23 @@ pub const ProxyError = error{
 };
 
 // ============================================================================
+// IP Address Formatting
+// ============================================================================
+
+/// Format an IPv4 address (u32 in host byte order) as a string
+/// Returns a static buffer - only valid until next call
+var ip_format_buf: [16]u8 = undefined;
+fn formatIpv4(ip: u32) []const u8 {
+    const len = std.fmt.bufPrint(&ip_format_buf, "{d}.{d}.{d}.{d}", .{
+        @as(u8, @truncate(ip >> 24)),
+        @as(u8, @truncate(ip >> 16)),
+        @as(u8, @truncate(ip >> 8)),
+        @as(u8, @truncate(ip)),
+    }) catch return "0.0.0.0";
+    return ip_format_buf[0..len.len];
+}
+
+// ============================================================================
 // Connection State (TigerStyle: explicit struct for clarity)
 // ============================================================================
 
@@ -163,7 +180,9 @@ pub fn generateHandler(
                 const waf_result = engine.check(&waf_request);
 
                 // Add WAF attributes to span
+                const client_ip_str = formatIpv4(source_ip);
                 span.setStringAttribute("waf.decision", if (waf_result.isBlocked()) "block" else if (waf_result.shouldLog()) "log_only" else "allow");
+                span.setStringAttribute("waf.client_ip", client_ip_str);
                 if (waf_result.reason != .none) {
                     span.setStringAttribute("waf.reason", waf_result.reason.description());
                 }
@@ -173,8 +192,10 @@ pub fn generateHandler(
 
                 if (waf_result.isBlocked()) {
                     // Request blocked by WAF
-                    log.warn("[W{d}] WAF blocked request: reason={s}, rule={s}", .{
+                    log.warn("[W{d}] WAF BLOCKED: ip={s} uri={s} reason={s} rule={s}", .{
                         state.worker_id,
+                        client_ip_str,
+                        ctx.request.uri orelse "/",
                         waf_result.reason.description(),
                         waf_result.rule_name orelse "N/A",
                     });
@@ -198,8 +219,10 @@ pub fn generateHandler(
 
                 // Log if shadow mode decision was made
                 if (waf_result.shouldLog()) {
-                    log.info("[W{d}] WAF shadow: reason={s}, rule={s}", .{
+                    log.info("[W{d}] WAF SHADOW: ip={s} uri={s} reason={s} rule={s}", .{
                         state.worker_id,
+                        client_ip_str,
+                        ctx.request.uri orelse "/",
                         waf_result.reason.description(),
                         waf_result.rule_name orelse "N/A",
                     });

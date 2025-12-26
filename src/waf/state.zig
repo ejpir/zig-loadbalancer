@@ -87,6 +87,8 @@ pub const Reason = enum(u8) {
     path_traversal = 7,
     /// Invalid request format
     invalid_request = 8,
+    /// Request velocity burst detected (sudden spike from IP)
+    burst = 9,
 
     /// Get human-readable description
     pub fn description(self: Reason) []const u8 {
@@ -100,6 +102,7 @@ pub const Reason = enum(u8) {
             .xss => "XSS pattern detected",
             .path_traversal => "path traversal attempt",
             .invalid_request => "invalid request format",
+            .burst => "request velocity burst detected",
         };
     }
 };
@@ -373,6 +376,172 @@ pub const ConnTracker = extern struct {
 };
 
 // =============================================================================
+// Burst Detector (Anomaly Detection)
+// =============================================================================
+
+/// Maximum tracked IPs for burst detection
+pub const MAX_BURST_TRACKED: usize = 8192;
+
+/// Burst detection window in seconds
+pub const BURST_WINDOW_SEC: u32 = 10;
+
+/// Default burst threshold multiplier (current rate > baseline * threshold = burst)
+pub const BURST_THRESHOLD_MULTIPLIER: u32 = 10;
+
+/// Minimum baseline before burst detection activates (avoid false positives on first requests)
+pub const BURST_MIN_BASELINE: u16 = 5;
+
+/// Entry for tracking per-IP request velocity
+/// Uses exponential moving average (EMA) to establish baseline
+pub const BurstEntry = extern struct {
+    /// Hash of IP address - 0 means empty slot
+    ip_hash: u32 = 0,
+
+    /// Baseline request rate (EMA, requests per window, scaled by 16 for precision)
+    /// Stored as fixed-point: actual_rate = baseline_rate / 16
+    baseline_rate: u16 = 0,
+
+    /// Request count in current window
+    current_count: u16 = 0,
+
+    /// Last window timestamp (seconds, wrapping)
+    last_window: u32 = 0,
+
+    /// Get atomic pointer to current_count
+    pub inline fn getCurrentCountPtr(self: *BurstEntry) *std.atomic.Value(u16) {
+        return @ptrCast(&self.current_count);
+    }
+
+    /// Get atomic pointer to baseline_rate
+    pub inline fn getBaselinePtr(self: *BurstEntry) *std.atomic.Value(u16) {
+        return @ptrCast(&self.baseline_rate);
+    }
+
+    /// Get atomic pointer to last_window
+    pub inline fn getLastWindowPtr(self: *BurstEntry) *std.atomic.Value(u32) {
+        return @ptrCast(&self.last_window);
+    }
+
+    /// Record a request and check for burst
+    /// Returns true if this is a burst (anomaly detected)
+    pub fn recordAndCheck(self: *BurstEntry, current_time: u32, threshold_mult: u32) bool {
+        const last = self.getLastWindowPtr().load(.acquire);
+        const time_diff = current_time -% last;
+
+        // Check if we're in a new window
+        if (time_diff >= BURST_WINDOW_SEC) {
+            // Window expired - update baseline and reset count
+            const old_count = self.getCurrentCountPtr().swap(1, .acq_rel);
+            const old_baseline = self.getBaselinePtr().load(.acquire);
+
+            // Calculate new baseline using EMA: new = old * 0.875 + current * 0.125
+            // Using fixed-point: multiply count by 16, then blend
+            const current_scaled: u32 = @as(u32, old_count) * 16;
+            const new_baseline: u16 = @intCast(
+                (@as(u32, old_baseline) * 7 + current_scaled) / 8,
+            );
+
+            self.getBaselinePtr().store(new_baseline, .release);
+            self.getLastWindowPtr().store(current_time, .release);
+
+            return false; // New window, no burst yet
+        }
+
+        // Same window - increment count and check for burst
+        const new_count = self.getCurrentCountPtr().fetchAdd(1, .acq_rel) + 1;
+        const baseline = self.getBaselinePtr().load(.acquire);
+
+        // Skip burst detection if baseline not established
+        if (baseline < BURST_MIN_BASELINE * 16) {
+            return false;
+        }
+
+        // Check if current rate exceeds baseline * threshold
+        // baseline is scaled by 16, so: current * 16 > baseline * threshold
+        const current_scaled: u32 = @as(u32, new_count) * 16;
+        const threshold: u32 = @as(u32, baseline) * threshold_mult;
+
+        return current_scaled > threshold;
+    }
+
+    comptime {
+        // Ensure entry is 12 bytes
+        std.debug.assert(@sizeOf(BurstEntry) == 12);
+    }
+};
+
+/// Burst detector hash table
+pub const BurstTracker = extern struct {
+    entries: [MAX_BURST_TRACKED]BurstEntry = [_]BurstEntry{.{}} ** MAX_BURST_TRACKED,
+
+    /// Find or create entry for an IP
+    /// Returns null if table is full
+    pub fn findOrCreate(self: *BurstTracker, ip_hash: u32, current_time: u32) ?*BurstEntry {
+        if (ip_hash == 0) return null;
+
+        const start_idx = ip_hash % MAX_BURST_TRACKED;
+        var idx = start_idx;
+        var probe_count: u32 = 0;
+
+        while (probe_count < BUCKET_PROBE_LIMIT) : (probe_count += 1) {
+            const entry = &self.entries[idx];
+
+            // Found existing entry
+            if (entry.ip_hash == ip_hash) {
+                return entry;
+            }
+
+            // Found empty slot - try to claim it
+            if (entry.ip_hash == 0) {
+                const ptr: *std.atomic.Value(u32) = @ptrCast(&entry.ip_hash);
+                if (ptr.cmpxchgStrong(0, ip_hash, .acq_rel, .acquire) == null) {
+                    // Successfully claimed slot
+                    entry.getLastWindowPtr().store(current_time, .release);
+                    return entry;
+                }
+                // Someone else claimed it, check if it's ours
+                if (entry.ip_hash == ip_hash) {
+                    return entry;
+                }
+            }
+
+            idx = (idx + 1) % MAX_BURST_TRACKED;
+        }
+
+        return null; // Table too full
+    }
+
+    /// Check if an IP is bursting (for read-only check)
+    pub fn isBursting(self: *BurstTracker, ip_hash: u32, current_time: u32, threshold_mult: u32) bool {
+        if (ip_hash == 0) return false;
+
+        const start_idx = ip_hash % MAX_BURST_TRACKED;
+        var idx = start_idx;
+        var probe_count: u32 = 0;
+
+        while (probe_count < BUCKET_PROBE_LIMIT) : (probe_count += 1) {
+            const entry = &self.entries[idx];
+
+            if (entry.ip_hash == ip_hash) {
+                return entry.recordAndCheck(current_time, threshold_mult);
+            }
+
+            if (entry.ip_hash == 0) {
+                return false; // Not found
+            }
+
+            idx = (idx + 1) % MAX_BURST_TRACKED;
+        }
+
+        return false;
+    }
+
+    comptime {
+        std.debug.assert(@sizeOf(BurstTracker) == MAX_BURST_TRACKED * @sizeOf(BurstEntry));
+    }
+};
+
+// =============================================================================
 // WAF Metrics
 // =============================================================================
 
@@ -550,6 +719,9 @@ pub const WafState = extern struct {
     /// Connection tracker for slowloris detection
     conn_tracker: ConnTracker align(CACHE_LINE) = .{},
 
+    /// Burst detector for anomaly detection
+    burst_tracker: BurstTracker align(CACHE_LINE) = .{},
+
     /// Global metrics with atomic counters
     metrics: WafMetrics align(CACHE_LINE) = .{},
 
@@ -667,6 +839,19 @@ pub const WafState = extern struct {
     }
 
     // =========================================================================
+    // Burst Detection Operations
+    // =========================================================================
+
+    /// Check if an IP is exhibiting burst behavior (sudden velocity spike)
+    /// Returns true if current request rate is significantly above baseline
+    pub fn checkBurst(self: *WafState, ip_hash: u32, current_time: u32, threshold_mult: u32) bool {
+        if (self.burst_tracker.findOrCreate(ip_hash, current_time)) |entry| {
+            return entry.recordAndCheck(current_time, threshold_mult);
+        }
+        return false; // Table full, fail open
+    }
+
+    // =========================================================================
     // Comptime Assertions
     // =========================================================================
 
@@ -677,6 +862,7 @@ pub const WafState = extern struct {
         // Verify all major sections are cache-line aligned
         std.debug.assert(@offsetOf(WafState, "buckets") % CACHE_LINE == 0);
         std.debug.assert(@offsetOf(WafState, "conn_tracker") % CACHE_LINE == 0);
+        std.debug.assert(@offsetOf(WafState, "burst_tracker") % CACHE_LINE == 0);
         std.debug.assert(@offsetOf(WafState, "metrics") % CACHE_LINE == 0);
         std.debug.assert(@offsetOf(WafState, "config_epoch") % CACHE_LINE == 0);
 
@@ -937,4 +1123,121 @@ test "alignment: all structures properly aligned" {
     try std.testing.expect(@offsetOf(WafState, "conn_tracker") % CACHE_LINE == 0);
     try std.testing.expect(@offsetOf(WafState, "metrics") % CACHE_LINE == 0);
     try std.testing.expect(@offsetOf(WafState, "config_epoch") % CACHE_LINE == 0);
+}
+
+test "BurstEntry: recordAndCheck detects velocity spike" {
+    var entry = BurstEntry{
+        .ip_hash = 0x12345678,
+        .baseline_rate = 0,
+        .current_count = 0,
+        .last_window = 0,
+    };
+
+    const threshold: u32 = 3; // Current rate must be > baseline * 3 to trigger
+    var time: u32 = 1000;
+
+    // Establish baseline over several windows with 20 requests each
+    // This builds up baseline above BURST_MIN_BASELINE (5 * 16 = 80)
+    for (0..5) |_| {
+        for (0..20) |_| {
+            _ = entry.recordAndCheck(time, threshold);
+        }
+        time += BURST_WINDOW_SEC;
+    }
+
+    // Baseline should now be ~20 requests/window (scaled by 16 = ~320)
+    // which is above BURST_MIN_BASELINE * 16 = 80
+
+    // Now simulate a burst: 200 requests in one window
+    // This should trigger because 200 * 16 = 3200 > 320 * 3 = 960
+    var burst_detected = false;
+    for (0..200) |_| {
+        if (entry.recordAndCheck(time, threshold)) {
+            burst_detected = true;
+            break;
+        }
+    }
+
+    try std.testing.expect(burst_detected);
+}
+
+test "BurstEntry: no burst for steady traffic" {
+    var entry = BurstEntry{
+        .ip_hash = 0x12345678,
+        .baseline_rate = 0,
+        .current_count = 0,
+        .last_window = 0,
+    };
+
+    const threshold: u32 = 10;
+    const base_time: u32 = 1000;
+
+    // First window - establish baseline (50 requests)
+    for (0..50) |_| {
+        _ = entry.recordAndCheck(base_time, threshold);
+    }
+
+    // Move to next window
+    const window2_time = base_time + BURST_WINDOW_SEC;
+    _ = entry.recordAndCheck(window2_time, threshold);
+
+    // Maintain similar rate - no burst
+    var burst_detected = false;
+    for (0..60) |_| {
+        if (entry.recordAndCheck(window2_time, threshold)) {
+            burst_detected = true;
+        }
+    }
+
+    // Should NOT detect burst (60 is not >> 50 * 10)
+    try std.testing.expect(!burst_detected);
+}
+
+test "BurstTracker: findOrCreate" {
+    var tracker = BurstTracker{};
+    const current_time: u32 = 1000;
+
+    // Find or create entry
+    const entry1 = tracker.findOrCreate(0x12345678, current_time);
+    try std.testing.expect(entry1 != null);
+    try std.testing.expectEqual(@as(u32, 0x12345678), entry1.?.ip_hash);
+
+    // Same hash should return same entry
+    const entry2 = tracker.findOrCreate(0x12345678, current_time);
+    try std.testing.expectEqual(entry1, entry2);
+
+    // Different hash should return different entry
+    const entry3 = tracker.findOrCreate(0xDEADBEEF, current_time);
+    try std.testing.expect(entry3 != null);
+    try std.testing.expect(entry1 != entry3);
+}
+
+test "WafState: checkBurst integration" {
+    var waf_state = WafState.init();
+
+    const ip_hash: u32 = 0xCAFEBABE;
+    const threshold: u32 = 3;
+    var time: u32 = 1000;
+
+    // Establish baseline over several windows with 30 requests each
+    for (0..5) |_| {
+        for (0..30) |_| {
+            // Should not detect burst while establishing baseline
+            const result = waf_state.checkBurst(ip_hash, time, threshold);
+            _ = result;
+        }
+        time += BURST_WINDOW_SEC;
+    }
+
+    // Now burst: 300 requests in one window
+    // Baseline ~30 req/window * 16 = 480, threshold 480 * 3 = 1440
+    // 300 * 16 = 4800 > 1440, should trigger
+    var burst_detected = false;
+    for (0..300) |_| {
+        if (waf_state.checkBurst(ip_hash, time, threshold)) {
+            burst_detected = true;
+            break;
+        }
+    }
+    try std.testing.expect(burst_detected);
 }

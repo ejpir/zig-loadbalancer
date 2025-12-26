@@ -423,6 +423,10 @@ pub const WafConfig = struct {
     trusted_proxies: []const CidrRange = &.{},
     /// Logging configuration
     logging: LoggingConfig = .{},
+    /// Burst detection: detect sudden velocity spikes
+    burst_detection_enabled: bool = true,
+    /// Burst threshold: current rate must exceed baseline * threshold to trigger
+    burst_threshold: u32 = 10,
     /// Config epoch for hot-reload detection
     epoch: u64 = 0,
 

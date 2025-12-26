@@ -38,6 +38,8 @@ pub const Reason = @import("state.zig").Reason;
 pub const Bucket = @import("state.zig").Bucket;
 pub const ConnEntry = @import("state.zig").ConnEntry;
 pub const ConnTracker = @import("state.zig").ConnTracker;
+pub const BurstEntry = @import("state.zig").BurstEntry;
+pub const BurstTracker = @import("state.zig").BurstTracker;
 pub const WafMetrics = @import("state.zig").WafMetrics;
 pub const MetricsSnapshot = @import("state.zig").MetricsSnapshot;
 
@@ -49,6 +51,9 @@ pub const MAX_CAS_ATTEMPTS = @import("state.zig").MAX_CAS_ATTEMPTS;
 pub const MAX_TRACKED_IPS = @import("state.zig").MAX_TRACKED_IPS;
 pub const WAF_STATE_MAGIC = @import("state.zig").WAF_STATE_MAGIC;
 pub const WAF_STATE_SIZE = @import("state.zig").WAF_STATE_SIZE;
+pub const MAX_BURST_TRACKED = @import("state.zig").MAX_BURST_TRACKED;
+pub const BURST_WINDOW_SEC = @import("state.zig").BURST_WINDOW_SEC;
+pub const BURST_THRESHOLD_MULTIPLIER = @import("state.zig").BURST_THRESHOLD_MULTIPLIER;
 
 // State helper functions
 pub const packState = @import("state.zig").packState;

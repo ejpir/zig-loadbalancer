@@ -207,6 +207,21 @@ pub const WafEngine = struct {
 
         // Check rate limits
         const rate_limit_result = self.checkRateLimit(request, client_ip);
+        if (rate_limit_result.decision != .allow) {
+            self.recordDecision(&rate_limit_result);
+            return self.applyMode(rate_limit_result);
+        }
+
+        // Check for burst behavior (sudden velocity spike)
+        if (self.waf_config.burst_detection_enabled) {
+            const burst_result = self.checkBurst(client_ip);
+            if (burst_result.decision != .allow) {
+                self.recordDecision(&burst_result);
+                return self.applyMode(burst_result);
+            }
+        }
+
+        // All checks passed
         self.recordDecision(&rate_limit_result);
         return self.applyMode(rate_limit_result);
     }
@@ -296,6 +311,18 @@ pub const WafEngine = struct {
         var result = CheckResult.allow();
         result.tokens_remaining = decision.remaining_tokens;
         return result;
+    }
+
+    /// Check for burst behavior (sudden velocity spike)
+    fn checkBurst(self: *WafEngine, client_ip: u32) CheckResult {
+        const current_time = rate_limiter.getCurrentTimeSec();
+        const threshold = self.waf_config.burst_threshold;
+
+        if (self.waf_state.checkBurst(client_ip, current_time, threshold)) {
+            return CheckResult.block(.burst, null);
+        }
+
+        return CheckResult.allow();
     }
 
     /// Apply shadow mode transformation if enabled

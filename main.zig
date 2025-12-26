@@ -69,6 +69,45 @@ pub fn getWafConfig() *const waf.WafConfig {
     return &global_waf_config;
 }
 
+/// WAF stats reporter interval (seconds)
+const WAF_STATS_INTERVAL_SEC: u64 = 10;
+
+/// Start WAF stats reporter thread
+fn startWafStatsThread() !std.Thread {
+    return std.Thread.spawn(.{}, wafStatsLoop, .{});
+}
+
+/// WAF stats reporter loop - runs in background thread
+fn wafStatsLoop() void {
+    const waf_log = std.log.scoped(.waf_stats);
+
+    while (true) {
+        std.posix.nanosleep(WAF_STATS_INTERVAL_SEC, 0);
+
+        if (global_waf_state) |state| {
+            const stats = state.metrics.snapshot();
+            const total = stats.totalRequests();
+
+            if (total > 0) {
+                waf_log.info(
+                    "WAF Stats: total={d} allowed={d} blocked={d} logged={d} block_rate={d}% | by_reason: rate_limit={d} slowloris={d} body={d} json={d}",
+                    .{
+                        total,
+                        stats.requests_allowed,
+                        stats.requests_blocked,
+                        stats.requests_logged,
+                        stats.blockRatePercent(),
+                        stats.blocked_rate_limit,
+                        stats.blocked_slowloris,
+                        stats.blocked_body_too_large,
+                        stats.blocked_json_depth,
+                    },
+                );
+            }
+        }
+    }
+}
+
 pub const std_options: std.Options = .{
     .log_level = .debug, // Compile-time max level (allows all)
     .logFn = runtimeLogFn, // Custom log function respects runtime level
@@ -552,6 +591,10 @@ fn runMultiProcess(allocator: std.mem.Allocator, config: Config) !void {
     defer if (!global_waf_config.enabled) allocator.destroy(waf_state_ptr);
     if (global_waf_config.enabled) {
         log.info("WAF state initialized ({d} bytes)", .{@sizeOf(waf.WafState)});
+        // Start WAF stats reporter thread
+        _ = startWafStatsThread() catch |err| {
+            log.warn("Failed to start WAF stats thread: {s}", .{@errorName(err)});
+        };
     }
 
     // Initialize backends in shared region
@@ -873,6 +916,10 @@ fn runSingleProcess(parent_allocator: std.mem.Allocator, config: Config) !void {
     defer allocator.destroy(waf_state_ptr);
     if (global_waf_config.enabled) {
         log.info("WAF state initialized ({d} bytes)", .{@sizeOf(waf.WafState)});
+        // Start WAF stats reporter thread
+        _ = startWafStatsThread() catch |err| {
+            log.warn("Failed to start WAF stats thread: {s}", .{@errorName(err)});
+        };
     }
 
     for (lb_config.backends, 0..) |b, idx| {

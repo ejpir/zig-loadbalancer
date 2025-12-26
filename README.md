@@ -6,6 +6,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/17%2C000%2B-req%2Fs-blue" alt="17k+ req/s">
   <img src="https://img.shields.io/badge/HTTP%2F2-supported-blueviolet" alt="HTTP/2">
+  <img src="https://img.shields.io/badge/WAF-built--in-red" alt="WAF">
+  <img src="https://img.shields.io/badge/OpenTelemetry-tracing-purple" alt="OpenTelemetry">
   <img src="https://img.shields.io/badge/single_binary-4MB-green" alt="Single binary">
   <img src="https://img.shields.io/badge/dependencies-zero-green" alt="Zero dependencies">
   <img src="https://img.shields.io/badge/zig-0.16%2B-orange" alt="Zig 0.16+">
@@ -22,7 +24,13 @@
 ./load_balancer -b localhost:9001 -b localhost:9002 -p 8080
 ```
 
-That's it. Health checks, automatic failover, connection pooling. Done.
+That's it. Health checks, automatic failover, connection pooling, **WAF protection**, **distributed tracing**. Done.
+
+## What's New
+
+- **Web Application Firewall (WAF)** — Rate limiting, burst detection, request validation
+- **OpenTelemetry Tracing** — Full request lifecycle visibility in Jaeger
+- **Lock-free Performance** — TigerBeetle-inspired atomic operations, zero locks
 
 ## Use Cases
 
@@ -59,28 +67,28 @@ kill -USR2 $(pgrep load_balancer)
 <tr>
 <td width="50%">
 
-### Local microservices gateway
+### Rate-limited API Gateway
 
-One port, multiple backends. Round-robin or weighted distribution.
+Protect your APIs from abuse with per-IP rate limiting and burst detection.
 
 ```bash
 ./load_balancer \
-  -b auth-service:8001 \
-  -b api-service:8002 \
-  -b cache-service:8003 \
-  -s round_robin
+  -b api-service:8001 \
+  --waf-config waf.json \
+  --otel-endpoint localhost:4318
 ```
 
 </td>
 <td width="50%">
 
-### Debug HTTP/TLS issues
+### Debug with Distributed Tracing
 
-See exactly what's on the wire. Hex dumps, TLS cipher info, the works.
+See every request in Jaeger with WAF decisions, backend latency, and more.
 
 ```bash
-./load_balancer --trace --tls-trace \
-  -b httpbin.org:443 -p 8080
+./load_balancer -b backend:8001 \
+  --otel-endpoint localhost:4318
+# Open http://localhost:16686 for Jaeger UI
 ```
 
 </td>
@@ -123,8 +131,13 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/backend1 &
 ./zig-out/bin/backend2 &
 
-# Run
-./zig-out/bin/load_balancer -p 8080 -b 127.0.0.1:9001 -b 127.0.0.1:9002
+# Run with WAF and tracing
+./zig-out/bin/load_balancer \
+  -p 8080 \
+  -b 127.0.0.1:9001 \
+  -b 127.0.0.1:9002 \
+  --waf-config waf.json \
+  --otel-endpoint localhost:4318
 
 # Test
 curl http://localhost:8080
@@ -138,6 +151,7 @@ curl http://localhost:8080
 | HAProxy needs a PhD | One binary, zero setup |
 | Envoy downloads half the internet | No dependencies beyond Zig stdlib |
 | Node/Go proxies have GC pauses | Memory-safe Zig, no garbage collector |
+| WAF costs $$$$ | Built-in, lock-free, high-performance |
 | "Just use Kubernetes" | This is 4MB, not a lifestyle |
 
 **The numbers:** 17,000+ req/s with ~10% overhead vs direct backend access.
@@ -157,15 +171,22 @@ curl http://localhost:8080
         │          │         │          │         │          │
         │ • pool   │         │ • pool   │         │ • pool   │
         │ • health │         │ • health │         │ • health │
+        │ • WAF    │         │ • WAF    │         │ • WAF    │
         └────┬─────┘         └────┬─────┘         └────┬─────┘
              │                    │                    │
              └────────────────────┼────────────────────┘
                                   │ SO_REUSEPORT
                                   ▼
                             Port 8080
+                                  │
+                                  ▼
+                    ┌─────────────────────────────┐
+                    │     Jaeger / OTLP           │
+                    │   (Distributed Tracing)     │
+                    └─────────────────────────────┘
 ```
 
-Each worker is **fully isolated**: own connection pool, own health state, no locks. A crash in one worker doesn't affect the others.
+Each worker is **fully isolated**: own connection pool, own health state, **shared WAF state** (mmap), no locks. A crash in one worker doesn't affect the others.
 
 ### Health Checking
 
@@ -173,20 +194,190 @@ Each worker is **fully isolated**: own connection pool, own health state, no loc
 
 **Active** — Background probes every 5s catch problems before users hit them.
 
+---
+
+## Web Application Firewall (WAF)
+
+Built-in, lock-free WAF with TigerBeetle-inspired design:
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Rate Limiting** | Token bucket per IP+path, atomic CAS operations |
+| **Burst Detection** | Anomaly detection using EMA (detects sudden traffic spikes) |
+| **Request Validation** | URI length, body size, JSON depth limits |
+| **Slowloris Protection** | Per-IP connection tracking |
+| **Shadow Mode** | Test rules without blocking (log_only) |
+| **Hot Reload** | Config changes apply without restart |
+
+### WAF Request Flow
+
+```
+Request → WAF Check → Backend
+            │
+            ├─ 1. Validate request (URI, body size)
+            ├─ 2. Check rate limits (token bucket)
+            ├─ 3. Check burst detection (EMA anomaly)
+            └─ 4. Allow / Block / Log
+```
+
+### WAF Configuration
+
+Create `waf.json`:
+
+```json
+{
+  "enabled": true,
+  "shadow_mode": false,
+  "burst_detection_enabled": true,
+  "burst_threshold": 10,
+  "rate_limits": [
+    {
+      "name": "login_bruteforce",
+      "path": "/api/auth/login",
+      "method": "POST",
+      "limit": { "requests": 10, "period_sec": 60 },
+      "burst": 3,
+      "by": "ip",
+      "action": "block"
+    },
+    {
+      "name": "api_general",
+      "path": "/api/*",
+      "limit": { "requests": 100, "period_sec": 60 },
+      "burst": 20,
+      "by": "ip",
+      "action": "block"
+    }
+  ],
+  "slowloris": {
+    "max_conns_per_ip": 50
+  },
+  "request_limits": {
+    "max_uri_length": 2048,
+    "max_body_size": 1048576,
+    "max_json_depth": 20,
+    "endpoints": [
+      { "path": "/api/upload", "max_body_size": 10485760 }
+    ]
+  },
+  "trusted_proxies": ["10.0.0.0/8", "172.16.0.0/12"],
+  "logging": {
+    "log_blocked": true,
+    "log_allowed": false,
+    "log_near_limit": true,
+    "near_limit_threshold": 0.8
+  }
+}
+```
+
+Run with WAF:
+
+```bash
+./load_balancer -b backend:8001 --waf-config waf.json
+```
+
+### WAF Statistics
+
+Every 10 seconds, the WAF logs statistics:
+
+```
+[+10000ms] info(waf_stats): WAF Stats: total=1523 allowed=1498 blocked=25 logged=0 block_rate=1% | by_reason: rate_limit=20 slowloris=0 body=3 json=2
+```
+
+### Burst Detection
+
+Detects sudden traffic spikes using Exponential Moving Average (EMA):
+
+- **Window**: 60 seconds
+- **EMA**: `baseline = old * 0.875 + current * 0.125`
+- **Trigger**: `current_rate > baseline * threshold`
+
+Example: An IP normally sends 20 req/min. Suddenly sends 300 req/min → **blocked**.
+
+---
+
+## OpenTelemetry Integration
+
+Full distributed tracing with Jaeger support.
+
+### Setup
+
+1. Start Jaeger:
+```bash
+docker run -d --name jaeger \
+  -p 16686:16686 \
+  -p 4318:4318 \
+  jaegertracing/all-in-one:latest
+```
+
+2. Run load balancer with tracing:
+```bash
+./load_balancer -b backend:8001 --otel-endpoint localhost:4318
+```
+
+3. Open Jaeger UI: http://localhost:16686
+
+### What's Traced
+
+Every request gets a span with:
+
+| Attribute | Description |
+|-----------|-------------|
+| `http.method` | GET, POST, etc. |
+| `http.url` | Request URI |
+| `http.status_code` | Response status |
+| `waf.decision` | allow / block / log_only |
+| `waf.client_ip` | Client IP address |
+| `waf.reason` | Why blocked (rate_limit, burst, etc.) |
+| `waf.rule` | Which rule triggered |
+| `backend.host` | Backend server |
+| `backend.latency_ms` | Backend response time |
+
+### Example Trace
+
+```
+proxy_request [12.3ms]
+├─ http.method: POST
+├─ http.url: /api/auth/login
+├─ waf.decision: block
+├─ waf.client_ip: 192.168.1.100
+├─ waf.reason: rate limit exceeded
+└─ waf.rule: login_bruteforce
+```
+
+### Batching
+
+Spans are batched for efficiency:
+- **Max queue**: 2048 spans
+- **Batch size**: 512 spans
+- **Export interval**: 5 seconds
+
+---
+
 ## CLI Reference
 
 ```
--p, --port N         Listen port (default: 8080)
--b, --backend H:P    Backend server (repeat for multiple)
--w, --workers N      Worker count (default: CPU cores)
--s, --strategy S     round_robin | weighted | random
--c, --config FILE    JSON config file (hot-reloaded)
--l, --loglevel LVL   err | warn | info | debug
--k, --insecure       Skip TLS verification (dev only!)
--t, --trace          Dump raw HTTP payloads
---tls-trace          Show TLS handshake details
---mode mp|sp         Multi-process or single-process
---help               You know what this does
+-p, --port N           Listen port (default: 8080)
+-b, --backend H:P      Backend server (repeat for multiple)
+-w, --workers N        Worker count (default: CPU cores)
+-s, --strategy S       round_robin | weighted | random
+-c, --config FILE      JSON config file (hot-reloaded)
+-l, --loglevel LVL     err | warn | info | debug
+-k, --insecure         Skip TLS verification (dev only!)
+-t, --trace            Dump raw HTTP payloads
+--tls-trace            Show TLS handshake details
+--mode mp|sp           Multi-process or single-process
+
+WAF Options:
+--waf-config FILE      WAF configuration JSON file
+--waf-shadow           Enable shadow mode (log only, don't block)
+
+Observability:
+--otel-endpoint H:P    OpenTelemetry OTLP endpoint (e.g., localhost:4318)
+
+--help                 You know what this does
 ```
 
 ## Config File
@@ -218,6 +409,8 @@ Changes detected via kqueue (macOS) / inotify (Linux). Zero-downtime reload.
 | **Prometheus metrics** | `GET /metrics` |
 | **Connection pooling** | Per-backend, per-worker pools |
 | **Crash isolation** | Workers are separate processes |
+| **WAF** | Rate limiting, burst detection, request validation |
+| **Distributed tracing** | OpenTelemetry + Jaeger integration |
 
 ## HTTP/2 Support
 
@@ -249,7 +442,7 @@ info(tls_trace): ALPN Protocol: http2
 ```bash
 zig build                        # Debug
 zig build -Doptimize=ReleaseFast # Production
-zig build test                   # 242 tests
+zig build test                   # 370+ tests
 ```
 
 Requires Zig 0.16.0+
@@ -262,6 +455,13 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the nerdy stuff:
 - Why there are no pointers in shared memory
 - Binary hot reload via file descriptor passing
 - SIMD HTTP parsing
+
+See [docs/WAF_ARCHITECTURE.md](docs/WAF_ARCHITECTURE.md) for WAF internals:
+- Lock-free token bucket implementation
+- Burst detection with EMA algorithm
+- Shared memory structures (4MB WafState)
+- OpenTelemetry span propagation
+- Request flow diagrams with function names
 
 ## License
 
