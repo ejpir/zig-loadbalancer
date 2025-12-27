@@ -50,6 +50,8 @@ pub const H2ConnectionPool = struct {
 
     /// Initialize pool with backend servers
     pub fn init(backends: []const BackendServer, allocator: std.mem.Allocator) Self {
+        std.debug.assert(backends.len <= MAX_BACKENDS);
+
         var pool = Self{
             .slots = undefined,
             .slot_state = undefined,
@@ -79,6 +81,7 @@ pub const H2ConnectionPool = struct {
     /// 5. Unlock mutex on return
     pub fn getOrCreate(self: *Self, backend_idx: u32, io: Io) !*H2Connection {
         std.debug.assert(backend_idx < self.backends.len);
+        std.debug.assert(backend_idx < MAX_BACKENDS);
 
         // Lock per-backend mutex to prevent concurrent creation race
         // Critical: without this, multiple coroutines see "empty" before any assigns
@@ -89,10 +92,14 @@ pub const H2ConnectionPool = struct {
         for (&self.slot_state[backend_idx], &self.slots[backend_idx], 0..) |*state, *slot, i| {
             if (state.* == .available) {
                 if (slot.*) |conn| {
-                    // Skip stale connections - DON'T destroy here!
-                    // Other requests may still hold references. Let release() handle cleanup.
+                    // Destroy stale connections so slots don't remain permanently unavailable.
+                    // Available slots must have ref_count == 0.
                     if (self.isConnectionStale(conn)) {
-                        log.debug("Connection stale, skipping: backend={d} slot={d}", .{ backend_idx, i });
+                        log.debug("Connection stale, destroying: backend={d} slot={d}", .{ backend_idx, i });
+                        std.debug.assert(conn.ref_count.load(.acquire) == 0);
+                        slot.* = null;
+                        state.* = .empty;
+                        self.destroyConnection(conn, io);
                         continue;
                     }
 
