@@ -95,9 +95,10 @@ pub const H2ConnectionPool = struct {
                     // Available slots must have ref_count == 0.
                     if (self.isConnectionStale(conn)) {
                         log.debug("Connection stale, destroying: backend={d} slot={d}", .{ backend_idx, i });
-                        // backend_mutex serializes getOrCreate calls; release() only
-                        // marks a slot available when ref_count drops to 0.
-                        std.debug.assert(conn.ref_count.load(.acquire) == 0);
+                        // backend_mutex serializes getOrCreate calls; release() transitions
+                        // to .available only after ref_count hits 0 (acq_rel), so there is
+                        // no concurrent increment while we hold the mutex.
+                        std.debug.assert(conn.ref_count.load(.seq_cst) == 0);
                         slot.* = null;
                         state.* = .empty;
                         self.destroyConnection(conn, io);
