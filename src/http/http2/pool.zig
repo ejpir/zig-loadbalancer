@@ -81,7 +81,6 @@ pub const H2ConnectionPool = struct {
     /// 5. Unlock mutex on return
     pub fn getOrCreate(self: *Self, backend_idx: u32, io: Io) !*H2Connection {
         std.debug.assert(backend_idx < self.backends.len);
-        std.debug.assert(backend_idx < MAX_BACKENDS);
 
         // Lock per-backend mutex to prevent concurrent creation race
         // Critical: without this, multiple coroutines see "empty" before any assigns
@@ -96,6 +95,8 @@ pub const H2ConnectionPool = struct {
                     // Available slots must have ref_count == 0.
                     if (self.isConnectionStale(conn)) {
                         log.debug("Connection stale, destroying: backend={d} slot={d}", .{ backend_idx, i });
+                        // backend_mutex serializes getOrCreate calls; release() only
+                        // marks a slot available when ref_count drops to 0.
                         std.debug.assert(conn.ref_count.load(.acquire) == 0);
                         slot.* = null;
                         state.* = .empty;
